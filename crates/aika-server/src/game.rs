@@ -33,9 +33,15 @@ pub const OP_CLIENT_READY: u16 = 0xF0B;
 /// Client to server: walked to a point. The server returns nothing to the
 /// mover, it only relays to the others who can see them.
 pub const OP_MOVE: u16 = 0x301;
-/// Walking, the only movement the server accepts from a player
-/// (`Data/GlobalDefs.pas:216`).
+/// Walking, the only move type the original relays to other players
+/// (`Data/GlobalDefs.pas:216`). The real client also sends other values.
 const MOVE_NORMAL: u8 = 0;
+/// Server-originated teleport (`Data/GlobalDefs.pas:217`). A client must
+/// never be able to move itself this way.
+const MOVE_TELEPORT: u8 = 1;
+/// How many movement packets to dump in full per connection, to confirm the
+/// layout against the real client without flooding the log.
+const MOVES_TO_DUMP: u8 = 3;
 /// Server to client: create a creature on the map. This is the spawn.
 pub const OP_CREATE_MOB: u16 = 0x349;
 
@@ -141,6 +147,8 @@ struct Session {
     character: Option<Character>,
     /// Id the client uses to refer to itself in packets.
     client_id: u16,
+    /// How many movement packets were dumped in full so far.
+    moves_logged: u8,
     /// The character already spawned. The client resends `0xF0B` whenever it
     /// thinks something is missing, and spawning again teleports the player to the
     /// starting point, which is the original's `if IsInstantiated then Exit`
@@ -395,7 +403,7 @@ fn handle_client_ready(session: &mut Session) -> Action {
 /// the player (`SendToVisible(..., false)` in `PacketHandlers.pas:892`).
 /// While there is no registry of online players, storing the position does.
 fn handle_move(session: &mut Session, message: &Message) -> Action {
-    let Some(destination) = Movement::parse(&message.body) else {
+    let Some(movement) = Movement::parse(&message.body) else {
         warn!(size = message.body.len(), "0x301 packet too short");
         return Action::Ignore;
     };
@@ -405,22 +413,49 @@ fn handle_move(session: &mut Session, message: &Message) -> Action {
         return Action::Ignore;
     }
 
-    // The original only accepts walking; teleport and summon come from us.
-    if destination.move_type != MOVE_NORMAL {
-        debug!(kind = destination.move_type, "movement that is not walking, ignored");
+    // The first few movements of a session are dumped in full: the layout of
+    // this packet is only confirmed against the real client, and a wrong
+    // offset here reads garbage as a coordinate.
+    if session.moves_logged < MOVES_TO_DUMP {
+        session.moves_logged += 1;
+        debug!(
+            x = movement.x,
+            y = movement.y,
+            move_type = movement.move_type,
+            speed = movement.speed,
+            body = %hex_dump(&message.body),
+            "0x301 movement"
+        );
+    }
+
+    if !movement.is_valid() {
+        warn!(x = movement.x, y = movement.y, "invalid destination");
         return Action::Ignore;
     }
 
-    if !destination.is_valid() {
-        warn!(x = destination.x, y = destination.y, "invalid destination");
+    // Teleport is server-originated. Honouring it from a client packet is
+    // exactly the exploit that lets a modified client jump anywhere on the
+    // map, so it is refused outright, as the original does.
+    if movement.move_type == MOVE_TELEPORT {
+        warn!(x = movement.x, y = movement.y, "client asked to teleport itself, refused");
         return Action::Ignore;
+    }
+
+    // Beyond walking, the real client sends other move types (16 has been
+    // observed in the wild). The original drops those entirely; we still
+    // record where the player ended up, because a stale position would be
+    // wrong the moment positions get persisted.
+    if movement.move_type != MOVE_NORMAL {
+        debug!(move_type = movement.move_type, "move type other than walking");
     }
 
     if let Some(character) = session.character.as_mut() {
-        character.x = destination.x as u32;
-        character.y = destination.y as u32;
+        character.x = movement.x as u32;
+        character.y = movement.y as u32;
     }
 
+    // Nothing goes back to the mover: the client moves on its own. Relaying to
+    // the players who can see them lands with the online player registry.
     Action::Ignore
 }
 
@@ -1010,15 +1045,36 @@ mod tests {
         assert_eq!((character.x, character.y), (3500, 720));
     }
 
+    /// The real client sends move types other than plain walking (16 has been
+    /// seen). The original drops those; we still track the position, because a
+    /// stale one would be wrong once positions are persisted.
     #[test]
-    fn movement_rejects_teleport_and_other_senders() {
+    fn movement_tracks_move_types_other_than_walking() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = logged_in(&state);
+        let _ = handle_message(&state, &mut session, &enter_world(0));
+        session.client_id = 7;
+
+        let mut body = vec![0u8; Movement::BODY_SIZE];
+        body[0..4].copy_from_slice(&4000.0f32.to_le_bytes());
+        body[4..8].copy_from_slice(&800.0f32.to_le_bytes());
+        body[Movement::MOVE_TYPE] = 16;
+        let message = Message { sender: 7, opcode: OP_MOVE, time: 0, body };
+
+        assert!(matches!(handle_message(&state, &mut session, &message), Action::Ignore));
+        let character = session.character.as_ref().unwrap();
+        assert_eq!((character.x, character.y), (4000, 800));
+    }
+
+    #[test]
+    fn movement_refuses_client_teleport_and_other_senders() {
         let state = state_with(vec![dev_character("Athus", 0)]);
         let mut session = logged_in(&state);
         let _ = handle_message(&state, &mut session, &enter_world(0));
         session.client_id = 7;
         let start = (session.character.as_ref().unwrap().x, session.character.as_ref().unwrap().y);
 
-        // teleport does not come from the client
+        // teleport must never come from the client: that is the map-jump exploit
         let mut body = vec![0u8; Movement::BODY_SIZE];
         body[0..4].copy_from_slice(&9999.0f32.to_le_bytes());
         body[Movement::MOVE_TYPE] = 1;

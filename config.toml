@@ -1,0 +1,86 @@
+# aika-server configuration.
+#
+# For the client to find this server, edit `Setting.txt` in the client folder
+# and replace the base URL (the line starting with "1 ") with:
+#
+#     1 http://127.0.0.1:8090
+#
+# The `SL.bin` shipped with the client already points its channels at
+# 127.0.0.1.
+
+[web]
+bind = "127.0.0.1:8090"
+# Minimum number of values in the status reply. The client we target expects
+# exactly one per channel (`Channels=4` in AikaServer.ini), so this stays off
+# and the list below decides.
+pad_status_to = 0
+
+[login]
+bind = "127.0.0.1:8831"
+token_ttl_secs = 300
+max_attempts = 10
+block_minutes = 10
+
+[game]
+# One address per channel, all on the same port: that is how the original
+# server separates channels (port 8822 is hardcoded in its source). The
+# client's SL.bin points channels at 127.0.0.1 through .4, and every one of
+# those is loopback, so none of this is exposed to the network.
+binds = [
+  "127.0.0.1:8822",
+  "127.0.0.2:8822",
+  "127.0.0.3:8822",
+  "127.0.0.4:8822",
+]
+# The original server refuses any other version (Version=124 in the ini).
+client_version = 124
+
+# What the launcher receives when it checks the client version. It must match
+# the client's `update.dat` byte for byte, or the launcher believes a patch is
+# pending and never unlocks START.
+[patch]
+version = 301
+file = "valhalla301.zip"
+
+# Channels. The client has the names built in (Alpha, Beta, Gamma...) and uses
+# this list only to learn how many exist and how busy each one is:
+# `online = 1` means up and empty, `-1` means down.
+#
+# NOTE: `name` here is only a label for our logs. The client NEVER sees it.
+# World and channel names come from `SL.bin`, a client file; edit it with
+# `cargo run -p aika-data --bin sl-tool`.
+
+[[servers]]
+name = "Alpha"
+online = 1
+
+[[servers]]
+name = "Beta"
+online = 1
+
+[[servers]]
+name = "Gamma"
+online = 1
+
+[[servers]]
+name = "Delta"
+online = 1
+
+# Development accounts, kept in memory for now.
+# `password` is plaintext and becomes an MD5 at startup; use `password_hash`
+# to paste a hash straight from the `password_hash` column of the MySQL dump.
+[[accounts]]
+username = "admin"
+password = "admin"
+nation = 2
+
+# Characters on the account, one per slot (0 to 2). For testing only, until
+# character creation and a database exist.
+[[accounts.characters]]
+name = "Athus"
+slot = 0
+level = 42
+class_index = 20   # 20-29 = templar
+hair = 7702
+nation = 2
+gold = 999999

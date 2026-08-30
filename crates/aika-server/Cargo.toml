@@ -1,0 +1,26 @@
+[package]
+name = "aika-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Aika Online server: token (HTTP), login and game services"
+
+[lib]
+name = "aika_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aika-server"
+path = "src/main.rs"
+
+[dependencies]
+aika-net = { path = "../aika-net" }
+anyhow = "1"
+hex = "0.4"
+md-5 = "0.10"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

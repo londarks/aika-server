@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local database file (development uses SQLite)
+*.db
+*.db-journal
+
+# Local overrides
+config.local.toml
+
+# Original dump: carries real account rows from a private server.
+# Only sql/schema.sql (structure, no data) is tracked.
+sql/SQL Aika.sql
+
+# Client-derived fixture: kept locally, never redistributed.
+crates/aika-data/testdata/SL.bin

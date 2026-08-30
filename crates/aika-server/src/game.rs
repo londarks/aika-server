@@ -45,6 +45,52 @@ const MOVES_TO_DUMP: u8 = 3;
 /// Server to client: create a creature on the map. This is the spawn.
 pub const OP_CREATE_MOB: u16 = 0x349;
 
+// The burst the original sends after `0xF0B`, in order. There is no ack
+// packet: the client stops resending `0xF0B` once it has received enough of
+// this to consider itself in the world (`Mob/Player.pas:4945-5244`).
+/// Skill list.
+pub const OP_SKILLS: u16 = 0x106;
+/// Cash balance, carried as a plain signal.
+pub const OP_CASH: u16 = 0x139;
+/// Account status.
+pub const OP_ACCOUNT_STATUS: u16 = 0x14F;
+/// Active buffs.
+pub const OP_BUFFS: u16 = 0x16E;
+/// Active title.
+pub const OP_ACTIVE_TITLE: u16 = 0x361;
+/// Nation relics.
+pub const OP_RELICS: u16 = 0x136;
+/// Attribute points.
+pub const OP_REFRESH_POINT: u16 = 0x109;
+/// Combat stats.
+pub const OP_REFRESH_STATUS: u16 = 0x10A;
+/// Full attribute reply, which the original emits right after `0x10A`.
+pub const OP_ALL_ATTRIBUTES: u16 = 0x23FF;
+/// Level and experience.
+pub const OP_LEVEL: u16 = 0x108;
+/// Current and maximum HP/MP.
+pub const OP_HP_MP: u16 = 0x103;
+
+/// Several packets carry this fixed value in the header `Index` field instead
+/// of the client id.
+const FIXED_INDEX: u16 = 0x7535;
+
+/// Total sizes, header included, taken from the Delphi records.
+const SKILLS_SIZE: usize = 96;
+const SIGNAL_SIZE: usize = 16;
+const BUFFS_SIZE: usize = 252;
+const ACTIVE_TITLE_SIZE: usize = 20;
+const RELICS_SIZE: usize = 66;
+const REFRESH_POINT_SIZE: usize = 28;
+const REFRESH_STATUS_SIZE: usize = 54;
+const ALL_ATTRIBUTES_SIZE: usize = 50;
+const LEVEL_SIZE: usize = 24;
+const HP_MP_SIZE: usize = 32;
+
+/// The original writes a single `0xCC` byte into a WORD field of `0x108`
+/// (`Mob/BaseMob.pas:2434`), so the field reads `CC 00`.
+const LEVEL_UNK: u16 = 0x00CC;
+
 /// `TSendCreateMobPacket` (`Data/Packets.pas:344`), 508 bytes in total.
 const CREATE_MOB_SIZE: usize = 508;
 
@@ -380,7 +426,8 @@ fn handle_client_ready(session: &mut Session) -> Action {
 
     // Spawning twice throws the player back to the starting point, and the
     // client resends this packet whenever it thinks something is missing,
-    // to walk. Without this guard it gets stuck in a respawn loop.
+    // including when trying to walk. Without this guard it gets stuck in a
+    // respawn loop.
     if session.spawned {
         debug!(character = %character.name, "repeated 0xF0B, ignoring");
         return Action::Ignore;
@@ -390,10 +437,133 @@ fn handle_client_ready(session: &mut Session) -> Action {
         character = %character.name,
         x = character.x,
         y = character.y,
-        "nascendo no mapa"
+        "spawning on the map"
     );
     session.spawned = true;
-    Action::Reply(vec![encode_spawn(&character, session.client_id)])
+    Action::Reply(world_burst(&character, session.client_id))
+}
+
+/// Everything the server sends once the client reports it has loaded.
+///
+/// There is no acknowledgement packet in this protocol: the client keeps
+/// resending `0xF0B` until it has received enough of this burst to consider
+/// itself in the world. Sending only the spawn leaves it asking forever, which
+/// also makes movement stutter.
+///
+/// This is the ordered subset of `SendToWorldSends` (`Mob/Player.pas:4945`)
+/// that a character with no guild, pran, mount, friends, buffs or quests
+/// receives. Packets whose field layout is not yet known are sent with the
+/// right size and a zeroed body, which is what an empty list looks like
+/// anyway. Three packets from the original are still missing because their
+/// size is unknown: `0x138` (cash inventory), `0x936` and `0x91A` (nation).
+fn world_burst(character: &Character, client_id: u16) -> Vec<Vec<u8>> {
+    let (hp, mp) = vitals(character);
+
+    let mut frames = vec![
+        encode_spawn(character, client_id),
+        encode_skills(client_id),
+        encode_signal(OP_CASH, 0, 0, character.gold.min(u32::MAX as u64) as u32),
+        zeroed(OP_ACCOUNT_STATUS, client_id, SIGNAL_SIZE),
+        zeroed(OP_BUFFS, client_id, BUFFS_SIZE),
+        zeroed(OP_ACTIVE_TITLE, client_id, ACTIVE_TITLE_SIZE),
+        zeroed(OP_RELICS, FIXED_INDEX, RELICS_SIZE),
+        encode_refresh_point(character),
+        encode_refresh_status(character),
+        zeroed(OP_ALL_ATTRIBUTES, client_id, ALL_ATTRIBUTES_SIZE),
+        encode_level(character, client_id),
+        encode_hp_mp(character, client_id, hp, mp),
+    ];
+
+    // The original spawns the player a second time here, after its stats have
+    // been recomputed. Same opcode, same recipient, fresher numbers.
+    frames.push(encode_spawn(character, client_id));
+    frames
+}
+
+/// Provisional health and mana. The real formulas depend on tables we have not
+/// read yet; what matters for now is that neither is zero.
+fn vitals(character: &Character) -> (u32, u32) {
+    (100 + character.level as u32 * 10, 50 + character.level as u32 * 5)
+}
+
+/// A packet of the right size with an empty body, for the ones whose fields
+/// are not mapped yet. An empty list is all zeroes in this protocol anyway.
+fn zeroed(opcode: u16, sender: u16, total_size: usize) -> Vec<u8> {
+    frame::encode(
+        &Message { sender, opcode, time: 0, body: vec![0u8; total_size - MIN_FRAME] },
+        rand::random(),
+    )
+}
+
+/// `0x106` `TSendSkillsPacket`: NPC index, send type and 40 skill ids.
+fn encode_skills(client_id: u16) -> Vec<u8> {
+    let mut body = vec![0u8; SKILLS_SIZE - MIN_FRAME];
+    // NPC index and send type both stay 0 on login; the original only sets
+    // the send type when a skill NPC is involved.
+    let _ = &mut body[0..4];
+    frame::encode(
+        &Message { sender: client_id, opcode: OP_SKILLS, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `0x109` `TSendRefreshPoint`: the six attributes plus the two spendable
+/// point pools. The original copies the first 12 bytes of `TStatus` straight
+/// in, so the order here is the attribute order.
+fn encode_refresh_point(character: &Character) -> Vec<u8> {
+    let mut body = vec![0u8; REFRESH_POINT_SIZE - MIN_FRAME];
+    for (i, value) in character.attributes.iter().enumerate() {
+        body[i * 2..i * 2 + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    // Free status points, which the original sends twice: once as the last
+    // attribute and once in its own field.
+    let free = character.attributes[5];
+    body[12..14].copy_from_slice(&free.to_le_bytes());
+    body[14..16].copy_from_slice(&0u16.to_le_bytes()); // skill points
+    frame::encode(
+        &Message { sender: FIXED_INDEX, opcode: OP_REFRESH_POINT, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `0x10A` `TSendRefreshStatus`: combat stats.
+fn encode_refresh_status(character: &Character) -> Vec<u8> {
+    let mut body = vec![0u8; REFRESH_STATUS_SIZE - MIN_FRAME];
+    // Movement speed is the only field we have a real value for; the rest of
+    // the combat stats come from tables we have not read yet.
+    body[20..22].copy_from_slice(&(character.speed_move as u16).to_le_bytes());
+    frame::encode(
+        &Message { sender: FIXED_INDEX, opcode: OP_REFRESH_STATUS, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `0x108` `TSendCurrentLevel`: level, a constant, and experience.
+fn encode_level(character: &Character, client_id: u16) -> Vec<u8> {
+    let mut body = vec![0u8; LEVEL_SIZE - MIN_FRAME];
+    // Same convention as everywhere else: the client adds 1.
+    body[0..2].copy_from_slice(&character.level.saturating_sub(1).to_le_bytes());
+    body[2..4].copy_from_slice(&LEVEL_UNK.to_le_bytes());
+    body[4..12].copy_from_slice(&character.exp.to_le_bytes());
+    frame::encode(
+        &Message { sender: client_id, opcode: OP_LEVEL, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `0x103` `TSendCurrentHPMPPacket`: maximum and current HP and MP.
+fn encode_hp_mp(character: &Character, client_id: u16, hp: u32, mp: u32) -> Vec<u8> {
+    let _ = character;
+    let mut body = vec![0u8; HP_MP_SIZE - MIN_FRAME];
+    body[0..4].copy_from_slice(&hp.to_le_bytes());
+    body[4..8].copy_from_slice(&hp.to_le_bytes());
+    body[8..12].copy_from_slice(&mp.to_le_bytes());
+    body[12..16].copy_from_slice(&mp.to_le_bytes());
+    // The last field marks an update rather than a login; 0 on this path.
+    frame::encode(
+        &Message { sender: client_id, opcode: OP_HP_MP, time: 0, body },
+        rand::random(),
+    )
 }
 
 /// `0x301`: the player walked.
@@ -975,8 +1145,65 @@ mod tests {
         let Action::Reply(frames) = handle_message(&state, &mut session, &ready) else {
             panic!("expected the spawn packet");
         };
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].len(), CREATE_MOB_SIZE, "the client expects 508 bytes");
+        // The client has no acknowledgement packet: it keeps resending 0xF0B
+        // until this burst convinces it that it is in the world.
+        let opcodes: Vec<u16> = frames.iter().map(|f| decode(f).opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_CREATE_MOB,
+                OP_SKILLS,
+                OP_CASH,
+                OP_ACCOUNT_STATUS,
+                OP_BUFFS,
+                OP_ACTIVE_TITLE,
+                OP_RELICS,
+                OP_REFRESH_POINT,
+                OP_REFRESH_STATUS,
+                OP_ALL_ATTRIBUTES,
+                OP_LEVEL,
+                OP_HP_MP,
+                OP_CREATE_MOB,
+            ],
+            "order matters; it is the order SendToWorldSends uses"
+        );
+
+        // Every size comes from a Delphi record and the client rejects a
+        // packet that is not exactly that long.
+        let sizes: Vec<usize> = frames.iter().map(|f| f.len()).collect();
+        assert_eq!(
+            sizes,
+            vec![
+                CREATE_MOB_SIZE,
+                SKILLS_SIZE,
+                SIGNAL_SIZE,
+                SIGNAL_SIZE,
+                BUFFS_SIZE,
+                ACTIVE_TITLE_SIZE,
+                RELICS_SIZE,
+                REFRESH_POINT_SIZE,
+                REFRESH_STATUS_SIZE,
+                ALL_ATTRIBUTES_SIZE,
+                LEVEL_SIZE,
+                HP_MP_SIZE,
+                CREATE_MOB_SIZE,
+            ]
+        );
+
+        // The level packet carries level minus one and the constant the
+        // original writes beside it.
+        let level = decode(&frames[10]);
+        assert_eq!(u16::from_le_bytes(level.body[0..2].try_into().unwrap()), 29);
+        assert_eq!(u16::from_le_bytes(level.body[2..4].try_into().unwrap()), LEVEL_UNK);
+
+        // HP and MP must not be zero or the character is born dead.
+        let vitals = decode(&frames[11]);
+        assert!(u32::from_le_bytes(vitals.body[0..4].try_into().unwrap()) > 0, "max HP");
+        assert!(u32::from_le_bytes(vitals.body[8..12].try_into().unwrap()) > 0, "max MP");
+
+        // Some packets identify themselves with a fixed index, not the client id.
+        assert_eq!(decode(&frames[7]).sender, FIXED_INDEX, "0x109");
+        assert_eq!(decode(&frames[8]).sender, FIXED_INDEX, "0x10A");
 
         let message = decode(&frames[0]);
         assert_eq!(message.opcode, OP_CREATE_MOB);

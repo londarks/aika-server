@@ -164,6 +164,22 @@ treated as one.
   `crates/aika-data/testdata/` and the round-trip tests start checking against
   real bytes; without it they run against a list the codec builds itself.
 
+  It also reads `strdef*.bin`, the client string table, through `strdef-tool`:
+
+  ```sh
+  strdef-tool list    /path/to/client/UI/strdef4.bin
+  strdef-tool pending /path/to/client/UI/strdef4.bin   # entries still in Big5 or EUC-KR
+  strdef-tool export  /path/to/client/UI/strdef4.bin pt.tsv
+  strdef-tool import  /path/to/client/UI/strdef4.bin pt.tsv
+  strdef-tool scan    /path/to/client/UI/FieldSceneB4.bin
+  ```
+
+  The table is 3096 fixed 128-byte records of plain latin-1 text, so the whole
+  interface can be retranslated by editing a TSV. Records nobody touched come
+  back byte for byte, and `import` writes to a `.new` file rather than over the
+  original. `scan` handles the files that are not record tables, walking the
+  bytes for embedded untranslated strings.
+
 ## `sql/schema.sql`
 
 The structure of the original server's database, 47 tables, kept as

@@ -4,3 +4,4 @@
 //! read and written by our own code instead of the original pack's tools.
 
 pub mod sl;
+pub mod strdef;

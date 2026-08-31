@@ -205,6 +205,26 @@ const NPC_UNK0: u8 = 0x28;
 const NPC_IS_SERVICE: u8 = 1;
 const NPC_EFFECT_TYPE: u16 = 1;
 
+/// The equipment slots the spawn packet carries beyond the body and the
+/// hair. Slots 8 and up are accessories, which it has no room for.
+const WORN_SLOTS: std::ops::Range<u16> = 2..8;
+
+/// What the client should draw in one equipment slot.
+///
+/// The appearance wins when there is one, which is how a piece of gear can
+/// look like something else; otherwise the item itself
+/// (`Mob/BaseNpc.pas:1876`).
+fn worn_appearance(character: &Character, slot: u16) -> u16 {
+    let Some(item) = character.items.get(inventory::EQUIP, slot) else {
+        return 0;
+    };
+    if item.appearance != 0 {
+        item.appearance
+    } else {
+        item.index
+    }
+}
+
 /// Fixed values the original writes without explanation, but which the
 /// client expects (`Mob/BaseMob.pas:2974-3131`).
 const SPAWN_UNK0: u8 = 0x0A;
@@ -1268,6 +1288,15 @@ fn encode_spawn_as(character: &Character, client_id: u16, spawn_type: u8) -> Vec
     // Equip[0] is the class and Equip[1] the hair, as in the character list.
     put16(&mut body, off::EQUIP, character.class_index);
     put16(&mut body, off::EQUIP + 2, character.hair);
+
+    // And slots 2 to 7 are what the character is actually wearing. Without
+    // these the client draws a body and a haircut and nothing else: the
+    // armour is in the record it holds, and it does not dress anyone from
+    // there — it dresses them from the spawn.
+    for slot in WORN_SLOTS {
+        put16(&mut body, off::EQUIP + slot as usize * 2, worn_appearance(character, slot));
+    }
+
     body[off::ARMA_REFINE] = SPAWN_ARMA_REFINE;
 
     // Floating point coordinates: the original server copies the pair of
@@ -2563,7 +2592,13 @@ fn encode_char_list_entry(character: Option<&Character>) -> [u8; CHAR_ENTRY_SIZE
     out[18..20].copy_from_slice(&character.class_info().to_le_bytes());
     out[20..24].copy_from_slice(&character.sizes);
 
-    // Equip[0] is the class and Equip[1] the hair; the rest is appearance.
+    // The selection screen dresses the character the same way the world
+    // does, from the appearance of each slot; the first two are then
+    // overwritten with the body and the hair.
+    for slot in WORN_SLOTS {
+        let at = 24 + slot as usize * 2;
+        out[at..at + 2].copy_from_slice(&worn_appearance(character, slot).to_le_bytes());
+    }
     out[24..26].copy_from_slice(&character.class_index.to_le_bytes());
     out[26..28].copy_from_slice(&character.hair.to_le_bytes());
 
@@ -4511,5 +4546,50 @@ mod tests {
         assert!(casts < 200, "the monster would not die");
         assert_eq!(session.character.as_ref().unwrap().exp, before + 25);
         assert!(!session.visible_mobs.contains(&RAT));
+    }
+
+    /// A character wearing armour has to arrive wearing it. The record the
+    /// client holds is not what dresses it: the spawn packet is.
+    #[tokio::test]
+    async fn what_a_character_wears_reaches_the_spawn_and_the_selection_screen() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = logged_in(&state).await;
+        handle_message(&state, &mut session, &enter_world(0)).await;
+
+        let character = session.character.as_mut().unwrap();
+        // a breastplate, and a helmet whose appearance is something else
+        character
+            .items
+            .put(Item { index: 3314, container: inventory::EQUIP, slot: 2, ..Item::default() })
+            .unwrap();
+        character
+            .items
+            .put(Item {
+                index: 3344,
+                appearance: 9999,
+                container: inventory::EQUIP,
+                slot: 3,
+                ..Item::default()
+            })
+            .unwrap();
+
+        let character = session.character.as_ref().unwrap().clone();
+        let spawn = decode(&encode_spawn(&character, TEST_CLIENT_ID));
+
+        use spawn_offset as off;
+        let worn = |slot: usize| {
+            let at = off::EQUIP + slot * 2;
+            u16::from_le_bytes(spawn.body[at..at + 2].try_into().unwrap())
+        };
+        assert_eq!(worn(0), character.class_index, "the body is still the class");
+        assert_eq!(worn(1), character.hair);
+        assert_eq!(worn(2), 3314, "the breastplate did not reach the client");
+        assert_eq!(worn(3), 9999, "the appearance has to win over the item");
+        assert_eq!(worn(7), 0, "an empty slot stays empty");
+
+        // and the selection screen dresses it the same way
+        let entry = encode_char_list_entry(Some(&character));
+        let at = 24 + 2 * 2;
+        assert_eq!(u16::from_le_bytes(entry[at..at + 2].try_into().unwrap()), 3314);
     }
 }

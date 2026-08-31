@@ -83,6 +83,12 @@ pub struct GameConfig {
     /// new characters are born naked with flat attributes.
     #[serde(default)]
     pub template_dir: String,
+    /// `ExpList.bin`. Empty means nobody ever gains a level.
+    #[serde(default)]
+    pub exp_list: String,
+    /// Directory of drop tables. Empty means monsters leave nothing.
+    #[serde(default)]
+    pub drop_dir: String,
 }
 
 /// What the launcher receives when it checks the client version.
@@ -240,6 +246,8 @@ impl Default for GameConfig {
             mob_dir: String::new(),
             skill_data: String::new(),
             template_dir: String::new(),
+            exp_list: String::new(),
+            drop_dir: String::new(),
         }
     }
 }

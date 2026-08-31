@@ -8,6 +8,8 @@ use aika_data::itemlist::ItemList;
 use aika_data::mobs::MobTable;
 use aika_data::npc::NpcSet;
 use aika_data::skills::SkillTable;
+use aika_data::drops::DropTable;
+use aika_data::exp::ExpTable;
 use aika_data::template::Template;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -26,6 +28,10 @@ pub struct State {
     /// What a character of each class is born as, in class order. A missing
     /// one leaves that class playable but naked.
     pub templates: [Option<Template>; 6],
+    /// What each level costs. Empty means nobody gains one.
+    pub levels: ExpTable,
+    /// What monsters leave behind. Empty means they leave nothing.
+    pub drops: DropTable,
     /// Where the world is kept between runs. Unit tests that only build
     /// packets leave it out; every server that people log into has one.
     db: Option<Database>,
@@ -57,8 +63,10 @@ impl State {
         let items = load_items(&cfg.game.item_list);
         let skills = load_skills(&cfg.game.skill_data);
         let templates = load_templates(&cfg.game.template_dir);
+        let levels = load_levels(&cfg.game.exp_list);
+        let drops = load_drops(&cfg.game.drop_dir);
         Ok(Self {
-            cfg, store, world, items, skills, templates,
+            cfg, store, world, items, skills, templates, levels, drops,
             db: Some(db), started: Instant::now(),
         })
     }
@@ -76,8 +84,10 @@ impl State {
         let items = load_items(&cfg.game.item_list);
         let skills = load_skills(&cfg.game.skill_data);
         let templates = load_templates(&cfg.game.template_dir);
+        let levels = load_levels(&cfg.game.exp_list);
+        let drops = load_drops(&cfg.game.drop_dir);
         Ok(Self {
-            cfg, store, world, items, skills, templates,
+            cfg, store, world, items, skills, templates, levels, drops,
             db: None, started: Instant::now(),
         })
     }
@@ -264,4 +274,39 @@ fn load_templates(dir: &str) -> [Option<Template>; 6] {
     }
     info!(dir, classes = loaded.iter().filter(|t| t.is_some()).count(), "templates loaded");
     loaded
+}
+
+/// Reads the experience curve, if one was configured.
+fn load_levels(path: &str) -> ExpTable {
+    if path.is_empty() {
+        return ExpTable::default();
+    }
+    match std::fs::read(path).map(|b| ExpTable::decode(&b)) {
+        Ok(Ok(table)) => {
+            info!(path, levels = table.max_level(), "experience curve loaded");
+            table
+        }
+        Ok(Err(e)) => {
+            warn!(path, error = %e, "the experience curve is malformed; nobody will level");
+            ExpTable::default()
+        }
+        Err(e) => {
+            warn!(path, error = %e, "could not read the experience curve");
+            ExpTable::default()
+        }
+    }
+}
+
+/// Reads the drop tables, if a directory was configured.
+fn load_drops(dir: &str) -> DropTable {
+    if dir.is_empty() {
+        return DropTable::default();
+    }
+    let table = DropTable::load_dir(dir);
+    if table.is_empty() {
+        warn!(dir, "no drop tables were read; monsters will leave nothing");
+    } else {
+        info!(dir, drops = table.len(), "drop tables loaded");
+    }
+    table
 }

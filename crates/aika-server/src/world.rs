@@ -12,7 +12,7 @@
 //! the shape of the answer is the same. A spatial grid belongs here later,
 //! behind the same methods.
 
-use crate::mob::Mob;
+use crate::mob::{Attack, Mob};
 use crate::store::Character;
 use aika_data::npc::Npc;
 use std::collections::HashMap;
@@ -81,6 +81,14 @@ pub struct World {
     /// come back — so they sit behind a lock and the world owns them rather
     /// than any one connection.
     mobs: Mutex<Vec<Mob>>,
+    /// Blows monsters have landed that the players have not been told about
+    /// yet, by player.
+    ///
+    /// The world tick runs outside every connection and cannot reach into a
+    /// session to take health off it. So it leaves the damage here and the
+    /// session picks it up on its next packet, which the client's own
+    /// twice-a-second heartbeat guarantees.
+    incoming: Mutex<HashMap<u16, Vec<Attack>>>,
 }
 
 impl World {
@@ -133,6 +141,64 @@ impl World {
         Some((mob.clone(), killed))
     }
 
+    /// Runs every monster's turn and collects what they swing at.
+    ///
+    /// The positions of the players are passed in rather than read under the
+    /// same lock: taking both locks in one place is how two of them end up
+    /// taken in the other order somewhere else.
+    pub fn think_mobs(&self, players: &[(u16, (f32, f32))], now: Instant) -> Vec<(u16, Attack)> {
+        let mut swings = Vec::new();
+        let mut mobs = self.mobs.lock().unwrap();
+
+        for mob in mobs.iter_mut().filter(|m| m.is_alive()) {
+            // The nearest player, which is all a monster this simple needs.
+            let nearest = players
+                .iter()
+                .map(|(id, at)| (*id, *at, mob.distance_to(*at)))
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .map(|(id, at, _)| (id, at));
+
+            if let Some(attack) = mob.think(nearest, now) {
+                mob.last_hurt_by = Some(attack.target);
+                swings.push((mob.id, attack));
+            }
+        }
+        swings
+    }
+
+    /// Leaves a blow for a player to find on its next packet.
+    pub fn deal_to_player(&self, player: u16, attack: Attack) {
+        self.incoming.lock().unwrap().entry(player).or_default().push(attack);
+    }
+
+    /// Takes everything left for a player, emptying the list.
+    pub fn take_incoming(&self, player: u16) -> Vec<Attack> {
+        self.incoming.lock().unwrap().remove(&player).unwrap_or_default()
+    }
+
+    /// Everyone in the world, with where they stand.
+    pub fn positions(&self) -> Vec<(u16, (f32, f32))> {
+        self.players
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|p| Some((p.client_id, p.position()?)))
+            .collect()
+    }
+
+    /// Every monster near enough to any of these points to matter, which is
+    /// what the tick has to move.
+    pub fn mobs_moved(&self, since: &[(u16, (f32, f32))]) -> Vec<Mob> {
+        let mobs = self.mobs.lock().unwrap();
+        mobs.iter()
+            .filter(|m| m.is_alive())
+            .filter(|m| {
+                since.iter().any(|(_, at)| within(*at, m.position(), DISTANCE_TO_FORGET))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Brings back every monster whose time is up, and says which.
     pub fn revive_mobs(&self, now: Instant) -> Vec<Mob> {
         let mut mobs = self.mobs.lock().unwrap();
@@ -167,6 +233,7 @@ impl World {
     }
 
     pub fn disconnect(&self, client_id: u16) -> Option<Presence> {
+        self.incoming.lock().unwrap().remove(&client_id);
         self.players.lock().unwrap().remove(&client_id)
     }
 
@@ -217,6 +284,13 @@ impl World {
             })
             .cloned()
             .collect()
+    }
+
+    /// Sends a frame to one player, if they are still connected.
+    pub fn send_to(&self, client_id: u16, frame: Vec<u8>) {
+        if let Some(presence) = self.players.lock().unwrap().get(&client_id) {
+            presence.send(frame);
+        }
     }
 
     /// Sends a frame to everyone who can see this player, never to the player

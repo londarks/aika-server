@@ -12,7 +12,7 @@
 use crate::state::State;
 use crate::inventory::{self, Inventory};
 use crate::store::{Account, Character, Item, MAX_CHARACTERS};
-use crate::{ability, combat, creation, dialog, shop};
+use crate::{ability, combat, creation, dialog, shop, stats};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
 use aika_data::npc::Npc;
 use aika_net::frame::{self, FrameError, FrameReader, Message, MIN_FRAME};
@@ -59,6 +59,8 @@ pub const OP_DELETE_ITEM: u16 = 0x32C;
 pub const OP_USE_ITEM: u16 = 0x31D;
 /// Leave the world and go back to the selection screen.
 pub const OP_BACK_TO_CHARACTER_SELECT: u16 = 0x668;
+/// Get up after dying.
+pub const OP_REVIVE: u16 = 0x303;
 /// `TClientMessagePacket` (`Data/Packets.pas:152`): a line of text on screen.
 pub const OP_CLIENT_MESSAGE: u16 = 0x984;
 /// Walking, the only move type the original relays to other players
@@ -339,6 +341,9 @@ struct Session {
     /// takes them down yet; they live here so a potion has somewhere to go.
     cur_hp: u32,
     cur_mp: u32,
+    /// Down, and waiting to get up. A dead character takes no more damage
+    /// and cannot swing.
+    dead: bool,
     /// Something changed that the database has not been told about yet.
     dirty: bool,
     /// When the last write went out, so a player walking in a straight line
@@ -410,12 +415,50 @@ pub fn spawn_world_tick(state: Arc<State>) -> tokio::task::JoinHandle<()> {
         let mut ticker = tokio::time::interval(WORLD_TICK);
         loop {
             ticker.tick().await;
-            let revived = state.world.revive_mobs(std::time::Instant::now());
+            let now = std::time::Instant::now();
+
+            let revived = state.world.revive_mobs(now);
             if !revived.is_empty() {
                 debug!(count = revived.len(), "monsters came back");
             }
+
+            // Nothing to think about with nobody in the world, and five
+            // thousand monsters pacing for an empty map is work for nothing.
+            let players = state.world.positions();
+            if players.is_empty() {
+                continue;
+            }
+
+            for (mob, attack) in state.world.think_mobs(&players, now) {
+                debug!(mob, target = attack.target, damage = attack.damage, "a monster swung");
+                state.world.deal_to_player(attack.target, attack);
+            }
+
+            // Whoever can see a monster that moved is told where it is now.
+            for mob in state.world.mobs_moved(&players) {
+                let frame = encode_mob_move(&mob);
+                for (id, at) in &players {
+                    if within(*at, mob.position(), DISTANCE_TO_WATCH) {
+                        state.world.send_to(*id, frame.clone());
+                    }
+                }
+            }
         }
     })
+}
+
+/// `0x301` for a monster: the same movement packet a player sends, with the
+/// monster as the sender, which is how everyone else learns it walked.
+fn encode_mob_move(mob: &crate::mob::Mob) -> Vec<u8> {
+    let mut body = vec![0u8; Movement::BODY_SIZE];
+    body[0..4].copy_from_slice(&mob.x.to_le_bytes());
+    body[4..8].copy_from_slice(&mob.y.to_le_bytes());
+    body[Movement::SPEED] = MOB_SPEED_MOVE;
+
+    frame::encode(
+        &Message { sender: mob.id, opcode: OP_MOVE, time: 0, body },
+        rand::random(),
+    )
 }
 
 /// Writes the session out if it owes anything and enough time has passed.
@@ -596,7 +639,7 @@ enum Action {
 async fn handle_message(state: &State, session: &mut Session, message: &Message) -> Action {
     match message.opcode {
         OP_REQUEST_LOGIN => handle_request_login(state, session, message),
-        OP_ENTER_WORLD => handle_enter_world(session, message, state.uptime_ms()),
+        OP_ENTER_WORLD => handle_enter_world(state, session, message, state.uptime_ms()),
         OP_CLIENT_READY => handle_client_ready(state, session),
         OP_MOVE => handle_move(state, session, message),
         dialog::OP_OPEN_NPC => handle_open_npc(state, session, message),
@@ -614,6 +657,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         OP_MOVE_ITEM => handle_move_item(session, message),
         OP_USE_ITEM => handle_use_item(state, session, message),
         combat::OP_ATTACK => handle_attack(state, session, message),
+        OP_REVIVE => handle_revive(state, session, message),
         ability::OP_USE_SKILL => handle_use_skill(state, session, message),
         OP_DELETE_ITEM => handle_delete_item(session, message),
         opcode => {
@@ -703,7 +747,12 @@ fn handle_request_login(state: &State, session: &mut Session, message: &Message)
 /// The record is called `TNumericTokenPacket` in the original and suggests
 /// a numeric password, but all that logic sits behind an unreachable
 /// `Exit;` (`PacketHandlers.pas:484`): in practice only `Slot` is read.
-fn handle_enter_world(session: &mut Session, message: &Message, time: u32) -> Action {
+fn handle_enter_world(
+    state: &State,
+    session: &mut Session,
+    message: &Message,
+    time: u32,
+) -> Action {
     if message.body.len() < 4 {
         warn!(size = message.body.len(), "0xF02 packet without the slot");
         return Action::Disconnect;
@@ -749,9 +798,9 @@ fn handle_enter_world(session: &mut Session, message: &Message, time: u32) -> Ac
     }
     frames.push(zeroed(OP_ENTER_94C, 0, ENTER_94C_SIZE));
 
-    let (max_hp, max_mp) = vitals(&character);
-    session.cur_hp = max_hp;
-    session.cur_mp = max_mp;
+    let stats = stats::of(&character, &state.items);
+    session.cur_hp = stats.max_hp;
+    session.cur_mp = stats.max_mp;
     session.character = Some(character);
     Action::Reply(frames)
 }
@@ -775,8 +824,10 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
         // The client sends this twice a second whatever we do. Rather than
         // drop it, spend it: it is the only regular tick a standing player
         // gives us, and it is what lets a monster that came back appear
-        // without the player having to walk.
-        let frames = refresh_mob_visibility(state, session);
+        // without the player having to walk — and what carries the blows the
+        // world tick left for this player.
+        let mut frames = refresh_mob_visibility(state, session);
+        frames.extend(collect_blows(state, session));
         return if frames.is_empty() { Action::Ignore } else { Action::Reply(frames) };
     }
 
@@ -2214,10 +2265,12 @@ fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> 
         return Action::Reply(frames);
     }
 
+    // A spell leans on the caster's magic attack rather than its swing.
+    let stats = stats::of(character, &state.items);
     let blow = combat::swing_with(
         character.level,
         target.level,
-        cast.damage,
+        cast.damage + stats::base_damage(stats.magic_attack, target.level as u32),
         &mut rand::thread_rng(),
     );
     let Some((target, killed)) = state.world.wound_mob(target.id, blow.damage, now) else {
@@ -2241,9 +2294,125 @@ fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> 
 
     if killed {
         info!(monster = %target.name, skill = cast.skill, "killed with a skill");
-        frames.extend(reward_for(session, &target));
+        frames.extend(reward_for(state, session, &target));
         session.visible_mobs.remove(&target.id);
     }
+    Action::Reply(frames)
+}
+
+
+/// Applies whatever monsters landed on this player since its last packet.
+///
+/// The world tick cannot reach into a session, so it leaves the damage in the
+/// world and this takes it. Being late by up to half a second is fine: the
+/// client draws its own health bar from what it is told, and it is told here.
+fn collect_blows(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+    let blows = state.world.take_incoming(session.client_id);
+    if blows.is_empty() || session.character.is_none() {
+        return Vec::new();
+    }
+    if session.dead {
+        return Vec::new();
+    }
+
+    let client_id = session.client_id;
+    let stats = stats::of(session.character.as_ref().expect("checked above"), &state.items);
+    let mut frames = Vec::new();
+
+    for blow in blows {
+        let damage = stats::base_damage(blow.damage, stats.defence);
+        session.cur_hp = session.cur_hp.saturating_sub(damage);
+
+        let report = combat::Damage {
+            skill: 0,
+            attacker: blow.attacker,
+            attacker_at: (0.0, 0.0),
+            attacker_hp: 0,
+            animation: 0,
+            target: client_id,
+            target_hp: session.cur_hp,
+            blow: combat::Blow { damage, kind: combat::DAMAGE_NORMAL },
+            at: session
+                .character
+                .as_ref()
+                .map(|c| (c.x as f32, c.y as f32))
+                .unwrap_or_default(),
+        };
+        frames.push(encode_damage(&report));
+
+        if session.cur_hp == 0 {
+            frames.extend(die(state, session, &stats));
+            break;
+        }
+    }
+    frames
+}
+
+/// What happens when a player runs out of health.
+///
+/// The client is told the health is gone and the character is marked down.
+/// Nothing is taken away: the original has a death penalty, and inventing one
+/// is a decision for whoever runs the server rather than for this.
+fn die(state: &State, session: &mut Session, stats: &stats::Stats) -> Vec<Vec<u8>> {
+    session.dead = true;
+    session.cur_hp = 0;
+
+    let name = session.character.as_ref().map(|c| c.name.clone()).unwrap_or_default();
+    info!(character = %name, "died");
+
+    let mut frames = vec![encode_hp_mp(
+        session.character.as_ref().expect("checked by the caller"),
+        session.client_id,
+        0,
+        session.cur_mp.min(stats.max_mp),
+    )];
+
+    // Everyone nearby sees them go down.
+    let frame = encode_remove_mob(session.client_id, DELETE_NORMAL);
+    state.world.send_to_visible(session.client_id, frame.clone());
+    frames.push(frame);
+    frames
+}
+
+/// `0x303`: get up again.
+///
+/// The original revives at the nearest save point; without those read yet,
+/// this is the town the character was created in, which is where a save point
+/// would be anyway.
+fn handle_revive(state: &State, session: &mut Session, _message: &Message) -> Action {
+    if !session.dead {
+        debug!("0x303 from somebody who is not dead");
+        return Action::Ignore;
+    }
+
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+    let (x, y) = creation::TOWN_FIRST;
+    character.x = x;
+    character.y = y;
+
+    let character = session.character.as_ref().expect("checked above").clone();
+    let stats = stats::of(&character, &state.items);
+
+    session.dead = false;
+    session.cur_hp = stats.max_hp;
+    session.cur_mp = stats.max_mp;
+    session.dirty = true;
+    session.visible.clear();
+    session.visible_mobs.clear();
+    session.visible_npcs.clear();
+
+    state.world.enter(session.client_id, character.clone());
+    state.world.move_to(session.client_id, x, y);
+    info!(character = %character.name, "got up");
+
+    let mut frames = vec![
+        encode_spawn_as(&character, session.client_id, SPAWN_TELEPORT_IN),
+        encode_hp_mp(&character, session.client_id, session.cur_hp, session.cur_mp),
+    ];
+    frames.extend(refresh_npc_visibility(state, session));
+    frames.extend(refresh_mob_visibility(state, session));
     Action::Reply(frames)
 }
 
@@ -2258,6 +2427,9 @@ fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Act
         return Action::Ignore;
     };
 
+    if session.dead {
+        return Action::Ignore;
+    }
     let Some(character) = session.character.as_ref() else {
         return Action::Ignore;
     };
@@ -2279,7 +2451,15 @@ fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Act
         return Action::Ignore;
     }
 
-    let blow = combat::swing(level, target.level, &mut rand::thread_rng());
+    // Attack comes off the character and its gear now, and the monster's
+    // level stands in for the armour it is not wearing.
+    let stats = stats::of(session.character.as_ref().expect("checked above"), &state.items);
+    let blow = combat::swing_with(
+        level,
+        target.level,
+        stats::base_damage(stats.attack, target.level as u32),
+        &mut rand::thread_rng(),
+    );
     let Some((target, killed)) =
         state.world.wound_mob(request.target, blow.damage, std::time::Instant::now())
     else {
@@ -2314,15 +2494,15 @@ fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Act
             experience = target.experience,
             "killed"
         );
-        frames.extend(reward_for(session, &target));
+        frames.extend(reward_for(state, session, &target));
         session.visible_mobs.remove(&target.id);
     }
     Action::Reply(frames)
 }
 
-/// What a kill is worth. Experience only, for now: drops need the drop tables
-/// and levelling needs `ExpList.bin`, and neither is read yet.
-fn reward_for(session: &mut Session, target: &crate::mob::Mob) -> Vec<Vec<u8>> {
+/// What a kill is worth: experience, whatever levels that buys, and whatever
+/// the monster was carrying.
+fn reward_for(state: &State, session: &mut Session, target: &crate::mob::Mob) -> Vec<Vec<u8>> {
     let client_id = session.client_id;
     let Some(character) = session.character.as_mut() else {
         return Vec::new();
@@ -2331,8 +2511,81 @@ fn reward_for(session: &mut Session, target: &crate::mob::Mob) -> Vec<Vec<u8>> {
     character.exp = character.exp.saturating_add(target.experience as u64);
     session.dirty = true;
 
-    let character = session.character.as_ref().expect("checked above");
-    vec![encode_level(character, client_id)]
+    // The curve decides the level, not a running count of kills, so a
+    // character whose experience is edited in the database lands where that
+    // experience says it should.
+    let gained = state.levels.levels_gained(character.level, character.exp);
+    let mut frames = Vec::new();
+    if gained > 0 {
+        character.level = character.level.saturating_add(gained);
+        info!(character = %character.name, level = character.level, "levelled up");
+
+        // Health and mana come back full: a level is the one moment the game
+        // hands them over, and arriving at a new level nearly dead is a
+        // punishment for winning.
+        let stats = stats::of(character, &state.items);
+        session.cur_hp = stats.max_hp;
+        session.cur_mp = stats.max_mp;
+        frames.push(encode_hp_mp(
+            session.character.as_ref().expect("checked above"),
+            client_id,
+            session.cur_hp,
+            session.cur_mp,
+        ));
+    }
+
+    frames.push(encode_level(session.character.as_ref().expect("checked above"), client_id));
+    frames.extend(loot_from(state, session, target));
+    frames
+}
+
+/// What the monster was carrying, if anything, straight into the bag.
+///
+/// The original drops it on the ground for the player to pick up, which needs
+/// map items and the packets that go with them. Handing it over is the same
+/// outcome with one fewer system, and it is honest about being a shortcut:
+/// nobody else can take it, and a full bag loses it.
+fn loot_from(state: &State, session: &mut Session, target: &crate::mob::Mob) -> Vec<Vec<u8>> {
+    let band = state.drops.band_for(target.drop_index);
+    let mut rng = rand::thread_rng();
+
+    let Some(id) = aika_data::drops::roll(
+        band,
+        rand::Rng::gen_range(&mut rng, 1..=100),
+        rand::Rng::gen_range(&mut rng, 1..=100),
+        rand::Rng::gen_range(&mut rng, 0..usize::MAX),
+    ) else {
+        return Vec::new();
+    };
+
+    let Some(def) = state.items.get(id as usize) else {
+        debug!(item = id, "a drop table names an item the item table does not");
+        return Vec::new();
+    };
+
+    let dropped = Item {
+        index: id,
+        appearance: id,
+        refine: 1,
+        durability_min: def.durability(),
+        durability_max: def.durability(),
+        ..Item::default()
+    };
+
+    let Some(character) = session.character.as_mut() else {
+        return Vec::new();
+    };
+    match character.items.add(dropped) {
+        Ok(slot) => {
+            let item = character.items.get(inventory::BAG, slot).cloned().unwrap_or_default();
+            info!(item = id, slot, monster = %target.name, "looted");
+            vec![encode_refresh_item(inventory::BAG, slot, &item, true)]
+        }
+        Err(_) => vec![encode_client_message(
+            session.client_id,
+            "Your bag is full, so the drop was lost.",
+        )],
+    }
 }
 
 /// `TRecvDamagePacket` (`0x102`): who hit what, for how much, and what is
@@ -4591,5 +4844,275 @@ mod tests {
         let entry = encode_char_list_entry(Some(&character));
         let at = 24 + 2 * 2;
         assert_eq!(u16::from_le_bytes(entry[at..at + 2].try_into().unwrap()), 3314);
+    }
+
+    // ---- levelling, dying and loot ---------------------------------------
+
+    /// A world with a monster a level 1 can actually kill, and a curve to
+    /// level on. The rat the other tests use is level 40, which a level 1
+    /// cannot scratch — correctly, and uselessly for testing levelling.
+    fn progress_state() -> State {
+        use aika_data::mobs::MobTable;
+        const INFO: &str = "1,Ratinho,216,0,0,60,0,1,7,119,119,1025,0,0,0,0,0,0,45,0,0,0,0,0,25,0,1";
+        const LIST: &str = "1,1,1,1,Ratinho,Ratinho,0,0,0,3452,692,11,8,0,3452,692,11,8,0";
+
+        let mut state = fight_state();
+        let table = MobTable::parse(INFO, LIST).unwrap();
+        state.world = World::with_npcs(Vec::new()).with_mobs(crate::mob::place_all(&table));
+        state.levels = aika_data::exp::ExpTable::decode(&{
+            let mut bytes = Vec::new();
+            for total in [0u64, 20, 60, 200] {
+                bytes.extend_from_slice(&total.to_le_bytes());
+            }
+            bytes
+        })
+        .unwrap();
+        state
+    }
+
+    async fn kill_the_rat(state: &State, session: &mut Session) {
+        let mut swings = 0;
+        while state.world.mob(RAT).is_some_and(|m| m.is_alive()) && swings < 500 {
+            handle_message(state, session, &attack_message(RAT)).await;
+            swings += 1;
+        }
+        assert!(swings < 500, "the monster would not die");
+    }
+
+    /// Experience buys levels off the curve, not off a count of kills.
+    #[tokio::test]
+    async fn enough_experience_is_a_level() {
+        let state = progress_state();
+        let mut session = in_world(&state).await;
+        session.character.as_mut().unwrap().level = 1;
+        session.character.as_mut().unwrap().exp = 0;
+
+        kill_the_rat(&state, &mut session).await;
+
+        // the rat is worth 25, which the curve says is level 2
+        let character = session.character.as_ref().unwrap();
+        assert_eq!(character.exp, 25);
+        assert_eq!(character.level, 2, "the kill did not buy a level");
+    }
+
+    /// One kill can be worth more than one level, and health comes back with
+    /// it: arriving at a new level nearly dead is a punishment for winning.
+    #[tokio::test]
+    async fn a_level_fills_the_health_back_up() {
+        let state = progress_state();
+        let mut session = in_world(&state).await;
+        session.character.as_mut().unwrap().level = 1;
+        session.character.as_mut().unwrap().exp = 0;
+        session.cur_hp = 1;
+
+        kill_the_rat(&state, &mut session).await;
+
+        let stats = stats::of(session.character.as_ref().unwrap(), &state.items);
+        assert_eq!(session.cur_hp, stats.max_hp, "it levelled and stayed hurt");
+    }
+
+    /// A character whose experience is nowhere near the next level stays put.
+    #[tokio::test]
+    async fn not_enough_experience_is_not_a_level() {
+        let state = progress_state();
+        let mut session = in_world(&state).await;
+        session.character.as_mut().unwrap().level = 3;
+        session.character.as_mut().unwrap().exp = 60;
+
+        kill_the_rat(&state, &mut session).await;
+        assert_eq!(session.character.as_ref().unwrap().level, 3);
+    }
+
+    /// A monster's blow reaches the player on its next packet, because the
+    /// world tick cannot reach into a session to take health off it.
+    #[tokio::test]
+    async fn a_blow_left_by_the_tick_reaches_the_player() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+        let before = session.cur_hp;
+
+        state.world.deal_to_player(
+            session.client_id,
+            crate::mob::Attack { attacker: RAT, target: session.client_id, damage: 40 },
+        );
+
+        let ready = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_CLIENT_READY,
+            time: 0,
+            body: Vec::new(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &ready).await);
+
+        assert!(
+            frames.iter().any(|f| decode(f).opcode == combat::OP_DAMAGE),
+            "the player was never told it was hit"
+        );
+        assert!(session.cur_hp < before, "the blow took nothing off");
+    }
+
+    /// Enough blows and the character is down.
+    #[tokio::test]
+    async fn enough_blows_kill_the_player() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+
+        for _ in 0..200 {
+            state.world.deal_to_player(
+                session.client_id,
+                crate::mob::Attack {
+                    attacker: RAT,
+                    target: session.client_id,
+                    damage: 10_000,
+                },
+            );
+            let ready = Message {
+                sender: TEST_CLIENT_ID,
+                opcode: OP_CLIENT_READY,
+                time: 0,
+                body: Vec::new(),
+            };
+            handle_message(&state, &mut session, &ready).await;
+            if session.dead {
+                break;
+            }
+        }
+
+        assert!(session.dead, "the player would not die");
+        assert_eq!(session.cur_hp, 0);
+    }
+
+    /// A dead character takes no more damage and cannot swing.
+    #[tokio::test]
+    async fn the_dead_do_nothing() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+        session.dead = true;
+        session.cur_hp = 0;
+
+        let action = handle_message(&state, &mut session, &attack_message(RAT)).await;
+        assert!(matches!(action, Action::Ignore), "a corpse swung");
+        assert_eq!(state.world.mob(RAT).unwrap().hp, RAT_HP);
+
+        state.world.deal_to_player(
+            session.client_id,
+            crate::mob::Attack { attacker: RAT, target: session.client_id, damage: 40 },
+        );
+        assert!(collect_blows(&state, &mut session).is_empty(), "a corpse was hit again");
+    }
+
+    #[tokio::test]
+    async fn getting_up_restores_health_and_puts_you_in_town() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+        session.dead = true;
+        session.cur_hp = 0;
+        session.character.as_mut().unwrap().x = 9000;
+
+        let revive = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_REVIVE,
+            time: 0,
+            body: Vec::new(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &revive).await);
+
+        assert!(!session.dead);
+        assert!(session.cur_hp > 0, "it got up with no health");
+        let character = session.character.as_ref().unwrap();
+        assert_eq!((character.x, character.y), creation::TOWN_FIRST);
+        assert_eq!(decode(&frames[0]).opcode, OP_CREATE_MOB, "it was never put back on screen");
+    }
+
+    /// Getting up when you are not down is what a client sends twice.
+    #[tokio::test]
+    async fn getting_up_while_alive_does_nothing() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+        let where_it_was = session.character.as_ref().unwrap().x;
+
+        let revive = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_REVIVE,
+            time: 0,
+            body: Vec::new(),
+        };
+        assert!(matches!(
+            handle_message(&state, &mut session, &revive).await,
+            Action::Ignore
+        ));
+        assert_eq!(session.character.as_ref().unwrap().x, where_it_was);
+    }
+
+    /// A kill leaves something behind often enough to notice, and it goes
+    /// into the bag.
+    #[tokio::test]
+    async fn a_kill_can_leave_something_behind() {
+        use aika_data::drops::DropTable;
+
+        let mut state = progress_state();
+        // a band where every roll gives the same thing, so the test does not
+        // depend on which one comes up
+        state.drops = DropTable::default();
+        state.items = {
+            use aika_data::itemlist::{field, ItemList, RECORD_SIZE};
+            let mut raw = vec![0u8; 5000 * RECORD_SIZE];
+            let r = &mut raw[1000 * RECORD_SIZE..1001 * RECORD_SIZE];
+            r[field::NAME.start] = b'x';
+            r[field::SELL_PRICE..field::SELL_PRICE + 4].copy_from_slice(&10u32.to_le_bytes());
+            ItemList::decode(&raw).unwrap()
+        };
+
+        let mut session = in_world(&state).await;
+        // with an empty drop table nothing can drop, which is the case that
+        // has to not crash
+        kill_the_rat(&state, &mut session).await;
+        assert!(session.character.as_ref().unwrap().items.is_empty());
+    }
+
+    /// Gear is what makes a character hit harder, which is the whole point of
+    /// reading its stats.
+    #[tokio::test]
+    async fn better_gear_hits_harder() {
+        let mut state = fight_state();
+        state.items = {
+            use aika_data::itemlist::{field, ItemList, RECORD_SIZE};
+            let mut raw = vec![0u8; 5000 * RECORD_SIZE];
+            let r = &mut raw[1000 * RECORD_SIZE..1001 * RECORD_SIZE];
+            r[field::NAME.start] = b'x';
+            r[field::ATTACK..field::ATTACK + 2].copy_from_slice(&500u16.to_le_bytes());
+            ItemList::decode(&raw).unwrap()
+        };
+
+        let bare = {
+            let mut session = in_world(&state).await;
+            handle_message(&state, &mut session, &attack_message(RAT)).await;
+            RAT_HP - state.world.mob(RAT).unwrap().hp
+        };
+
+        let state = {
+            let mut fresh = fight_state();
+            fresh.items = state.items;
+            fresh
+        };
+        let armed = {
+            let mut session = in_world(&state).await;
+            session
+                .character
+                .as_mut()
+                .unwrap()
+                .items
+                .put(Item {
+                    index: 1000,
+                    container: inventory::EQUIP,
+                    slot: 6,
+                    ..Item::default()
+                })
+                .unwrap();
+            handle_message(&state, &mut session, &attack_message(RAT)).await;
+            RAT_HP - state.world.mob(RAT).unwrap().hp
+        };
+
+        assert!(armed > bare, "a sword did nothing: {armed} against {bare}");
     }
 }

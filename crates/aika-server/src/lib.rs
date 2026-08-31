@@ -26,6 +26,7 @@ pub mod mob;
 pub mod login;
 pub mod state;
 pub mod shop;
+pub mod stats;
 pub mod store;
 pub mod web;
 pub mod world;

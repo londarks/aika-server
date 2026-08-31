@@ -10,3 +10,4 @@ pub mod npc;
 pub mod skills;
 pub mod sl;
 pub mod strdef;
+pub mod template;

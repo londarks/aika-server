@@ -21,6 +21,7 @@
 //! and the same rule applies — the wire decides, not the record.
 
 use crate::store::{Character, Item, DEFAULT_SIZES, DEFAULT_SPEED_MOVE, MAX_CHARACTERS};
+use aika_data::template::Template;
 
 pub const OP_CREATE_CHARACTER: u16 = 0x3E04;
 pub const OP_DELETE_CHARACTER: u16 = 0x3E01;
@@ -95,18 +96,31 @@ pub const MAX_HAIR: u16 = 7731;
 pub const TOWN_FIRST: (u32, u32) = (3450, 690);
 pub const TOWN_SECOND: (u32, u32) = (3470, 935);
 
-/// Everyone starts with a stack of these.
-pub const STARTING_ITEM: u16 = 5300;
-pub const STARTING_ITEM_SLOTS: u16 = 3;
+/// Bags, which go in the last six bag slots rather than the first
+/// (`PacketHandlers.pas:622`).
+pub const BAG_ITEM: u16 = 5300;
+pub const BAG_SLOTS: std::ops::RangeInclusive<u16> = 120..=125;
 
-/// The weapon each class is handed, in equipment slot 15
-/// (`PacketHandlers.pas:640`).
-pub const WEAPON_SLOT: u16 = 15;
-const MELEE_WEAPON: u16 = 4615;
-const RANGED_WEAPON: u16 = 4600;
-/// The original writes a refine of 1000 on the starting weapon, which is how
-/// it marks a piece of gear that cannot be sold or refined further.
-const STARTING_REFINE: u16 = 1000;
+/// Ammunition, and the two classes that get it.
+///
+/// Only the two that shoot: the Atirador takes rifle rounds and the
+/// Pistoleira pistol rounds (`PacketHandlers.pas:632`). Handing a thousand
+/// rifle bullets to a Feiticeiro, which an earlier version of this did, is
+/// not something the original ever does.
+pub const AMMO_SLOT: u16 = 15;
+pub const AMMO_BAG_SLOTS: [u16; 2] = [5, 6];
+const RIFLE_AMMO: u16 = 4615;
+const PISTOL_AMMO: u16 = 4600;
+const AMMO_COUNT: u16 = 1000;
+
+/// Which class number gets which ammunition, or none.
+fn ammunition_for(class_number: u16) -> Option<u16> {
+    match class_number {
+        3 => Some(RIFLE_AMMO),
+        4 => Some(PISTOL_AMMO),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateError {
@@ -216,10 +230,13 @@ pub fn class_of(class_index: u16) -> u16 {
 ///
 /// `taken` decides whether a name is already in use; it is a closure so this
 /// stays a pure function and the database lookup stays at the edge.
+/// `template` is the class's starting record, which is where its armour,
+/// attributes and consumables come from.
 pub fn create(
     request: &CreateCharacter,
     existing: &[Character],
     taken: impl Fn(&str) -> bool,
+    template: Option<&Template>,
 ) -> Result<Character, CreateError> {
     if existing.len() >= MAX_CHARACTERS {
         return Err(CreateError::NoFreeSlot);
@@ -271,31 +288,49 @@ pub fn create(
         items: Default::default(),
     };
 
-    for slot in 0..STARTING_ITEM_SLOTS {
+    // Everything a class is born with comes from its template. Without one
+    // the character is still playable, just naked and with flat attributes.
+    if let Some(template) = template {
+        character.level = template.level().max(1);
+        character.sizes = template.sizes();
+        character.attributes = template.attributes();
+        character.gold = template.gold();
+
+        for item in template.equipment() {
+            let _ = character.items.put(from_template(item, crate::inventory::EQUIP));
+        }
+        for item in template.inventory() {
+            let _ = character.items.put(from_template(item, crate::inventory::BAG));
+        }
+    }
+
+    // And then what creation adds on top of it, in the order the original
+    // adds it (`PacketHandlers.pas:616`).
+    for slot in BAG_SLOTS {
         let _ = character.items.put(Item {
             container: crate::inventory::BAG,
             slot,
-            index: STARTING_ITEM,
-            appearance: STARTING_ITEM,
+            index: BAG_ITEM,
+            appearance: BAG_ITEM,
             refine: 1,
             ..Item::default()
         });
     }
 
-    // Three of the six classes fight at range; the original hands each group
-    // a different starting weapon (`PacketHandlers.pas:640`).
-    let weapon = match class_of(request.class_index) {
-        0 | 1 | 2 => MELEE_WEAPON,
-        _ => RANGED_WEAPON,
-    };
-    let _ = character.items.put(Item {
-        container: crate::inventory::EQUIP,
-        slot: WEAPON_SLOT,
-        index: weapon,
-        appearance: weapon,
-        refine: STARTING_REFINE,
-        ..Item::default()
-    });
+    if let Some(ammo) = ammunition_for(character.class_number()) {
+        let round = |container, slot| Item {
+            container,
+            slot,
+            index: ammo,
+            appearance: ammo,
+            refine: AMMO_COUNT,
+            ..Item::default()
+        };
+        let _ = character.items.put(round(crate::inventory::EQUIP, AMMO_SLOT));
+        for slot in AMMO_BAG_SLOTS {
+            let _ = character.items.put(round(crate::inventory::BAG, slot));
+        }
+    }
 
     Ok(character)
 }
@@ -369,38 +404,95 @@ mod tests {
     fn a_new_character_starts_in_the_town_it_chose() {
         let mut second = request("Athus", 0);
         second.town = 1;
-        assert_eq!(create(&second, &[], nobody).unwrap().x, TOWN_SECOND.0);
-        assert_eq!(create(&request("Athus", 0), &[], nobody).unwrap().x, TOWN_FIRST.0);
+        assert_eq!(create(&second, &[], nobody, None).unwrap().x, TOWN_SECOND.0);
+        assert_eq!(create(&request("Athus", 0), &[], nobody, None).unwrap().x, TOWN_FIRST.0);
     }
 
+    /// A character born without a template is still playable: it just has
+    /// nothing on and flat attributes.
     #[test]
-    fn a_new_character_is_level_one_with_something_to_carry() {
-        let character = create(&request("Athus", 0), &[], nobody).unwrap();
+    fn without_a_template_a_character_is_playable_but_bare() {
+        let character = create(&request("Athus", 0), &[], nobody, None).unwrap();
 
         assert_eq!(character.level, 1);
         assert_eq!(character.name, "Athus");
         assert_eq!(character.class_index, 20);
         assert_eq!(character.id, 0, "the database has not seen it yet");
-
-        assert_eq!(
-            character.items.in_container(crate::inventory::BAG).count(),
-            STARTING_ITEM_SLOTS as usize
-        );
-        let weapon = character
-            .items
-            .get(crate::inventory::EQUIP, WEAPON_SLOT)
-            .expect("no starting weapon");
-        assert_eq!(weapon.index, MELEE_WEAPON, "class 1 fights up close");
+        assert_eq!(character.attributes, [10, 10, 10, 10, 10, 0]);
     }
 
+    /// The six bags creation hands out go in the *last* six bag slots, not
+    /// the first. Putting them at the front, which an earlier version did,
+    /// buries them under everything the template already put there.
     #[test]
-    fn the_ranged_classes_get_a_different_weapon() {
-        let mut ranged = request("Athus", 0);
-        ranged.class_index = 40;
-        let character = create(&ranged, &[], nobody).unwrap();
+    fn the_bags_go_in_the_last_six_slots() {
+        let character = create(&request("Athus", 0), &[], nobody, None).unwrap();
 
-        let weapon = character.items.get(crate::inventory::EQUIP, WEAPON_SLOT).unwrap();
-        assert_eq!(weapon.index, RANGED_WEAPON);
+        for slot in BAG_SLOTS {
+            let bag = character
+                .items
+                .get(crate::inventory::BAG, slot)
+                .unwrap_or_else(|| panic!("no bag in slot {slot}"));
+            assert_eq!(bag.index, BAG_ITEM);
+        }
+        assert!(
+            character.items.get(crate::inventory::BAG, 0).is_none(),
+            "a bag landed in the first slot"
+        );
+    }
+
+    /// Only the two classes that shoot get ammunition. Handing a thousand
+    /// rifle rounds to a Feiticeiro is what this is here to stop.
+    #[test]
+    fn only_the_shooters_are_given_ammunition() {
+        let ammo_of = |class_index: u16| {
+            let mut r = request("Athus", 0);
+            r.class_index = class_index;
+            let c = create(&r, &[], nobody, None).unwrap();
+            c.items.get(crate::inventory::EQUIP, AMMO_SLOT).map(|i| i.index)
+        };
+
+        assert_eq!(ammo_of(30), Some(4615), "the Atirador takes rifle rounds");
+        assert_eq!(ammo_of(40), Some(4600), "the Pistoleira takes pistol rounds");
+
+        for class_index in [10, 20, 50, 60] {
+            assert_eq!(
+                ammo_of(class_index),
+                None,
+                "class index {class_index} was handed ammunition it cannot use"
+            );
+        }
+    }
+
+    /// With a template the character is born wearing what its class wears,
+    /// carrying what it carries, and with the attributes it should have.
+    #[test]
+    fn a_template_decides_what_a_class_starts_as() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/templates");
+        if !dir.join("Atirador.acc").is_file() {
+            return;
+        }
+        let all = aika_data::template::load_all(&dir);
+        let atirador = all[2].as_ref().expect("no Atirador template");
+
+        let mut r = request("Athus", 0);
+        r.class_index = 30;
+        let character = create(&r, &[], nobody, Some(atirador)).unwrap();
+
+        assert_eq!(character.attributes, atirador.attributes());
+        assert_eq!(character.sizes, atirador.sizes());
+        assert!(
+            character.items.in_container(crate::inventory::EQUIP).count() > 1,
+            "it was born wearing nothing"
+        );
+
+        // and the additions still land on top of the template
+        assert!(character.items.get(crate::inventory::BAG, 125).is_some(), "no bag");
+        assert_eq!(
+            character.items.get(crate::inventory::EQUIP, AMMO_SLOT).map(|i| i.index),
+            Some(4615)
+        );
     }
 
     #[test]
@@ -413,7 +505,7 @@ mod tests {
 
     #[test]
     fn a_name_already_in_use_is_refused() {
-        let result = create(&request("Athus", 0), &[], |name| name == "Athus");
+        let result = create(&request("Athus", 0), &[], |name| name == "Athus", None);
         assert_eq!(result, Err(CreateError::NameTaken("Athus".into())));
     }
 
@@ -422,51 +514,51 @@ mod tests {
     #[test]
     fn a_name_has_to_be_letters_and_digits() {
         assert_eq!(
-            create(&request("Ath us", 0), &[], nobody),
+            create(&request("Ath us", 0), &[], nobody, None),
             Err(CreateError::NameNotAlphanumeric)
         );
         assert_eq!(
-            create(&request("Ath\u{1}s", 0), &[], nobody),
+            create(&request("Ath\u{1}s", 0), &[], nobody, None),
             Err(CreateError::NameNotAlphanumeric)
         );
-        assert_eq!(create(&request("", 0), &[], nobody), Err(CreateError::NameEmpty));
-        assert!(create(&request("Athus99", 0), &[], nobody).is_ok());
+        assert_eq!(create(&request("", 0), &[], nobody, None), Err(CreateError::NameEmpty));
+        assert!(create(&request("Athus99", 0), &[], nobody, None).is_ok());
     }
 
     #[test]
     fn a_name_longer_than_the_client_shows_is_refused() {
         let long = "A".repeat(MAX_NAME + 1);
         assert_eq!(
-            create(&request(&long, 0), &[], nobody),
+            create(&request(&long, 0), &[], nobody, None),
             Err(CreateError::NameTooLong(MAX_NAME + 1))
         );
-        assert!(create(&request(&"A".repeat(MAX_NAME), 0), &[], nobody).is_ok());
+        assert!(create(&request(&"A".repeat(MAX_NAME), 0), &[], nobody, None).is_ok());
     }
 
     #[test]
     fn a_slot_that_is_taken_or_does_not_exist_is_refused() {
-        let existing = vec![create(&request("First", 0), &[], nobody).unwrap()];
+        let existing = vec![create(&request("First", 0), &[], nobody, None).unwrap()];
 
         assert_eq!(
-            create(&request("Second", 0), &existing, nobody),
+            create(&request("Second", 0), &existing, nobody, None),
             Err(CreateError::BadSlot(0)),
             "slot 0 is taken"
         );
         assert_eq!(
-            create(&request("Second", 3), &existing, nobody),
+            create(&request("Second", 3), &existing, nobody, None),
             Err(CreateError::BadSlot(3))
         );
-        assert!(create(&request("Second", 1), &existing, nobody).is_ok());
+        assert!(create(&request("Second", 1), &existing, nobody, None).is_ok());
     }
 
     #[test]
     fn a_fourth_character_is_refused() {
         let existing: Vec<Character> = (0..MAX_CHARACTERS as u32)
-            .map(|slot| create(&request(&format!("N{slot}"), slot), &[], nobody).unwrap())
+            .map(|slot| create(&request(&format!("N{slot}"), slot), &[], nobody, None).unwrap())
             .collect();
 
         assert_eq!(
-            create(&request("Fourth", 0), &existing, nobody),
+            create(&request("Fourth", 0), &existing, nobody, None),
             Err(CreateError::NoFreeSlot)
         );
     }
@@ -475,16 +567,33 @@ mod tests {
     fn a_class_or_hair_the_client_cannot_draw_is_refused() {
         let mut bad_class = request("Athus", 0);
         bad_class.class_index = 5;
-        assert_eq!(create(&bad_class, &[], nobody), Err(CreateError::BadClass(5)));
+        assert_eq!(create(&bad_class, &[], nobody, None), Err(CreateError::BadClass(5)));
 
         bad_class.class_index = 70;
-        assert_eq!(create(&bad_class, &[], nobody), Err(CreateError::BadClass(70)));
+        assert_eq!(create(&bad_class, &[], nobody, None), Err(CreateError::BadClass(70)));
 
         let mut bad_hair = request("Athus", 0);
         bad_hair.hair = 1;
-        assert_eq!(create(&bad_hair, &[], nobody), Err(CreateError::BadHair(1)));
+        assert_eq!(create(&bad_hair, &[], nobody, None), Err(CreateError::BadHair(1)));
 
         bad_hair.hair = MAX_HAIR + 1;
-        assert_eq!(create(&bad_hair, &[], nobody), Err(CreateError::BadHair(MAX_HAIR + 1)));
+        assert_eq!(create(&bad_hair, &[], nobody, None), Err(CreateError::BadHair(MAX_HAIR + 1)));
+    }
+}
+
+/// A template's item, put in one of our containers.
+fn from_template(item: aika_data::template::Item, container: u8) -> Item {
+    Item {
+        container,
+        slot: item.slot,
+        index: item.index,
+        appearance: item.appearance,
+        identific: item.identific,
+        effect_index: item.effect_index,
+        effect_value: item.effect_value,
+        durability_min: item.durability_min,
+        durability_max: item.durability_max,
+        refine: item.refine,
+        expires_at: item.expires_at,
     }
 }

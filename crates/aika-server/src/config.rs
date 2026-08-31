@@ -79,6 +79,10 @@ pub struct GameConfig {
     /// The server's `SkillData.bin`. Empty means nobody can cast anything.
     #[serde(default)]
     pub skill_data: String,
+    /// Directory of `.acc` character templates, one per class. Empty means
+    /// new characters are born naked with flat attributes.
+    #[serde(default)]
+    pub template_dir: String,
 }
 
 /// What the launcher receives when it checks the client version.
@@ -235,6 +239,7 @@ impl Default for GameConfig {
             item_list: String::new(),
             mob_dir: String::new(),
             skill_data: String::new(),
+            template_dir: String::new(),
         }
     }
 }

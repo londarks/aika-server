@@ -1934,9 +1934,13 @@ async fn handle_create_character(
     };
     let username = account.username.clone();
 
-    let outcome = creation::create(&request, &account.characters, |name| {
-        state.store.name_taken(name)
-    });
+    let class_number = (request.class_index / 10).clamp(1, 6);
+    let outcome = creation::create(
+        &request,
+        &account.characters,
+        |name| state.store.name_taken(name),
+        state.template(class_number),
+    );
 
     let mut character = match outcome {
         Ok(character) => character,
@@ -3816,8 +3820,8 @@ mod tests {
         assert_eq!(names_in_char_list(&frames[1])[0], "Athus", "the first one was replaced");
     }
 
-    /// A new character starts with something in the bag and a weapon on, and
-    /// both have to reach the client in the world packet.
+    /// What creation puts in the bag has to reach the client in the world
+    /// packet, at the slot it was put in.
     #[tokio::test]
     async fn a_new_character_arrives_carrying_its_starting_gear() {
         let state = state_with(vec![]);
@@ -3828,17 +3832,11 @@ mod tests {
         let record = encode_character(&created, TEST_CLIENT_ID);
 
         use character_offset as off;
-        let bag = off::INVENTORY;
+        let last_bag = off::INVENTORY + 125 * off::ITEM_SIZE;
         assert_eq!(
-            u16::from_le_bytes(record[bag..bag + 2].try_into().unwrap()),
-            creation::STARTING_ITEM
-        );
-
-        let weapon = off::EQUIP + creation::WEAPON_SLOT as usize * off::ITEM_SIZE;
-        assert_ne!(
-            u16::from_le_bytes(record[weapon..weapon + 2].try_into().unwrap()),
-            0,
-            "the starting weapon did not reach the client"
+            u16::from_le_bytes(record[last_bag..last_bag + 2].try_into().unwrap()),
+            creation::BAG_ITEM,
+            "the bag in the last slot did not reach the client"
         );
     }
 

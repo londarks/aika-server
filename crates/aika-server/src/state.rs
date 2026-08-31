@@ -8,6 +8,7 @@ use aika_data::itemlist::ItemList;
 use aika_data::mobs::MobTable;
 use aika_data::npc::NpcSet;
 use aika_data::skills::SkillTable;
+use aika_data::template::Template;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -22,6 +23,9 @@ pub struct State {
     /// Every skill at every rank. Empty when none was configured, which
     /// refuses every cast rather than panicking.
     pub skills: SkillTable,
+    /// What a character of each class is born as, in class order. A missing
+    /// one leaves that class playable but naked.
+    pub templates: [Option<Template>; 6],
     /// Where the world is kept between runs. Unit tests that only build
     /// packets leave it out; every server that people log into has one.
     db: Option<Database>,
@@ -52,7 +56,11 @@ impl State {
             .with_mobs(crate::mob::place_all(&load_mobs(&cfg.game.mob_dir)));
         let items = load_items(&cfg.game.item_list);
         let skills = load_skills(&cfg.game.skill_data);
-        Ok(Self { cfg, store, world, items, skills, db: Some(db), started: Instant::now() })
+        let templates = load_templates(&cfg.game.template_dir);
+        Ok(Self {
+            cfg, store, world, items, skills, templates,
+            db: Some(db), started: Instant::now(),
+        })
     }
 
     /// State with no database behind it, for tests about packets rather than
@@ -67,7 +75,16 @@ impl State {
             .with_mobs(crate::mob::place_all(&load_mobs(&cfg.game.mob_dir)));
         let items = load_items(&cfg.game.item_list);
         let skills = load_skills(&cfg.game.skill_data);
-        Ok(Self { cfg, store, world, items, skills, db: None, started: Instant::now() })
+        let templates = load_templates(&cfg.game.template_dir);
+        Ok(Self {
+            cfg, store, world, items, skills, templates,
+            db: None, started: Instant::now(),
+        })
+    }
+
+    /// The template for a class, counted from one the way the client counts.
+    pub fn template(&self, class_number: u16) -> Option<&Template> {
+        self.templates.get(class_number.checked_sub(1)? as usize)?.as_ref()
     }
 
     pub fn db(&self) -> Option<&Database> {
@@ -227,4 +244,24 @@ fn load_skills(path: &str) -> SkillTable {
             SkillTable::default()
         }
     }
+}
+
+/// Reads the six character templates, if a directory was configured.
+fn load_templates(dir: &str) -> [Option<Template>; 6] {
+    if dir.is_empty() {
+        return Default::default();
+    }
+
+    let loaded = aika_data::template::load_all(dir);
+    for (i, template) in loaded.iter().enumerate() {
+        if template.is_none() {
+            warn!(
+                dir,
+                class = aika_data::template::CLASS_FILES[i],
+                "no template; that class will start naked"
+            );
+        }
+    }
+    info!(dir, classes = loaded.iter().filter(|t| t.is_some()).count(), "templates loaded");
+    loaded
 }

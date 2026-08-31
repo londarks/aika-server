@@ -66,6 +66,9 @@ item_list = "assets/items/ItemList.bin"
 mob_dir = "assets/mobs"
 # Every skill in the game, at every rank. Empty means nobody can cast.
 skill_data = "assets/skills/SkillData.bin"
+# What a character of each class is born as: armour, attributes, consumables.
+# One .acc per class, and they are where the class code comes from too.
+template_dir = "assets/templates"
 
 # What the launcher receives when it checks the client version. It must match
 # the client's `update.dat` byte for byte, or the launcher believes a patch is

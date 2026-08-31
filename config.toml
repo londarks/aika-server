@@ -60,6 +60,10 @@ npc_dir = "assets/npcs"
 # The server's item table, which is what prices a shop. Same rules as above:
 # copy it into `data/` yourself, and never write an absolute path here.
 item_list = "assets/items/ItemList.bin"
+# Where AllMobsInfo.csv and MonsterListCSV.csv are: what kinds of monster
+# exist, and where each copy of them stands. Empty means a world with nothing
+# in it to fight.
+mob_dir = "assets/mobs"
 
 # What the launcher receives when it checks the client version. It must match
 # the client's `update.dat` byte for byte, or the launcher believes a patch is

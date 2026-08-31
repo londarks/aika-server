@@ -12,7 +12,7 @@
 use crate::state::State;
 use crate::inventory::{self, Inventory};
 use crate::store::{Account, Character, Item, MAX_CHARACTERS};
-use crate::{creation, dialog, shop};
+use crate::{combat, creation, dialog, shop};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
 use aika_data::npc::Npc;
 use aika_net::frame::{self, FrameError, FrameReader, Message, MIN_FRAME};
@@ -215,6 +215,9 @@ const SPAWN_ARMA_REFINE: u8 = 15;
 /// client draws them differently, so a player logging in next to you should
 /// not look like one who was standing there all along.
 const SPAWN_TELEPORT_IN: u8 = 1;
+
+/// What the original gives every monster (`ServerSocket.pas:655`).
+const MOB_SPEED_MOVE: u8 = 22;
 /// `SPAWN_NORMAL` in `Data/GlobalDefs.pas:211`. There is also 1 (teleport)
 /// and 2 (offspring birth); bit 0x80 is added when the player is in PK.
 const SPAWN_NORMAL: u8 = 0;
@@ -317,6 +320,9 @@ struct Session {
     /// When the last write went out, so a player walking in a straight line
     /// does not write a row per step.
     saved_at: Option<std::time::Instant>,
+    /// Monsters already on this player's screen, for the same reason as the
+    /// players and the NPCs: sending a spawn twice draws two of them.
+    visible_mobs: HashSet<u16>,
     /// Which NPC has a window open, if any. Every shop packet is checked
     /// against it: a client that never opened a shop must not be able to buy
     /// from one, and the original refuses on the same grounds.
@@ -356,6 +362,32 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Resu
     leave_world(&state, &session);
     writer.abort();
     result
+}
+
+/// How often the world is looked at for things that happen on their own.
+///
+/// Only one thing does so far: monsters whose respawn time is up. A second is
+/// finer than any respawn in the shipped data, the shortest of which is
+/// thirty, so nothing waits noticeably longer than the file says.
+const WORLD_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Brings monsters back on their own clock.
+///
+/// The players are not told from here. Each connection keeps its own idea of
+/// what is on its screen, and pushing a spawn from outside would desync it;
+/// instead the session notices on its next refresh, which the client's own
+/// twice-a-second heartbeat drives.
+pub fn spawn_world_tick(state: Arc<State>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(WORLD_TICK);
+        loop {
+            ticker.tick().await;
+            let revived = state.world.revive_mobs(std::time::Instant::now());
+            if !revived.is_empty() {
+                debug!(count = revived.len(), "monsters came back");
+            }
+        }
+    })
 }
 
 /// Writes the session out if it owes anything and enough time has passed.
@@ -553,6 +585,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         }
         OP_MOVE_ITEM => handle_move_item(session, message),
         OP_USE_ITEM => handle_use_item(state, session, message),
+        combat::OP_ATTACK => handle_attack(state, session, message),
         OP_DELETE_ITEM => handle_delete_item(session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
@@ -710,8 +743,12 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
     // including when trying to walk. Without this guard it gets stuck in a
     // respawn loop.
     if session.spawned {
-        debug!(character = %character.name, "repeated 0xF0B, ignoring");
-        return Action::Ignore;
+        // The client sends this twice a second whatever we do. Rather than
+        // drop it, spend it: it is the only regular tick a standing player
+        // gives us, and it is what lets a monster that came back appear
+        // without the player having to walk.
+        let frames = refresh_mob_visibility(state, session);
+        return if frames.is_empty() { Action::Ignore } else { Action::Reply(frames) };
     }
 
     session.spawned = true;
@@ -722,6 +759,7 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
     // The city is drawn by the client; the people in it are not. Without this
     // the player arrives in an empty town.
     frames.extend(refresh_npc_visibility(state, session));
+    frames.extend(refresh_mob_visibility(state, session));
 
     // Everyone already standing nearby has to appear on this player's screen,
     // and this player on theirs. Both directions use the same spawn packet.
@@ -971,6 +1009,7 @@ fn refresh_visibility(state: &State, session: &mut Session) -> Action {
     let now: HashSet<u16> = neighbours.iter().map(|p| p.client_id).collect();
 
     let mut frames = refresh_npc_visibility(state, session);
+    frames.extend(refresh_mob_visibility(state, session));
     let character = session.character.as_ref().expect("checked above");
     let mine = encode_spawn(character, session.client_id);
 
@@ -1045,6 +1084,49 @@ fn refresh_npc_visibility(state: &State, session: &mut Session) -> Vec<Vec<u8>> 
 
     for id in gone {
         session.visible_npcs.remove(&id);
+        frames.push(encode_remove_mob(id, DELETE_NORMAL));
+    }
+
+    frames
+}
+
+/// Puts monsters on the screen and takes them off it again.
+///
+/// The same two-radius rule as everything else, with one addition: a monster
+/// that died while on screen has to be removed even though it has not moved.
+fn refresh_mob_visibility(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+    let Some(character) = session.character.as_ref() else {
+        return Vec::new();
+    };
+    let at = (character.x as f32, character.y as f32);
+
+    let near = state.world.mobs_near(at, DISTANCE_TO_WATCH);
+    let mut frames = Vec::new();
+
+    for mob in &near {
+        if session.visible_mobs.insert(mob.id) {
+            frames.push(encode_mob_spawn(mob));
+        }
+    }
+
+    // Anything on screen that is no longer near enough, or no longer alive,
+    // comes off it. Asking the world for each one covers the second case:
+    // a monster killed by somebody else is not in `near` any more.
+    let gone: Vec<u16> = session
+        .visible_mobs
+        .iter()
+        .copied()
+        .filter(|id| !near.iter().any(|m| m.id == *id))
+        .filter(|id| {
+            state
+                .world
+                .mob(*id)
+                .is_none_or(|mob| !mob.is_alive() || !within(at, mob.position(), DISTANCE_TO_FORGET))
+        })
+        .collect();
+
+    for id in gone {
+        session.visible_mobs.remove(&id);
         frames.push(encode_remove_mob(id, DELETE_NORMAL));
     }
 
@@ -1948,6 +2030,150 @@ async fn handle_delete_character(
     let account = state.store.get(&username).unwrap_or_else(|| account.clone());
     session.account = Some(account.clone());
     Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
+}
+
+
+/// `0x302`: the player swung at something.
+///
+/// Only monsters can be hit. Attacking another player needs a duel or a war
+/// to be agreed first, and neither exists yet; hitting an NPC is refused by
+/// the original too.
+fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Action {
+    let Some(request) = combat::Attack::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x302 packet too short");
+        return Action::Ignore;
+    };
+
+    let Some(character) = session.character.as_ref() else {
+        return Action::Ignore;
+    };
+    let at = (character.x as f32, character.y as f32);
+    let level = character.level;
+
+    // The position comes from the world, never from the packet: the client
+    // sends where it thinks it is, and a modified one would reach across the
+    // map by lying about it.
+    let Some(target) = state.world.mob(request.target) else {
+        debug!(target = request.target, "0x302 at something that is not a monster");
+        return Action::Ignore;
+    };
+    if !target.is_alive() {
+        return Action::Ignore;
+    }
+    if !within(at, target.position(), combat::MELEE_RANGE) {
+        debug!(target = request.target, "0x302 from out of reach");
+        return Action::Ignore;
+    }
+
+    let blow = combat::swing(level, target.level, &mut rand::thread_rng());
+    let Some((target, killed)) =
+        state.world.wound_mob(request.target, blow.damage, std::time::Instant::now())
+    else {
+        // Somebody else landed the last blow between the checks above and
+        // here. Theirs, not ours.
+        return Action::Ignore;
+    };
+
+    let (max_hp, _) = vitals(session.character.as_ref().expect("checked above"));
+    let report = combat::Damage {
+        skill: request.skill,
+        attacker: session.client_id,
+        attacker_at: at,
+        attacker_hp: session.cur_hp.min(max_hp),
+        animation: request.animation,
+        target: target.id,
+        target_hp: target.hp,
+        blow,
+        at: target.position(),
+    };
+    let frame = encode_damage(&report);
+
+    // Everyone who can see the fight sees it. A fight only the person
+    // swinging can see is a fight that looks like it never happened.
+    state.world.send_to_visible(session.client_id, frame.clone());
+
+    let mut frames = vec![frame];
+    if killed {
+        info!(
+            monster = %target.name,
+            level = target.level,
+            experience = target.experience,
+            "killed"
+        );
+        frames.extend(reward_for(session, &target));
+        session.visible_mobs.remove(&target.id);
+    }
+    Action::Reply(frames)
+}
+
+/// What a kill is worth. Experience only, for now: drops need the drop tables
+/// and levelling needs `ExpList.bin`, and neither is read yet.
+fn reward_for(session: &mut Session, target: &crate::mob::Mob) -> Vec<Vec<u8>> {
+    let client_id = session.client_id;
+    let Some(character) = session.character.as_mut() else {
+        return Vec::new();
+    };
+
+    character.exp = character.exp.saturating_add(target.experience as u64);
+    session.dirty = true;
+
+    let character = session.character.as_ref().expect("checked above");
+    vec![encode_level(character, client_id)]
+}
+
+/// `TRecvDamagePacket` (`0x102`): who hit what, for how much, and what is
+/// left of it.
+fn encode_damage(damage: &combat::Damage) -> Vec<u8> {
+    let body = damage.to_body();
+    debug_assert_eq!(body.len() + MIN_FRAME, combat::DAMAGE_SIZE);
+    frame::encode(
+        &Message { sender: damage.attacker, opcode: combat::OP_DAMAGE, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// A monster's `0x349`. Closer to a player's than to an NPC's: the original
+/// writes the same `Unk0` as for a player and does not flag it as a service
+/// (`Mob/BaseMob.pas:3045`). What tells the client it is a monster is the id
+/// range it arrives in.
+fn encode_mob_spawn(mob: &crate::mob::Mob) -> Vec<u8> {
+    use spawn_offset as off;
+    let mut body = vec![0u8; off::BODY_SIZE];
+
+    let put16 = |b: &mut Vec<u8>, at: usize, v: u16| {
+        b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    let put32 = |b: &mut Vec<u8>, at: usize, v: u32| {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    };
+
+    // The name is the digits of a string index, the same convention the NPCs
+    // use: the client owns the words.
+    write_fixed_str(&mut body[off::NAME..off::NAME + 16], &mob.name_index.to_string());
+
+    for (i, model) in mob.model.iter().enumerate() {
+        put16(&mut body, off::EQUIP + i * 2, *model);
+    }
+
+    body[off::POSITION_X..off::POSITION_X + 4].copy_from_slice(&mob.x.to_le_bytes());
+    body[off::POSITION_Y..off::POSITION_Y + 4].copy_from_slice(&mob.y.to_le_bytes());
+    put32(&mut body, off::ROTATION, mob.rotation as u32);
+
+    put32(&mut body, off::MAX_HP, mob.max_hp);
+    put32(&mut body, off::MAX_MP, mob.max_hp);
+    put32(&mut body, off::CUR_HP, mob.hp);
+    put32(&mut body, off::CUR_MP, mob.max_hp);
+
+    body[off::UNK0] = SPAWN_UNK0;
+    body[off::SPEED_MOVE] = MOB_SPEED_MOVE;
+    body[off::SPAWN_TYPE] = mob.spawn_type;
+    body[off::SIZES..off::SIZES + 3].copy_from_slice(&mob.sizes);
+
+    debug_assert_eq!(body.len() + MIN_FRAME, CREATE_MOB_SIZE);
+    frame::encode(
+        &Message { sender: mob.id, opcode: OP_CREATE_MOB, time: 0, body },
+        rand::random(),
+    )
 }
 
 /// `TSendClientIndexPacket` (`0x117`): the id of the mob the player is.
@@ -3759,5 +3985,166 @@ mod tests {
             handle_message(&state, &mut session, &back).await,
             Action::Disconnect
         ));
+    }
+
+    // ---- monsters and fighting -------------------------------------------
+
+    /// A world with one monster standing next to where the player spawns.
+    fn fight_state() -> State {
+        use aika_data::mobs::MobTable;
+        // Level 40 with 5000 health, against the level 42 the test character
+        // is: enough to take a dozen swings, so a fight is a fight.
+        const INFO: &str = "1,Rato,216,0,0,5000,0,40,7,119,119,1025,0,0,0,0,0,0,45,0,0,0,0,0,25,0,1";
+        const LIST: &str = "1,1,1,1,Rato,Rato,0,0,0,3452,692,11,8,0,3452,692,11,8,0";
+
+        let mut state = state_with(vec![dev_character("Athus", 0)]);
+        let table = MobTable::parse(INFO, LIST).unwrap();
+        state.world = World::with_npcs(Vec::new()).with_mobs(crate::mob::place_all(&table));
+        state
+    }
+
+    const RAT: u16 = aika_data::mobs::FIRST_MOB_ID;
+    const RAT_HP: u32 = 5000;
+
+    fn attack_message(target: u16) -> Message {
+        Message {
+            sender: TEST_CLIENT_ID,
+            opcode: combat::OP_ATTACK,
+            time: 0,
+            body: combat::Attack {
+                target,
+                animation: 2,
+                skill: 0,
+                from: (3450.0, 690.0),
+                at: (3452.0, 692.0),
+            }
+            .to_body(),
+        }
+    }
+
+    /// A monster near the player has to be on screen when they arrive, the
+    /// same as the townspeople.
+    #[tokio::test]
+    async fn a_monster_nearby_is_on_screen_on_arrival() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+
+        assert!(session.visible_mobs.contains(&RAT), "the monster never appeared");
+    }
+
+    #[tokio::test]
+    async fn hitting_a_monster_takes_health_off_it_and_tells_everyone() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+
+        let frames = frames_of(handle_message(&state, &mut session, &attack_message(RAT)).await);
+        let report = decode(&frames[0]);
+
+        assert_eq!(report.opcode, combat::OP_DAMAGE);
+        assert_eq!(report.body.len() + MIN_FRAME, combat::DAMAGE_SIZE);
+
+        use combat::damage_offset as off;
+        let damage = u64::from_le_bytes(
+            report.body[off::DAMAGE..off::DAMAGE + 8].try_into().unwrap(),
+        );
+        let left = u32::from_le_bytes(
+            report.body[off::TARGET_HP..off::TARGET_HP + 4].try_into().unwrap(),
+        );
+        assert!(damage > 0, "the swing did nothing");
+        assert_eq!(left, RAT_HP - damage as u32, "the health left does not match the damage");
+        assert_eq!(state.world.mob(RAT).unwrap().hp, left);
+    }
+
+    /// Reaching across the map is what a modified client would try. The
+    /// position comes from the world, not from the packet.
+    #[tokio::test]
+    async fn a_monster_out_of_reach_cannot_be_hit() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+        session.character.as_mut().unwrap().x = 9000;
+
+        let action = handle_message(&state, &mut session, &attack_message(RAT)).await;
+        assert!(matches!(action, Action::Ignore));
+        assert_eq!(state.world.mob(RAT).unwrap().hp, RAT_HP, "it was hit from across the map");
+    }
+
+    #[tokio::test]
+    async fn hitting_something_that_is_not_a_monster_does_nothing() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+
+        assert!(matches!(
+            handle_message(&state, &mut session, &attack_message(9999)).await,
+            Action::Ignore
+        ));
+    }
+
+    /// Killing pays, and the corpse comes off the screen.
+    #[tokio::test]
+    async fn killing_a_monster_pays_experience_and_clears_it() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+        let before = session.character.as_ref().unwrap().exp;
+
+        let mut swings = 0;
+        while state.world.mob(RAT).is_some_and(|m| m.is_alive()) && swings < 200 {
+            handle_message(&state, &mut session, &attack_message(RAT)).await;
+            swings += 1;
+        }
+
+        assert!(swings < 200, "the monster would not die");
+        assert!(swings > 1, "it died in one hit, which is not a fight");
+        assert_eq!(
+            session.character.as_ref().unwrap().exp,
+            before + 25,
+            "the kill did not pay"
+        );
+        assert!(!session.visible_mobs.contains(&RAT), "the corpse is still on screen");
+        assert!(session.dirty, "the experience was not marked for saving");
+    }
+
+    /// A corpse pays once. Two players landing on the same one must not both
+    /// be paid for it.
+    #[tokio::test]
+    async fn a_corpse_pays_nothing() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+
+        while state.world.mob(RAT).is_some_and(|m| m.is_alive()) {
+            handle_message(&state, &mut session, &attack_message(RAT)).await;
+        }
+        let after_kill = session.character.as_ref().unwrap().exp;
+
+        handle_message(&state, &mut session, &attack_message(RAT)).await;
+        assert_eq!(session.character.as_ref().unwrap().exp, after_kill, "the corpse paid twice");
+    }
+
+    /// A monster that comes back has to reappear on a standing player, which
+    /// is what the client's own heartbeat is spent on.
+    #[tokio::test]
+    async fn a_monster_that_comes_back_reappears_without_walking() {
+        let state = fight_state();
+        let mut session = in_world(&state).await;
+
+        while state.world.mob(RAT).is_some_and(|m| m.is_alive()) {
+            handle_message(&state, &mut session, &attack_message(RAT)).await;
+        }
+        assert!(!session.visible_mobs.contains(&RAT));
+
+        let respawn = state.world.mob(RAT).unwrap().respawn;
+        assert_eq!(state.world.revive_mobs(std::time::Instant::now() + respawn).len(), 1);
+
+        // the heartbeat, not a step
+        let ready = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_CLIENT_READY,
+            time: 0,
+            body: Vec::new(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &ready).await);
+
+        assert_eq!(opcodes(&frames), vec![OP_CREATE_MOB]);
+        assert!(session.visible_mobs.contains(&RAT), "it never came back on screen");
+        assert_eq!(state.world.mob(RAT).unwrap().hp, RAT_HP, "it came back hurt");
     }
 }

@@ -12,10 +12,12 @@
 //! the shape of the answer is the same. A spatial grid belongs here later,
 //! behind the same methods.
 
+use crate::mob::Mob;
 use crate::store::Character;
 use aika_data::npc::Npc;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// Frames queued for one connection to write.
@@ -72,9 +74,13 @@ impl Presence {
 #[derive(Default)]
 pub struct World {
     players: Mutex<HashMap<u16, Presence>>,
-    /// Read from `Data/NPCs` at startup and never touched again: an NPC does
-    /// not move, log out or take damage, so it needs no lock.
+    /// Read from `assets/npcs` at startup and never touched again: an NPC
+    /// does not move, log out or take damage, so it needs no lock.
     npcs: Vec<Npc>,
+    /// Monsters. Unlike the NPCs these change — they take damage, die and
+    /// come back — so they sit behind a lock and the world owns them rather
+    /// than any one connection.
+    mobs: Mutex<Vec<Mob>>,
 }
 
 impl World {
@@ -84,6 +90,53 @@ impl World {
 
     pub fn with_npcs(npcs: Vec<Npc>) -> Self {
         Self { npcs, ..Self::default() }
+    }
+
+    pub fn with_mobs(mut self, mobs: Vec<Mob>) -> Self {
+        self.mobs = Mutex::new(mobs);
+        self
+    }
+
+    pub fn mob_count(&self) -> usize {
+        self.mobs.lock().unwrap().len()
+    }
+
+    /// The living monsters a player standing at this point should see.
+    pub fn mobs_near(&self, at: (f32, f32), radius: f32) -> Vec<Mob> {
+        self.mobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|mob| mob.is_alive())
+            .filter(|mob| within(at, mob.position(), radius))
+            .cloned()
+            .collect()
+    }
+
+    pub fn mob(&self, id: u16) -> Option<Mob> {
+        self.mobs.lock().unwrap().iter().find(|m| m.id == id).cloned()
+    }
+
+    /// Hurts a monster and says what became of it: `None` when there is no
+    /// such monster or it is already down, otherwise the monster as it now
+    /// stands and whether this was the killing blow.
+    ///
+    /// The whole thing happens under one lock, which is what stops two
+    /// players being paid for the same corpse.
+    pub fn wound_mob(&self, id: u16, damage: u32, now: Instant) -> Option<(Mob, bool)> {
+        let mut mobs = self.mobs.lock().unwrap();
+        let mob = mobs.iter_mut().find(|m| m.id == id)?;
+        if !mob.is_alive() {
+            return None;
+        }
+        let killed = mob.wound(damage, now);
+        Some((mob.clone(), killed))
+    }
+
+    /// Brings back every monster whose time is up, and says which.
+    pub fn revive_mobs(&self, now: Instant) -> Vec<Mob> {
+        let mut mobs = self.mobs.lock().unwrap();
+        mobs.iter_mut().filter_map(|m| m.revive(now).then(|| m.clone())).collect()
     }
 
     pub fn npcs(&self) -> &[Npc] {

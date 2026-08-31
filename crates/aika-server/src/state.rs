@@ -5,6 +5,7 @@ use crate::db::Database;
 use crate::store::{AccountStore, Character};
 use crate::world::World;
 use aika_data::itemlist::ItemList;
+use aika_data::mobs::MobTable;
 use aika_data::npc::NpcSet;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -43,7 +44,8 @@ impl State {
             cfg.login.max_attempts,
             Duration::from_secs(cfg.login.block_minutes * 60),
         )?;
-        let world = World::with_npcs(load_npcs(&cfg.game.npc_dir));
+        let world = World::with_npcs(load_npcs(&cfg.game.npc_dir))
+            .with_mobs(crate::mob::place_all(&load_mobs(&cfg.game.mob_dir)));
         let items = load_items(&cfg.game.item_list);
         Ok(Self { cfg, store, world, items, db: Some(db), started: Instant::now() })
     }
@@ -56,7 +58,8 @@ impl State {
             cfg.login.max_attempts,
             Duration::from_secs(cfg.login.block_minutes * 60),
         )?;
-        let world = World::with_npcs(load_npcs(&cfg.game.npc_dir));
+        let world = World::with_npcs(load_npcs(&cfg.game.npc_dir))
+            .with_mobs(crate::mob::place_all(&load_mobs(&cfg.game.mob_dir)));
         let items = load_items(&cfg.game.item_list);
         Ok(Self { cfg, store, world, items, db: None, started: Instant::now() })
     }
@@ -150,4 +153,43 @@ fn load_items(path: &str) -> ItemList {
             ItemList::default()
         }
     }
+}
+
+/// Reads the monster tables, if a directory was configured.
+///
+/// A world with nothing to fight still lets people log in and walk around, so
+/// a missing directory is a warning rather than a refusal to start.
+fn load_mobs(dir: &str) -> MobTable {
+    if dir.is_empty() {
+        return MobTable::default();
+    }
+
+    let table = match MobTable::load_dir(dir) {
+        Ok(Ok(table)) => table,
+        Ok(Err(e)) => {
+            warn!(dir, error = %e, "the monster tables are malformed; the world will be empty");
+            return MobTable::default();
+        }
+        Err(e) => {
+            warn!(dir, error = %e, "could not read the monster tables; the world will be empty");
+            return MobTable::default();
+        }
+    };
+
+    if !table.orphans.is_empty() {
+        warn!(
+            dir,
+            kinds = table.orphans.len(),
+            first = %table.orphans.first().map(String::as_str).unwrap_or(""),
+            "spawn points name monsters that have no entry in AllMobsInfo.csv"
+        );
+    }
+    info!(
+        dir,
+        kinds = table.kinds().count(),
+        points = table.len(),
+        placed = table.placed().count(),
+        "monsters loaded"
+    );
+    table
 }

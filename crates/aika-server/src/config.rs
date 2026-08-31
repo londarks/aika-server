@@ -72,6 +72,10 @@ pub struct GameConfig {
     /// shops open and refuse every purchase.
     #[serde(default)]
     pub item_list: String,
+    /// Directory holding `AllMobsInfo.csv` and `MonsterListCSV.csv`. Empty
+    /// means a world with nothing in it to fight.
+    #[serde(default)]
+    pub mob_dir: String,
 }
 
 /// What the launcher receives when it checks the client version.
@@ -226,6 +230,7 @@ impl Default for GameConfig {
             client_version: default_client_version(),
             npc_dir: String::new(),
             item_list: String::new(),
+            mob_dir: String::new(),
         }
     }
 }

@@ -28,6 +28,9 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(State::open(cfg).await?);
 
+    // Monsters come back on their own, whether or not anybody is connected.
+    game::spawn_world_tick(Arc::clone(&state));
+
     let web_listener = bind(web_addr, "token server").await?;
     let login_listener = bind(login_addr, "login server").await?;
 
@@ -42,7 +45,14 @@ async fn main() -> Result<()> {
         });
     }
 
-    info!(config = %config_path, accounts, channels, "aika-server started");
+    info!(
+        config = %config_path,
+        accounts,
+        channels,
+        npcs = state.world.npcs().len(),
+        monsters = state.world.mob_count(),
+        "aika-server started"
+    );
 
     tokio::select! {
         result = web::serve(Arc::clone(&state), web_listener) => result?,

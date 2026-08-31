@@ -1285,7 +1285,13 @@ fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> A
             }
             session.opened_npc = Some(npc_id);
             info!(npc = npc_id, name = %npc.label, "shop opened");
-            Action::Reply(vec![encode_show_shop(session.client_id, npc)])
+
+            // The conversation closes before the shop opens. The client
+            // letterboxes the screen while a menu is up, and leaving it up
+            // behind the shop is what looks like a cutscene that will not
+            // end. The original closes it for every option except talking,
+            // quests and the menu heading (`PacketHandlers.pas:3382`).
+            Action::Reply(vec![encode_menu_close(), encode_show_shop(session.client_id, npc)])
         }
         dialog::option::CLOSE => {
             session.opened_npc = None;
@@ -1297,13 +1303,16 @@ fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> A
             let name = dialog::option_text(other as u8);
             debug!(npc = npc_id, option = other, text = name, "npc option not implemented");
 
-            let mut frames = vec![encode_client_message(
-                session.client_id,
-                &format!("{name} is not available yet."),
-            )];
+            // Closed first, for the same reason the shop closes it: the
+            // client keeps the screen letterboxed while a menu is up.
+            let mut frames = Vec::new();
             if !request.keeps_window_open() {
                 frames.push(encode_menu_close());
             }
+            frames.push(encode_client_message(
+                session.client_id,
+                &format!("{name} is not available yet."),
+            ));
             Action::Reply(frames)
         }
     }
@@ -2993,7 +3002,13 @@ mod tests {
             &open_npc(2050, dialog::option::SHOP),
         ).await);
 
-        let window = decode(&frames[0]);
+        assert_eq!(
+            opcodes(&frames),
+            vec![dialog::OP_MENU_CLOSE, shop::OP_SHOW_SHOP],
+            "the conversation has to close before the shop opens, or the client              keeps the screen letterboxed behind it"
+        );
+
+        let window = decode(&frames[1]);
         assert_eq!(window.opcode, shop::OP_SHOW_SHOP);
         assert_eq!(window.body.len() + MIN_FRAME, shop::SHOW_SHOP_SIZE);
         assert_eq!(u16::from_le_bytes(window.body[0..2].try_into().unwrap()), 2050);
@@ -3300,7 +3315,14 @@ mod tests {
             &open_npc(2050, dialog::option::QUESTS),
         ).await);
 
+        // quests keep the window open, so nothing closes it
+        assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
         assert_eq!(message_text(&frames[0]), "Quest is not available yet.");
+
+        // repair does not, so it closes first
+        let frames = frames_of(handle_message(&state, &mut session, &open_npc(2050, 31)).await);
+        assert_eq!(opcodes(&frames), vec![dialog::OP_MENU_CLOSE, OP_CLIENT_MESSAGE]);
+        assert_eq!(message_text(&frames[1]), "Repair is not available yet.");
     }
 
     // ---- making a character, and turning ---------------------------------

@@ -70,78 +70,88 @@ pub const COLOUR_HEADING: u32 = 0xFF7F_C1F4;
 
 /// The 65 menu entries, in English.
 ///
-/// The original reads these from `NPCOptionsText.bin`, a file of 65 fixed
-/// 64-byte strings written in Portuguese by whoever ran that server. Keeping
-/// our own means one less file to carry, and it is the only place the player
-/// reads words the server chose, so it is the one place worth translating by
-/// hand. Index 0 is unused: the file numbers its options from 1.
+/// These are a translation of `NPCOptionsText.bin`, entry by entry, with the
+/// original's Portuguese kept beside each one so the two can be checked
+/// against each other. Four of them are not in the file at all: `TLoad`
+/// overwrites entries 47, 59, 60 and 64 in memory after reading it
+/// (`Functions/Load.pas:3099`), and those overwrites are what the player
+/// actually sees.
+///
+/// Keeping our own copy means one less file from the pack to carry, but it
+/// has to be a translation and not an invention: an earlier version of this
+/// table was guessed past entry 13, which labelled *Repair* as *Buy* and sent
+/// somebody clicking the wrong line of a merchant's menu. Index 0 is unused —
+/// the file numbers its options from 1.
+///
+/// `Nothing_N` in the file means an unused slot, and those stay empty here:
+/// `entries` drops anything without text rather than drawing a blank line.
 const OPTION_TEXT: [&str; 66] = [
-    "",
-    "Talk",
-    "Quest",
-    "Teleport",
-    "Enter the castle",
-    "Shop",
-    "Skills",
-    "Storage",
-    "Close",
-    "Sign up for the war",
-    "Create a guild",
-    "Guild storage",
-    "Sign up for the castle",
-    "Pran station",
-    "",
-    "Repair",
-    "Repair everything",
-    "Reinforce",
-    "Enchant",
-    "Auction house",
-    "Disassemble",
-    "Menu",
-    "Change appearance",
-    "Change nation",
-    "Mount enchant",
-    "Save your location",
-    "Anvil",
-    "Pran enchant",
-    "Levelling",
-    "Dungeon",
-    "Alliance",
-    "Buy",
-    "Sell",
-    "Leave the alliance",
-    "Break the alliance",
-    "Remove a member",
-    "Relic",
-    "Upgrade a relic",
-    "Nation warehouse",
-    "Nation taxes",
-    "Battlefield",
-    "Arena",
-    "Event",
-    "Reward",
-    "Coupon",
-    "Mail",
-    "Title",
-    "Teleport to your saved location",
-    "Craft",
-    "Recipes",
-    "Return to the city",
-    "Guild war",
-    "Siege",
-    "Ranking",
-    "Trade",
-    "Personal shop",
-    "Bank",
-    "Exchange",
-    "Buff",
-    "Balavan teleport",
-    "Panzabil teleport",
-    "Party buff",
-    "Nation buff",
-    "Blessing",
-    "Perfect party buff (6 members)",
-    "Leave",
+    "",                                // index 0 is unused
+    "Talk",                            // Conversa
+    "Quest",                           // Missao
+    "Teleport",                        // Teleportar
+    "Enter the castle",                // Entrar no Castelo
+    "Shop",                            // Loja
+    "Skills",                          // Habilidades
+    "Storage",                         // Armazem
+    "Close",                           // Fechar
+    "Sign up for the war",             // Cadastrar para Guerra
+    "Create a guild",                  // Criar Guild
+    "Guild storage",                   // Armazem da Guild
+    "Sign up for the castle",          // Cadastrar para o castelo
+    "Pran station",                    // Central da Pran
+    "",                                // Nothing_2
+    "Craft",                           // Manofaturar
+    "Refine",                          // Refinar
+    "Enchant an item",                 // Encantar Item
+    "Change appearance",               // Trocar Aparencia
+    "Break an item down",              // Reduzir Item
+    "Timat",                           // Timat, a place
+    "",                                // Nothing_3
+    "",                                // Nothing_4
+    "",                                // Nothing_5
+    "",                                // Nothing_6
+    "Save your location",              // Salvar Localizacao
+    "Enter the dungeon",               // Entrar na Dungeon
+    "",                                // Nothing_7
+    "",                                // Nothing_8
+    "Pran hairdresser",                // Cabeleireiro da Pran
+    "",                                // Nothing_9
+    "Repair",                          // Consertar
+    "Repair everything",               // Consertar Tudo
+    "Dismantle",                       // Desmontar
+    "",                                // Nothing_10
+    "Blessing",                        // Bencao
+    "",                                // Nothing_11
+    "Agross",                          // Agross, a place
+    "Return from Agross",              // Retorno Agross
+    "Upgrade a relic",                 // Aprimorar Reliquia
+    "",                                // Nothing_12
+    "Current standing",                // Situacao Atual
+    "Switch alliance",                 // Alternar Alianca
+    "Return to your nation",           // Retornar Nacao
+    "Enchant a mount",                 // Encantar Montaria
+    "",                                // Nothing_13
+    "Guild skills",                    // Habilidade Guild
+    "Teleport to your saved location",  // patched over Nothing_14 at load
+    "Auction house",                   // Leilao
+    "Karak airship",                   // Karak Aereo
+    "",                                // Nothing_15
+    "",                                // Nothing_16
+    "Teleport to Leopold",             // Teleporte Leopold
+    "",                                // Nothing_17
+    "Change nation",                   // Trocar Nacao
+    "",                                // Nothing_18
+    "",                                // Nothing_19
+    "Teleport to Karena",              // Teleporte Karena
+    "",                                // Nothing_20
+    "Teleport to Balavan",             // patched over Nothing_21 at load
+    "Teleport to Panzabil",            // patched over Nothing_22 at load
+    "",                                // Nothing_23
+    "Enchant a Pran",                  // Encantar Pran
+    "",                                // Nothing_24
+    "Perfect party blessing (6 members)",  // patched over Nothing_25 at load
+    "Blessing (50k)",                  // Bencao 50k
 ];
 
 /// The words a menu entry shows.
@@ -283,6 +293,32 @@ mod tests {
     fn entries_without_text_are_dropped() {
         let npc = npc_with(vec![1, 14, 8], false);
         assert_eq!(entries(&npc), vec![1, 8]);
+    }
+
+    /// The table is a translation of `NPCOptionsText.bin`, not a guess.
+    /// These are the entries a shipped `.npc` file actually references, and
+    /// getting one wrong sends a player clicking the wrong line: 31 was
+    /// labelled "Buy" once, and it is Repair.
+    #[test]
+    fn the_option_text_matches_the_file_it_translates() {
+        assert_eq!(option_text(1), "Talk");
+        assert_eq!(option_text(2), "Quest");
+        assert_eq!(option_text(5), "Shop");
+        assert_eq!(option_text(6), "Skills");
+        assert_eq!(option_text(8), "Close");
+        assert_eq!(option_text(25), "Save your location");
+        assert_eq!(option_text(31), "Repair");
+        assert_eq!(option_text(32), "Repair everything");
+        assert_eq!(option_text(50), "");
+
+        // the four the original patches in after reading the file
+        assert_eq!(option_text(47), "Teleport to your saved location");
+        assert_eq!(option_text(59), "Teleport to Balavan");
+        assert_eq!(option_text(60), "Teleport to Panzabil");
+        assert_eq!(option_text(64), "Perfect party blessing (6 members)");
+
+        // and nothing past the end of the table panics
+        assert_eq!(option_text(255), "");
     }
 
     #[test]

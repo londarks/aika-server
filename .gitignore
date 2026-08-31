@@ -15,3 +15,6 @@ sql/SQL Aika.sql
 
 # Client-derived fixture: kept locally, never redistributed.
 crates/aika-data/testdata/SL.bin
+
+# Game data fixture: kept locally, never redistributed.
+crates/aika-data/testdata/ItemList.bin

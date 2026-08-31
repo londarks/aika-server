@@ -23,9 +23,10 @@ GPL-3.0 as well.
 | Movement | tracked, relayed to everyone in range |
 | Online registry | players see each other arrive, walk and leave |
 | `SL.bin` (channel list) | read and write, byte-exact round trip |
+| Item table | `ItemList.bin` parsed: 31,000 ids, 16,714 defined |
 | Persistence | next up (SQLite in development, MySQL in production) |
 
-82 tests, including an end-to-end run of the whole chain: HTTP token, TCP login
+90 tests, including an end-to-end run of the whole chain: HTTP token, TCP login
 and game server through to the character list.
 
 **The original client logs in, enters the world and walks.**

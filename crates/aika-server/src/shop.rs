@@ -123,7 +123,15 @@ pub enum ShopError {
     WrongNpc,
     /// The slot the client named holds nothing.
     EmptySlot,
-    /// An id that is not in the item table.
+    /// An id the shop offers that the server's item table does not define.
+    ///
+    /// This is not a client lying: the client draws the shop from its own
+    /// item table, so it shows a name and a description for something our
+    /// table has never heard of. The two files are out of step in the data
+    /// they were taken from, and the server cannot price, level-gate or even
+    /// name what it does not have. The original would have sold it for
+    /// nothing, since a missing record reads as a row of zeros and its price
+    /// chain ends at "gold, zero". Refusing is the better answer.
     UnknownItem(u16),
     /// The item has no price at all, which is how the shipped tables mark
     /// something that is not really on sale.
@@ -142,7 +150,9 @@ impl ShopError {
         match self {
             ShopError::WrongNpc => "You are too far from the shop.".into(),
             ShopError::EmptySlot => "There is nothing there.".into(),
-            ShopError::UnknownItem(id) => format!("Item {id} does not exist."),
+            ShopError::UnknownItem(id) => {
+                format!("This server does not have item {id}, even though your client draws it.")
+            }
             ShopError::NotForSale => "That is not for sale.".into(),
             ShopError::PaidInSomethingElse(what) => {
                 format!("That is paid for with {what}, which is not in yet.")

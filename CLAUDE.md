@@ -73,6 +73,13 @@ Reference sources live outside this repo, in sibling directories:
 - **The `.npc` id is in the file name, not in the record.** The files were made
   by copying one another; `[2700] Lilola Hawn.npc` says 2215 inside. The
   original patches a hardcoded few and lets the rest overwrite each other.
+- **The client and the server have different item tables.** The server's
+  `ItemList.bin` is plaintext; the client's `ItemList4.bin` is the same size
+  plus a 12-byte `BR00022I` header and is encrypted with a position-dependent
+  cipher (identical records encrypt differently, so no repeating-key attack).
+  Shops reference ids the client has and the server does not — that is a data
+  mismatch in the pack, not a bug. Reading the client's table would let the
+  two be regenerated from one source; nobody has done it yet.
 - **Players and NPCs share one id space.** 1..2000 for players, 2048..3048 for
   NPCs (`Connections/ServerSocket.pas:44`). Player ids are capped so a
   connection can never be drawn on top of a townsperson.

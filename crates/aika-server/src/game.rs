@@ -2074,7 +2074,7 @@ async fn handle_delete_character(
 
 /// The skills a character has, worked out from the table.
 fn known_skills(state: &State, character: &Character) -> Vec<usize> {
-    ability::known_by(&state.skills, character.class_info() as u32, character.level as u32)
+    ability::known_by(&state.skills, character.skill_class() as u32, character.level as u32)
 }
 
 /// `TSendSkillsPacket` (`0x106`): the forty skills the client draws on the
@@ -2127,7 +2127,7 @@ fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> 
     let target_at = target.as_ref().map(|m| m.position());
 
     let caster = ability::Caster {
-        base_class: character.class_info() as u32,
+        base_class: character.skill_class() as u32,
         level: character.level as u32,
         mana: session.cur_mp,
         at,
@@ -2791,7 +2791,11 @@ mod tests {
 
         assert_eq!(read_fixed_str(&slot1[0..16]), "Athus");
         assert_eq!(u16::from_le_bytes(slot1[16..18].try_into().unwrap()), 2, "nation");
-        assert_eq!(u16::from_le_bytes(slot1[18..20].try_into().unwrap()), 1, "base class");
+        assert_eq!(
+            u16::from_le_bytes(slot1[18..20].try_into().unwrap()),
+            2,
+            "class index 20 is the second class the creation screen offers"
+        );
         assert_eq!(u16::from_le_bytes(slot1[24..26].try_into().unwrap()), 20, "Equip[0] = class");
         assert_eq!(u16::from_le_bytes(slot1[26..28].try_into().unwrap()), 7702, "Equip[1] = hair");
         assert_eq!(slot1[47], 15, "Refine[7] is hardcoded to 15");

@@ -25,6 +25,51 @@ use crate::store::{Character, Item, DEFAULT_SIZES, DEFAULT_SPEED_MOVE, MAX_CHARA
 pub const OP_CREATE_CHARACTER: u16 = 0x3E04;
 pub const OP_DELETE_CHARACTER: u16 = 0x3E01;
 
+/// `TDeleteChar` (`Data/Packets.pas:284`): a spare DWORD, the slot, and a
+/// four character PIN.
+///
+/// The original refuses this outright — `TPacketHandlers.DeleteChar` opens
+/// with a message reading "disabled until the risk of breaking your account
+/// is analysed" and returns. The code behind that early exit still shows what
+/// it meant to do, and it is worth doing properly: mark the row deleted
+/// rather than remove it, so a mistake is recoverable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteCharacter {
+    pub slot: u32,
+    /// The PIN the client asks for before deleting. We have nowhere to store
+    /// one yet, so it is carried and not checked; when accounts grow a PIN
+    /// this is where it gets compared.
+    pub pin: String,
+}
+
+impl DeleteCharacter {
+    pub const MIN_BODY: usize = 8;
+    pub const BODY_SIZE: usize = 44;
+
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        if body.len() < Self::MIN_BODY {
+            return None;
+        }
+        let pin = body
+            .get(8..12)
+            .map(|bytes| {
+                bytes.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect::<String>()
+            })
+            .unwrap_or_default();
+
+        Some(Self { slot: u32::from_le_bytes(body[4..8].try_into().ok()?), pin })
+    }
+
+    pub fn to_body(&self) -> Vec<u8> {
+        let mut body = vec![0u8; Self::BODY_SIZE];
+        body[4..8].copy_from_slice(&self.slot.to_le_bytes());
+        let pin = self.pin.as_bytes();
+        let len = pin.len().min(4);
+        body[8..8 + len].copy_from_slice(&pin[..len]);
+        body
+    }
+}
+
 /// The longest name the client will show.
 pub const MAX_NAME: usize = 14;
 
@@ -262,6 +307,24 @@ mod tests {
 
     fn nobody(_: &str) -> bool {
         false
+    }
+
+    #[test]
+    fn delete_body_roundtrip() {
+        let original = DeleteCharacter { slot: 2, pin: "1234".into() };
+        assert_eq!(DeleteCharacter::parse(&original.to_body()), Some(original));
+        assert_eq!(DeleteCharacter::parse(&[0u8; 4]), None);
+    }
+
+    /// A client that sends only the slot and no PIN still names a slot.
+    #[test]
+    fn a_delete_without_a_pin_still_parses() {
+        let mut body = vec![0u8; DeleteCharacter::MIN_BODY];
+        body[4..8].copy_from_slice(&1u32.to_le_bytes());
+
+        let parsed = DeleteCharacter::parse(&body).unwrap();
+        assert_eq!(parsed.slot, 1);
+        assert_eq!(parsed.pin, "");
     }
 
     #[test]

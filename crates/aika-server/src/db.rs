@@ -488,6 +488,28 @@ impl Database {
         Ok(())
     }
 
+    /// The character in a slot, if the account has one there.
+    pub async fn character_in_slot(
+        &self,
+        account_id: i64,
+        slot: u32,
+    ) -> Result<Option<i64>> {
+        let row = sqlx::query(
+            "SELECT id FROM characters
+             WHERE account_id = ? AND slot = ? AND deleted_at IS NULL",
+        )
+        .bind(account_id)
+        .bind(slot as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .context("looking up a character by slot")?;
+
+        Ok(match row {
+            Some(row) => Some(row.try_get::<i64, _>("id")?),
+            None => None,
+        })
+    }
+
     pub async fn soft_delete_character(&self, character_id: i64) -> Result<()> {
         sqlx::query("UPDATE characters SET deleted_at = ? WHERE id = ?")
             .bind(now())

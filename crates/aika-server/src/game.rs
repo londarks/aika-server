@@ -55,6 +55,10 @@ pub const OP_ROTATE: u16 = 0x305;
 pub const OP_MOVE_ITEM: u16 = 0x70F;
 /// Throw an item away.
 pub const OP_DELETE_ITEM: u16 = 0x32C;
+/// `TUseItemPacket`: drink the potion in a slot.
+pub const OP_USE_ITEM: u16 = 0x31D;
+/// Leave the world and go back to the selection screen.
+pub const OP_BACK_TO_CHARACTER_SELECT: u16 = 0x668;
 /// `TClientMessagePacket` (`Data/Packets.pas:152`): a line of text on screen.
 pub const OP_CLIENT_MESSAGE: u16 = 0x984;
 /// Walking, the only move type the original relays to other players
@@ -147,6 +151,12 @@ const CLIENT_MESSAGE_SIZE: usize = 144;
 const CLIENT_MESSAGE_TEXT: usize = 128;
 /// Yellow, at the top of the screen: what the original passes by default.
 const MESSAGE_NOTICE: u8 = 16;
+
+/// Item types a potion can be (`Data/GlobalDefs.pas:845,862,863,870`).
+const ITEM_TYPE_TEARS: u16 = 29;
+const ITEM_TYPE_HP_POTION: u16 = 700;
+const ITEM_TYPE_MP_POTION: u16 = 701;
+const ITEM_TYPE_HPMP_POTION: u16 = 800;
 
 /// The index the original stamps on a menu entry (`NPCHandlers.pas:172`).
 /// Note that it is not the `0x7535` used everywhere else — the digits are
@@ -298,6 +308,10 @@ struct Session {
     visible_npcs: HashSet<u16>,
     /// Which way the player is facing, so a repeat can be dropped.
     rotation: u32,
+    /// Health and mana as they stand. Not on the character because nothing
+    /// takes them down yet; they live here so a potion has somewhere to go.
+    cur_hp: u32,
+    cur_mp: u32,
     /// Which NPC has a window open, if any. Every shop packet is checked
     /// against it: a client that never opened a shop must not be able to buy
     /// from one, and the original refuses on the same grounds.
@@ -494,10 +508,15 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         shop::OP_BUY => handle_buy(state, session, message),
         shop::OP_SELL => handle_sell(state, session, message),
         OP_ROTATE => handle_rotate(state, session, message),
+        OP_BACK_TO_CHARACTER_SELECT => handle_back_to_character_select(session),
+        creation::OP_DELETE_CHARACTER => {
+            handle_delete_character(state, session, message).await
+        }
         creation::OP_CREATE_CHARACTER => {
             handle_create_character(state, session, message).await
         }
         OP_MOVE_ITEM => handle_move_item(session, message),
+        OP_USE_ITEM => handle_use_item(state, session, message),
         OP_DELETE_ITEM => handle_delete_item(session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
@@ -628,6 +647,9 @@ fn handle_enter_world(session: &mut Session, message: &Message, time: u32) -> Ac
     }
     frames.push(zeroed(OP_ENTER_94C, 0, ENTER_94C_SIZE));
 
+    let (max_hp, max_mp) = vitals(&character);
+    session.cur_hp = max_hp;
+    session.cur_mp = max_mp;
     session.character = Some(character);
     Action::Reply(frames)
 }
@@ -1366,8 +1388,7 @@ fn handle_move_item(session: &mut Session, message: &Message) -> Action {
         return Action::Ignore;
     };
 
-    let from = (request.from_container, request.from_slot);
-    let to = (request.to_container, request.to_slot);
+    let (from, to) = (request.from(), request.to());
     if let Err(e) = character.items.move_item(from, to) {
         debug!(?from, ?to, error = %e, "item not moved");
     }
@@ -1385,30 +1406,109 @@ fn handle_move_item(session: &mut Session, message: &Message) -> Action {
 
 /// `0x32C`: throw an item away.
 fn handle_delete_item(session: &mut Session, message: &Message) -> Action {
-    let Some(request) = MoveItem::parse(&message.body) else {
+    let Some(request) = DeleteItem::parse(&message.body) else {
         warn!(size = message.body.len(), "0x32C packet too short");
         return Action::Ignore;
     };
+    let (container, slot) = (request.container as u8, request.slot as u16);
 
     let Some(character) = session.character.as_mut() else {
         return Action::Ignore;
     };
 
-    match character.items.take(request.from_container, request.from_slot) {
+    match character.items.take(container, slot) {
         Ok(gone) => {
-            info!(item = gone.index, slot = request.from_slot, "item thrown away");
-            Action::Reply(vec![encode_refresh_item(
-                request.from_container,
-                request.from_slot,
-                &Item::default(),
-                true,
-            )])
+            info!(item = gone.index, container, slot, "item thrown away");
+            Action::Reply(vec![encode_refresh_item(container, slot, &Item::default(), true)])
         }
         Err(e) => {
             debug!(error = %e, "nothing to throw away");
             Action::Ignore
         }
     }
+}
+
+/// `0x31D`: use what is in a slot.
+///
+/// Only the potions are here. The original's `TItemFunctions.UseItem` is a
+/// nine hundred line switch over every kind of item in the game, and the rest
+/// of it needs systems that do not exist yet; a scroll that teleports you
+/// needs teleporting. What every branch shares is the shape: check the level,
+/// do the effect, take one off the stack, tell the client about the slot.
+fn handle_use_item(state: &State, session: &mut Session, message: &Message) -> Action {
+    let Some(request) = UseItem::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x31D packet too short");
+        return Action::Ignore;
+    };
+    let (container, slot) = (request.container as u8, request.slot as u16);
+
+    let client_id = session.client_id;
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+
+    let Some(item) = character.items.get(container, slot).cloned() else {
+        debug!(container, slot, "0x31D on an empty slot");
+        return Action::Ignore;
+    };
+
+    let Some(def) = state.items.get(item.index as usize) else {
+        debug!(item = item.index, "0x31D on an item that is not in the table");
+        return Action::Ignore;
+    };
+
+    if character.level < def.level() {
+        return Action::Reply(vec![encode_client_message(
+            client_id,
+            &format!("You need level {} to use that.", def.level()),
+        )]);
+    }
+
+    let effect = def.use_effect() as u32;
+    let (heals_hp, heals_mp) = match def.item_type() {
+        ITEM_TYPE_HP_POTION => (true, false),
+        ITEM_TYPE_MP_POTION => (false, true),
+        ITEM_TYPE_HPMP_POTION | ITEM_TYPE_TEARS => (true, true),
+        other => {
+            debug!(item = item.index, item_type = other, "this kind of item is not usable yet");
+            return Action::Reply(vec![encode_client_message(
+                client_id,
+                "That cannot be used yet.",
+            )]);
+        }
+    };
+
+    let (max_hp, max_mp) = vitals(character);
+    if heals_hp {
+        session_heal(&mut session.cur_hp, effect, max_hp);
+    }
+    if heals_mp {
+        session_heal(&mut session.cur_mp, effect, max_mp);
+    }
+
+    // One off the stack, and the slot goes empty when the last one is used.
+    let character = session.character.as_mut().expect("checked above");
+    let left = item.refine.saturating_sub(1);
+    let remaining = if left == 0 {
+        let _ = character.items.take(container, slot);
+        Item { container, slot, ..Item::default() }
+    } else {
+        let mut kept = item.clone();
+        kept.refine = left;
+        let _ = character.items.put(kept.clone());
+        kept
+    };
+
+    info!(item = item.index, container, slot, left, "item used");
+    Action::Reply(vec![
+        encode_hp_mp(character, session.client_id, session.cur_hp, session.cur_mp),
+        encode_refresh_item(container, slot, &remaining, false),
+    ])
+}
+
+/// Raises a pool without letting it past its ceiling.
+fn session_heal(current: &mut u32, by: u32, ceiling: u32) {
+    *current = current.saturating_add(by).min(ceiling);
 }
 
 /// What is in a slot, or an empty item addressed to it when nothing is.
@@ -1419,14 +1519,18 @@ fn slot_item(inventory: &Inventory, container: u8, slot: u16) -> Item {
         .unwrap_or(Item { container, slot, ..Item::default() })
 }
 
-/// `0x70F` and `0x32C`: a source slot and a destination, each a container and
-/// a slot number.
+/// `TMoveItemPacket` (`0x70F`), 8 bytes of body.
+///
+/// Four `WORD`s, and **the destination comes first**: `DestType, DestSlot,
+/// SrcType, SrcSlot` (`Data/Packets.pas:903`). Reading them the other way
+/// round is a bug that looks like the client dragging from empty slots,
+/// because every drag arrives backwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoveItem {
-    pub from_container: u8,
-    pub from_slot: u16,
-    pub to_container: u8,
+    pub to_container: u16,
     pub to_slot: u16,
+    pub from_container: u16,
+    pub from_slot: u16,
 }
 
 impl MoveItem {
@@ -1437,22 +1541,92 @@ impl MoveItem {
             return None;
         }
         Some(Self {
-            from_container: body[0],
-            from_slot: u16::from_le_bytes(body[2..4].try_into().ok()?),
-            to_container: body[4],
-            to_slot: u16::from_le_bytes(body[6..8].try_into().ok()?),
+            to_container: u16::from_le_bytes(body[0..2].try_into().ok()?),
+            to_slot: u16::from_le_bytes(body[2..4].try_into().ok()?),
+            from_container: u16::from_le_bytes(body[4..6].try_into().ok()?),
+            from_slot: u16::from_le_bytes(body[6..8].try_into().ok()?),
         })
     }
 
     pub fn to_body(self) -> Vec<u8> {
-        let mut body = vec![0u8; Self::BODY_SIZE];
-        body[0] = self.from_container;
-        body[2..4].copy_from_slice(&self.from_slot.to_le_bytes());
-        body[4] = self.to_container;
-        body[6..8].copy_from_slice(&self.to_slot.to_le_bytes());
+        let mut body = Vec::with_capacity(Self::BODY_SIZE);
+        body.extend_from_slice(&self.to_container.to_le_bytes());
+        body.extend_from_slice(&self.to_slot.to_le_bytes());
+        body.extend_from_slice(&self.from_container.to_le_bytes());
+        body.extend_from_slice(&self.from_slot.to_le_bytes());
+        body
+    }
+
+    pub fn from(&self) -> (u8, u16) {
+        (self.from_container as u8, self.from_slot)
+    }
+
+    pub fn to(&self) -> (u8, u16) {
+        (self.to_container as u8, self.to_slot)
+    }
+}
+
+/// `TDeleteItemPacket` (`0x32C`), 8 bytes: the slot, then the container.
+/// Note the order — it is the opposite of everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteItem {
+    pub slot: u32,
+    pub container: u32,
+}
+
+impl DeleteItem {
+    pub const BODY_SIZE: usize = 8;
+
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        if body.len() < Self::BODY_SIZE {
+            return None;
+        }
+        Some(Self {
+            slot: u32::from_le_bytes(body[0..4].try_into().ok()?),
+            container: u32::from_le_bytes(body[4..8].try_into().ok()?),
+        })
+    }
+
+    pub fn to_body(self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(Self::BODY_SIZE);
+        body.extend_from_slice(&self.slot.to_le_bytes());
+        body.extend_from_slice(&self.container.to_le_bytes());
         body
     }
 }
+
+/// `TUseItemPacket` (`0x31D`), 12 bytes: the container, the slot, and a
+/// third field whose meaning depends on the kind of item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UseItem {
+    pub container: u32,
+    pub slot: u32,
+    pub argument: u32,
+}
+
+impl UseItem {
+    pub const BODY_SIZE: usize = 12;
+
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        if body.len() < Self::BODY_SIZE {
+            return None;
+        }
+        Some(Self {
+            container: u32::from_le_bytes(body[0..4].try_into().ok()?),
+            slot: u32::from_le_bytes(body[4..8].try_into().ok()?),
+            argument: u32::from_le_bytes(body[8..12].try_into().ok()?),
+        })
+    }
+
+    pub fn to_body(self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(Self::BODY_SIZE);
+        body.extend_from_slice(&self.container.to_le_bytes());
+        body.extend_from_slice(&self.slot.to_le_bytes());
+        body.extend_from_slice(&self.argument.to_le_bytes());
+        body
+    }
+}
+
 
 /// A bare header, which is all a signal is (`ServerSocket.pas:3168`).
 fn encode_bare_signal(opcode: u16, index: u16) -> Vec<u8> {
@@ -1639,6 +1813,81 @@ async fn handle_create_character(
 
     // Read back rather than patched in place, so the list the client gets is
     // the one the store holds.
+    let account = state.store.get(&username).unwrap_or_else(|| account.clone());
+    session.account = Some(account.clone());
+    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
+}
+
+
+/// `0x668`: back to the character selection screen.
+///
+/// The original closes the socket and lets the client reconnect, with a
+/// comment from whoever wrote it saying it is a hack and that they never
+/// found the real logout packet. It is still the right shape: the connection
+/// carries a character from the moment one is chosen, so leaving the world
+/// means starting a new connection. Disconnecting here runs the same teardown
+/// as any other, which is what saves the session.
+fn handle_back_to_character_select(session: &Session) -> Action {
+    match session.character.as_ref() {
+        Some(character) => info!(character = %character.name, "leaving for the character list"),
+        None => debug!("0x668 before a character was chosen"),
+    }
+    Action::Disconnect
+}
+
+/// `0x3E01`: delete the character in a slot.
+///
+/// The row is marked deleted rather than removed. A player who deletes the
+/// wrong character has lost it either way as far as the game is concerned,
+/// but a mistake stays recoverable by hand, and the name stays taken, which
+/// is what stops somebody else claiming it a minute later.
+async fn handle_delete_character(
+    state: &State,
+    session: &mut Session,
+    message: &Message,
+) -> Action {
+    let Some(request) = creation::DeleteCharacter::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x3E01 packet too short");
+        return Action::Ignore;
+    };
+
+    let Some(account) = session.account.as_ref() else {
+        warn!("0x3E01 before logging in");
+        return Action::Ignore;
+    };
+    let username = account.username.clone();
+    let slot = request.slot as usize;
+
+    let Some(doomed) = account.characters.iter().find(|c| c.slot == slot).cloned() else {
+        debug!(user = %username, slot, "0x3E01 for an empty slot");
+        return Action::Reply(vec![encode_char_list(
+            account,
+            session.client_id,
+            state.uptime_ms(),
+        )]);
+    };
+
+    // A character being played cannot be deleted from under itself.
+    if session.character.as_ref().is_some_and(|c| c.id == doomed.id) {
+        return Action::Reply(vec![
+            encode_client_message(session.client_id, "You cannot delete the character you are playing."),
+            encode_char_list(account, session.client_id, state.uptime_ms()),
+        ]);
+    }
+
+    if let Some(db) = state.db() {
+        if let Err(e) = db.soft_delete_character(doomed.id).await {
+            warn!(user = %username, name = %doomed.name, error = %e, "character not deleted");
+            return Action::Reply(vec![
+                encode_client_message(session.client_id, "The character could not be deleted."),
+                encode_char_list(account, session.client_id, state.uptime_ms()),
+            ]);
+        }
+    }
+
+    info!(user = %username, name = %doomed.name, slot, "character deleted");
+    state.store.remove_character(&username, slot);
+
     let account = state.store.get(&username).unwrap_or_else(|| account.clone());
     session.account = Some(account.clone());
     Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
@@ -2576,10 +2825,21 @@ mod tests {
             r[field::DURABILITY] = 60;
         };
         define(1000, 500, false);
-        define(4351, 10, true);
+
+        // a health potion: the type and the effect are what makes it drinkable
+        let r = &mut raw[POTION as usize * RECORD_SIZE..(POTION as usize + 1) * RECORD_SIZE];
+        r[field::NAME.start] = b'x';
+        r[field::SELL_PRICE..field::SELL_PRICE + 4].copy_from_slice(&10u32.to_le_bytes());
+        r[field::CAN_GROUP] = 1;
+        r[field::ITEM_TYPE..field::ITEM_TYPE + 2]
+            .copy_from_slice(&ITEM_TYPE_HP_POTION.to_le_bytes());
+        r[field::USE_EFFECT..field::USE_EFFECT + 2].copy_from_slice(&500u16.to_le_bytes());
 
         ItemList::decode(&raw).expect("the fixture table is malformed")
     }
+
+    /// A health potion in the fixture table.
+    const POTION: u16 = 4351;
 
     /// A session standing in the world, ready to talk to somebody.
     async fn in_world(state: &State) -> Session {
@@ -2846,12 +3106,39 @@ mod tests {
         assert!(character.items.is_empty(), "the stack is still in the bag");
     }
 
+    /// The field order, pinned against the record rather than against my
+    /// reading of it. This was wrong once: the destination comes first, and
+    /// reading it the other way round made every drag arrive backwards and
+    /// look like the client dragging out of empty slots.
     #[test]
-    fn move_item_body_roundtrip() {
-        let original =
-            MoveItem { from_container: 1, from_slot: 7, to_container: 0, to_slot: 3 };
-        assert_eq!(MoveItem::parse(&original.to_body()), Some(original));
+    fn move_item_reads_the_destination_first() {
+        // DestType 0, DestSlot 8, SrcType 1, SrcSlot 3: equipping bag slot 3.
+        let wire: Vec<u8> = vec![0, 0, 8, 0, 1, 0, 3, 0];
+        let parsed = MoveItem::parse(&wire).unwrap();
+
+        assert_eq!(parsed.to(), (inventory::EQUIP, 8), "destination read wrong");
+        assert_eq!(parsed.from(), (inventory::BAG, 3), "source read wrong");
+        assert_eq!(parsed.to_body(), wire);
         assert_eq!(MoveItem::parse(&[0u8; 4]), None);
+    }
+
+    /// The delete packet puts the slot before the container, which is the
+    /// opposite of everywhere else.
+    #[test]
+    fn delete_item_reads_the_slot_first() {
+        let wire: Vec<u8> = vec![7, 0, 0, 0, 1, 0, 0, 0];
+        let parsed = DeleteItem::parse(&wire).unwrap();
+
+        assert_eq!((parsed.slot, parsed.container), (7, 1));
+        assert_eq!(parsed.to_body(), wire);
+        assert_eq!(DeleteItem::parse(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn use_item_body_roundtrip() {
+        let original = UseItem { container: 1, slot: 3, argument: 0 };
+        assert_eq!(UseItem::parse(&original.to_body()), Some(original));
+        assert_eq!(UseItem::parse(&[0u8; 8]), None);
     }
 
     #[tokio::test]
@@ -2871,10 +3158,10 @@ mod tests {
             opcode: OP_MOVE_ITEM,
             time: 0,
             body: MoveItem {
-                from_container: inventory::BAG,
-                from_slot: 7,
-                to_container: inventory::BAG,
+                to_container: inventory::BAG as u16,
                 to_slot: 3,
+                from_container: inventory::BAG as u16,
+                from_slot: 7,
             }
             .to_body(),
         };
@@ -2904,10 +3191,10 @@ mod tests {
             opcode: OP_MOVE_ITEM,
             time: 0,
             body: MoveItem {
-                from_container: inventory::BAG,
-                from_slot: 7,
-                to_container: inventory::BAG,
+                to_container: inventory::BAG as u16,
                 to_slot: 3,
+                from_container: inventory::BAG as u16,
+                from_slot: 7,
             }
             .to_body(),
         };
@@ -3169,5 +3456,238 @@ mod tests {
         // the copy the player gets of itself is the ordinary kind
         let own = decode(&world_burst(&character, session.client_id)[0]);
         assert_eq!(own.body[spawn_offset::SPAWN_TYPE], SPAWN_NORMAL);
+    }
+
+    // ---- using what is in a slot ----------------------------------------
+
+    fn use_message(container: u8, slot: u32) -> Message {
+        Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_USE_ITEM,
+            time: 0,
+            body: UseItem { container: container as u32, slot, argument: 0 }.to_body(),
+        }
+    }
+
+    /// Drinking one out of a stack leaves the rest, and the client is told
+    /// what is left rather than being made to guess.
+    #[tokio::test]
+    async fn using_a_potion_takes_one_off_the_stack() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                index: POTION,
+                container: inventory::BAG,
+                slot: 2,
+                refine: 5,
+                ..Item::default()
+            })
+            .unwrap();
+
+        let frames = frames_of(handle_message(&state, &mut session, &use_message(inventory::BAG, 2)).await);
+
+        assert_eq!(opcodes(&frames), vec![OP_HP_MP, shop::OP_REFRESH_ITEM]);
+        assert_eq!(
+            session.character.as_ref().unwrap().items.get(inventory::BAG, 2).unwrap().refine,
+            4,
+            "the stack did not go down"
+        );
+
+        let refresh = decode(&frames[1]);
+        assert_eq!(u16::from_le_bytes(refresh.body[4..6].try_into().unwrap()), POTION);
+        assert_eq!(u16::from_le_bytes(refresh.body[20..22].try_into().unwrap()), 4);
+    }
+
+    /// The last one empties the slot, and the client has to be told that too
+    /// or it keeps drawing a potion that is gone.
+    #[tokio::test]
+    async fn using_the_last_one_empties_the_slot() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                index: POTION,
+                container: inventory::BAG,
+                slot: 0,
+                refine: 1,
+                ..Item::default()
+            })
+            .unwrap();
+
+        let frames = frames_of(handle_message(&state, &mut session, &use_message(inventory::BAG, 0)).await);
+
+        assert!(session.character.as_ref().unwrap().items.get(inventory::BAG, 0).is_none());
+        let refresh = decode(&frames[1]);
+        assert_eq!(
+            u16::from_le_bytes(refresh.body[4..6].try_into().unwrap()),
+            0,
+            "the client was not told the slot is empty"
+        );
+    }
+
+    /// Healing stops at the ceiling instead of running past it.
+    #[tokio::test]
+    async fn a_potion_cannot_heal_past_the_maximum() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        let (max_hp, _) = vitals(session.character.as_ref().unwrap());
+
+        session.cur_hp = max_hp - 10;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                index: POTION,
+                container: inventory::BAG,
+                slot: 0,
+                refine: 2,
+                ..Item::default()
+            })
+            .unwrap();
+
+        handle_message(&state, &mut session, &use_message(inventory::BAG, 0)).await;
+        assert_eq!(session.cur_hp, max_hp, "a big potion overshot the ceiling");
+    }
+
+    /// An item the server has no rule for says so rather than going quiet.
+    #[tokio::test]
+    async fn an_item_with_no_rule_yet_says_so() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item { index: 1000, container: inventory::BAG, slot: 0, ..Item::default() })
+            .unwrap();
+
+        let frames = frames_of(handle_message(&state, &mut session, &use_message(inventory::BAG, 0)).await);
+        assert_eq!(message_text(&frames[0]), "That cannot be used yet.");
+        assert!(
+            session.character.as_ref().unwrap().items.get(inventory::BAG, 0).is_some(),
+            "the item was consumed anyway"
+        );
+    }
+
+    /// Using an empty slot is what the client sends on a stray double click.
+    #[tokio::test]
+    async fn using_an_empty_slot_does_nothing() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+
+        let action = handle_message(&state, &mut session, &use_message(inventory::BAG, 9)).await;
+        assert!(matches!(action, Action::Ignore));
+    }
+
+    /// Equipping is a drag from the bag into an equipment slot, which is the
+    /// case that arrives with the containers different.
+    #[tokio::test]
+    async fn equipping_moves_an_item_between_containers() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item { index: 1000, container: inventory::BAG, slot: 0, ..Item::default() })
+            .unwrap();
+
+        let drag = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_MOVE_ITEM,
+            time: 0,
+            body: MoveItem {
+                to_container: inventory::EQUIP as u16,
+                to_slot: 8,
+                from_container: inventory::BAG as u16,
+                from_slot: 0,
+            }
+            .to_body(),
+        };
+        handle_message(&state, &mut session, &drag).await;
+
+        let items = &session.character.as_ref().unwrap().items;
+        assert_eq!(items.get(inventory::EQUIP, 8).unwrap().index, 1000, "not equipped");
+        assert!(items.get(inventory::BAG, 0).is_none(), "still in the bag too");
+    }
+
+    fn delete_message(slot: u32) -> Message {
+        Message {
+            sender: TEST_CLIENT_ID,
+            opcode: creation::OP_DELETE_CHARACTER,
+            time: 0,
+            body: creation::DeleteCharacter { slot, pin: String::new() }.to_body(),
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_character_takes_it_off_the_list() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = logged_in(&state).await;
+        handle_message(&state, &mut session, &create_message("Segundo", 1)).await;
+
+        let frames = frames_of(handle_message(&state, &mut session, &delete_message(1)).await);
+
+        assert_eq!(opcodes(&frames), vec![OP_CHAR_LIST]);
+        let names = names_in_char_list(&frames[0]);
+        assert_eq!(names[0], "Athus", "the wrong character went");
+        assert_eq!(names[1], "", "the character is still on the list");
+        assert_eq!(session.account.as_ref().unwrap().characters.len(), 1);
+    }
+
+    /// Deleting the character being played would leave the connection holding
+    /// something that no longer exists.
+    #[tokio::test]
+    async fn the_character_being_played_cannot_be_deleted() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = in_world(&state).await;
+
+        let frames = frames_of(handle_message(&state, &mut session, &delete_message(0)).await);
+
+        assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE, OP_CHAR_LIST]);
+        assert_eq!(names_in_char_list(&frames[1])[0], "Athus");
+    }
+
+    /// An empty slot redraws the screen instead of going quiet, so the client
+    /// is never left waiting on a dialog.
+    #[tokio::test]
+    async fn deleting_an_empty_slot_just_redraws_the_list() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = logged_in(&state).await;
+
+        let frames = frames_of(handle_message(&state, &mut session, &delete_message(2)).await);
+        assert_eq!(opcodes(&frames), vec![OP_CHAR_LIST]);
+    }
+
+    /// Going back to the selection screen ends the connection, which is how
+    /// the original does it and what runs the save on the way out.
+    #[tokio::test]
+    async fn going_back_to_the_character_list_ends_the_connection() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = in_world(&state).await;
+
+        let back = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_BACK_TO_CHARACTER_SELECT,
+            time: 0,
+            body: Vec::new(),
+        };
+        assert!(matches!(
+            handle_message(&state, &mut session, &back).await,
+            Action::Disconnect
+        ));
     }
 }

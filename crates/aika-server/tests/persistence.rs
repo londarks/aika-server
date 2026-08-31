@@ -424,12 +424,7 @@ async fn an_item_thrown_away_stays_thrown_away() {
     client.enter_world().await;
     client.buy_from_shop().await;
 
-    let throw = aika_server::game::MoveItem {
-        from_container: inventory::BAG,
-        from_slot: 0,
-        to_container: inventory::BAG,
-        to_slot: 0,
-    };
+    let throw = aika_server::game::DeleteItem { slot: 0, container: inventory::BAG as u32 };
     client.send(aika_server::game::OP_DELETE_ITEM, throw.to_body()).await;
     client.expect(shop::OP_REFRESH_ITEM).await;
     drop(client);

@@ -314,6 +314,15 @@ impl AccountStore {
         true
     }
 
+    /// Takes a character out of the in-memory copy. The database keeps the
+    /// row and marks it deleted; this is only the list the client is shown.
+    pub fn remove_character(&self, username: &str, slot: usize) -> Option<Character> {
+        let mut accounts = self.accounts.lock().unwrap();
+        let account = accounts.get_mut(&username.to_ascii_lowercase())?;
+        let at = account.characters.iter().position(|c| c.slot == slot)?;
+        Some(account.characters.remove(at))
+    }
+
     pub fn get(&self, username: &str) -> Option<Account> {
         let key = username.to_ascii_lowercase();
         self.accounts.lock().unwrap().get(&key).cloned()

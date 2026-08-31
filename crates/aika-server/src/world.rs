@@ -13,6 +13,7 @@
 //! behind the same methods.
 
 use crate::store::Character;
+use aika_data::npc::Npc;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
@@ -27,6 +28,15 @@ pub const DISTANCE_TO_WATCH: f32 = 50.0;
 /// is deliberate: a single threshold makes someone standing right on the edge
 /// flicker in and out.
 pub const DISTANCE_TO_FORGET: f32 = 60.0;
+
+/// Client ids are one space shared by players and NPCs, because the protocol
+/// carries them in the same header field. The original reserves 1 to 2000 for
+/// players and 2048 to 3048 for NPCs (`Connections/ServerSocket.pas:44`), and
+/// only ever fills 200 player slots. Handing a player an id in the NPC range
+/// would make the client draw them over a townsperson.
+pub const MAX_PLAYERS: u16 = 200;
+/// The first id an NPC can hold.
+pub const FIRST_NPC_ID: u16 = 2048;
 
 /// One connected player.
 #[derive(Clone)]
@@ -58,6 +68,9 @@ impl Presence {
 #[derive(Default)]
 pub struct World {
     players: Mutex<HashMap<u16, Presence>>,
+    /// Read from `Data/NPCs` at startup and never touched again: an NPC does
+    /// not move, log out or take damage, so it needs no lock.
+    npcs: Vec<Npc>,
 }
 
 impl World {
@@ -65,20 +78,35 @@ impl World {
         Self::default()
     }
 
-    /// Registers a new connection and gives it a client id.
+    pub fn with_npcs(npcs: Vec<Npc>) -> Self {
+        Self { npcs, ..Self::default() }
+    }
+
+    pub fn npcs(&self) -> &[Npc] {
+        &self.npcs
+    }
+
+    /// The NPCs a player standing at this point should have on screen.
+    pub fn npcs_near(&self, at: (f32, f32), radius: f32) -> Vec<&Npc> {
+        self.npcs.iter().filter(|npc| within(at, (npc.x, npc.y), radius)).collect()
+    }
+
+    /// Registers a new connection and gives it a client id, or `None` when
+    /// the server is full.
     ///
     /// Ids start at 1 and the lowest free one is reused, the way the original
     /// picks a free connection slot. The client learns its id from the packets
     /// we send it, so it must be ours to choose: echoing back whatever the
-    /// client claimed would give every player the same id.
-    pub fn connect(&self, outbox: Outbox) -> u16 {
+    /// client claimed would give every player the same id. The cap is what
+    /// keeps a player id out of the range the NPCs occupy.
+    pub fn connect(&self, outbox: Outbox) -> Option<u16> {
         let mut players = self.players.lock().unwrap();
-        let client_id = (1u16..).find(|id| !players.contains_key(id)).expect("no free client id");
+        let client_id = (1..=MAX_PLAYERS).find(|id| !players.contains_key(id))?;
         players.insert(
             client_id,
             Presence { client_id, account_id: 0, character: None, outbox },
         );
-        client_id
+        Some(client_id)
     }
 
     pub fn disconnect(&self, client_id: u16) -> Option<Presence> {
@@ -170,7 +198,7 @@ mod tests {
 
     fn join(world: &World, name: &str, x: u32, y: u32) -> (u16, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let id = world.connect(tx);
+        let id = world.connect(tx).expect("the world is not full");
         world.enter(id, character(name, x, y));
         (id, rx)
     }
@@ -194,7 +222,7 @@ mod tests {
 
         // connected but never entered the world
         let (tx, _lurker_rx) = mpsc::unbounded_channel();
-        world.connect(tx);
+        world.connect(tx).unwrap();
 
         assert_eq!(world.online(), 1);
         assert!(world.visible_to(seer).is_empty(), "a lurker is not visible");
@@ -241,6 +269,24 @@ mod tests {
         assert_eq!(gone.client_id, other);
         assert!(world.visible_to(seer).is_empty());
         assert_eq!(world.online(), 1);
+    }
+
+    /// A player id in the NPC range would draw over a townsperson, so the
+    /// server refuses the connection instead.
+    #[test]
+    fn ids_stop_before_the_range_the_npcs_use() {
+        let world = World::new();
+        let mut held = Vec::new();
+        for _ in 0..MAX_PLAYERS {
+            let (tx, rx) = mpsc::unbounded_channel();
+            held.push((world.connect(tx).expect("still room"), rx));
+        }
+
+        assert_eq!(held.last().unwrap().0, MAX_PLAYERS);
+        assert!(MAX_PLAYERS < FIRST_NPC_ID);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert_eq!(world.connect(tx), None, "the server is full and must say so");
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::store::{AccountStore, Character};
 use crate::world::World;
+use aika_data::npc::NpcSet;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -38,7 +39,8 @@ impl State {
             cfg.login.max_attempts,
             Duration::from_secs(cfg.login.block_minutes * 60),
         )?;
-        Ok(Self { cfg, store, world: World::new(), db: Some(db), started: Instant::now() })
+        let world = World::with_npcs(load_npcs(&cfg.game.npc_dir));
+        Ok(Self { cfg, store, world, db: Some(db), started: Instant::now() })
     }
 
     /// State with no database behind it, for tests about packets rather than
@@ -49,7 +51,8 @@ impl State {
             cfg.login.max_attempts,
             Duration::from_secs(cfg.login.block_minutes * 60),
         )?;
-        Ok(Self { cfg, store, world: World::new(), db: None, started: Instant::now() })
+        let world = World::with_npcs(load_npcs(&cfg.game.npc_dir));
+        Ok(Self { cfg, store, world, db: None, started: Instant::now() })
     }
 
     pub fn db(&self) -> Option<&Database> {
@@ -79,4 +82,30 @@ impl State {
     pub fn token_ttl(&self) -> Duration {
         Duration::from_secs(self.cfg.login.token_ttl_secs)
     }
+}
+
+/// Reads the townspeople, if a directory was configured.
+///
+/// A missing or unreadable directory is a warning, not a failure: a server
+/// with no NPCs still lets people log in and walk around, and refusing to
+/// start would be a worse trade.
+fn load_npcs(dir: &str) -> Vec<aika_data::npc::Npc> {
+    if dir.is_empty() {
+        return Vec::new();
+    }
+
+    let set = match NpcSet::load_dir(dir) {
+        Ok(set) => set,
+        Err(e) => {
+            warn!(dir, error = %e, "could not read the npc directory; the world will be empty");
+            return Vec::new();
+        }
+    };
+
+    for (file, why) in &set.rejected {
+        warn!(file, reason = %why, "npc not loaded");
+    }
+    info!(dir, npcs = set.len(), "npcs loaded");
+
+    set.iter().cloned().collect()
 }

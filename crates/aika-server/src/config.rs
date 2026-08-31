@@ -64,6 +64,10 @@ pub struct GameConfig {
     /// (`Version=124` in `AikaServer.ini`).
     #[serde(default = "default_client_version")]
     pub client_version: u16,
+    /// Directory of `.npc` files to place in the world. Empty means no
+    /// townspeople, which is a playable but very lonely city.
+    #[serde(default)]
+    pub npc_dir: String,
 }
 
 /// What the launcher receives when it checks the client version.
@@ -205,6 +209,7 @@ impl Default for GameConfig {
         Self {
             binds: vec!["127.0.0.1:8822".parse().unwrap()],
             client_version: default_client_version(),
+            npc_dir: String::new(),
         }
     }
 }

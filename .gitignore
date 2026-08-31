@@ -20,3 +20,7 @@ crates/aika-data/testdata/SL.bin
 
 # Game data fixture: kept locally, never redistributed.
 crates/aika-data/testdata/ItemList.bin
+
+# Data from the original server (NPCs, tables): read by our server, never
+# redistributed, and never referenced by an absolute path.
+/data/

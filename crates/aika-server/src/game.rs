@@ -11,8 +11,10 @@
 
 use crate::state::State;
 use crate::store::{Account, Character, MAX_CHARACTERS};
-use crate::world::Outbox;
+use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
+use aika_data::npc::Npc;
 use aika_net::frame::{self, FrameError, FrameReader, Message, MIN_FRAME};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -129,6 +131,22 @@ mod spawn_offset {
     pub const BODY_SIZE: usize = 496;
 }
 
+/// Extra fields the NPC flavour of `0x349` uses (`Mob/BaseNpc.pas:1855`).
+mod npc_offset {
+    /// Where the job title goes, the line the client draws under the name.
+    pub const TITLE: usize = 444;
+    pub const TITLE_MAX: usize = 32;
+    /// One byte right after the four sizes.
+    pub const IS_SERVICE: usize = 79;
+    pub const EFFECT_TYPE: usize = 80;
+}
+
+/// An NPC is not a player: it is flagged as a service, carries a different
+/// `Unk0`, and lights up effect type 1 (`Mob/BaseNpc.pas:1886`).
+const NPC_UNK0: u8 = 0x28;
+const NPC_IS_SERVICE: u8 = 1;
+const NPC_EFFECT_TYPE: u16 = 1;
+
 /// Fixed values the original writes without explanation, but which the
 /// client expects (`Mob/BaseMob.pas:2974-3131`).
 const SPAWN_UNK0: u8 = 0x0A;
@@ -215,6 +233,9 @@ struct Session {
     /// starting point, which is the original's `if IsInstantiated then Exit`
     /// (`Mob/Player.pas:4967`).
     spawned: bool,
+    /// NPCs already placed on this player's screen. Same reason as `visible`:
+    /// sending a spawn twice makes the client draw two of them.
+    visible_npcs: HashSet<u16>,
 }
 
 async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Result<()> {
@@ -224,7 +245,10 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Resu
     // The id is ours to hand out, not the client's to claim: the client learns
     // it from the packets we send, and echoing back whatever it sent would give
     // every player the same one.
-    let client_id = state.world.connect(outbox.clone());
+    let Some(client_id) = state.world.connect(outbox.clone()) else {
+        warn!(players = state.world.online(), "refused a connection: the channel is full");
+        return Ok(());
+    };
 
     // One task owns the write half, so a broadcast from another connection can
     // reach this player without either side waiting on the other.
@@ -534,6 +558,10 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
 
     let mut frames = world_burst(&character, session.client_id);
 
+    // The city is drawn by the client; the people in it are not. Without this
+    // the player arrives in an empty town.
+    frames.extend(refresh_npc_visibility(state, session));
+
     // Everyone already standing nearby has to appear on this player's screen,
     // and this player on theirs. Both directions use the same spawn packet.
     let neighbours = state.world.visible_to(session.client_id);
@@ -551,6 +579,7 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
         x = character.x,
         y = character.y,
         neighbours = neighbours.len(),
+        npcs = session.visible_npcs.len(),
         "spawning on the map"
     );
     Action::Reply(frames)
@@ -769,14 +798,15 @@ fn handle_move(state: &State, session: &mut Session, message: &Message) -> Actio
 /// matter how close they walk. The set lives on the session so each side
 /// appears exactly once, and disappears exactly once.
 fn refresh_visibility(state: &State, session: &mut Session) -> Action {
-    let Some(character) = session.character.as_ref() else {
+    if session.character.is_none() {
         return Action::Ignore;
-    };
+    }
 
     let neighbours = state.world.visible_to(session.client_id);
-    let now: std::collections::HashSet<u16> = neighbours.iter().map(|p| p.client_id).collect();
+    let now: HashSet<u16> = neighbours.iter().map(|p| p.client_id).collect();
 
-    let mut frames = Vec::new();
+    let mut frames = refresh_npc_visibility(state, session);
+    let character = session.character.as_ref().expect("checked above");
     let mine = encode_spawn(character, session.client_id);
 
     for other in &neighbours {
@@ -803,6 +833,118 @@ fn refresh_visibility(state: &State, session: &mut Session) -> Action {
     } else {
         Action::Reply(frames)
     }
+}
+
+/// Places townspeople on the screen and takes them off it again.
+///
+/// NPCs are the other half of visibility, and the simpler half: they never
+/// move, so only the player walking changes the answer. They are also the
+/// first thing a player notices missing — an empty city looks broken in a way
+/// an empty field does not.
+fn refresh_npc_visibility(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+    let Some(character) = session.character.as_ref() else {
+        return Vec::new();
+    };
+    let at = (character.x as f32, character.y as f32);
+
+    let mut frames = Vec::new();
+    let near: HashSet<u16> = state
+        .world
+        .npcs_near(at, DISTANCE_TO_WATCH)
+        .iter()
+        .map(|npc| npc.id)
+        .collect();
+
+    for npc in state.world.npcs_near(at, DISTANCE_TO_WATCH) {
+        if session.visible_npcs.insert(npc.id) {
+            frames.push(encode_npc_spawn(npc));
+        }
+    }
+
+    // The wider radius is what keeps an NPC from flickering while a player
+    // walks back and forth across the edge of the watch distance.
+    let gone: Vec<u16> = session
+        .visible_npcs
+        .iter()
+        .copied()
+        .filter(|id| !near.contains(id))
+        .filter(|id| {
+            state
+                .world
+                .npcs()
+                .iter()
+                .find(|npc| npc.id == *id)
+                .is_none_or(|npc| !within(at, (npc.x, npc.y), DISTANCE_TO_FORGET))
+        })
+        .collect();
+
+    for id in gone {
+        session.visible_npcs.remove(&id);
+        frames.push(encode_remove_mob(id, DELETE_NORMAL));
+    }
+
+    frames
+}
+
+fn within(a: (f32, f32), b: (f32, f32), radius: f32) -> bool {
+    let (dx, dy) = (a.0 - b.0, a.1 - b.1);
+    dx * dx + dy * dy <= radius * radius
+}
+
+/// The NPC flavour of `0x349` (`TSendCreateNpcPacket`). Same size and mostly
+/// the same layout as a player's, with the differences the original makes in
+/// `TBaseNpc.GetCreateMob`: the model comes from the NPC's own equipment, the
+/// name is an index into the client's string table rather than text, and the
+/// job title travels with it.
+fn encode_npc_spawn(npc: &Npc) -> Vec<u8> {
+    use spawn_offset as off;
+    let mut body = vec![0u8; off::BODY_SIZE];
+
+    let put16 = |b: &mut Vec<u8>, at: usize, v: u16| {
+        b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    let put32 = |b: &mut Vec<u8>, at: usize, v: u32| {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    };
+
+    // The name field carries the digits of a string index, which is what the
+    // file holds and what the client looks up. Writing the real name here
+    // would show a number-shaped blank instead.
+    if let Some(index) = npc.name_index {
+        write_fixed_str(&mut body[off::NAME..off::NAME + 16], &index.to_string());
+    }
+
+    for (i, item) in npc.equip.iter().enumerate() {
+        put16(&mut body, off::EQUIP + i * 2, *item);
+    }
+
+    body[off::POSITION_X..off::POSITION_X + 4].copy_from_slice(&npc.x.to_le_bytes());
+    body[off::POSITION_Y..off::POSITION_Y + 4].copy_from_slice(&npc.y.to_le_bytes());
+    put32(&mut body, off::ROTATION, npc.rotation as u32);
+
+    // The original sends MaxHP twice, once as the mana ceiling as well.
+    put32(&mut body, off::MAX_HP, npc.max_hp);
+    put32(&mut body, off::MAX_MP, npc.max_hp);
+    put32(&mut body, off::CUR_HP, npc.cur_hp.min(npc.max_hp));
+    put32(&mut body, off::CUR_MP, npc.cur_mp.min(npc.max_hp));
+
+    body[off::UNK0] = NPC_UNK0;
+    body[off::SPEED_MOVE] = npc.speed_move as u8;
+    body[off::SPAWN_TYPE] = SPAWN_NORMAL;
+    body[off::SIZES..off::SIZES + 4].copy_from_slice(&npc.sizes);
+
+    body[npc_offset::IS_SERVICE] = NPC_IS_SERVICE;
+    put16(&mut body, npc_offset::EFFECT_TYPE, NPC_EFFECT_TYPE);
+    write_fixed_str(
+        &mut body[npc_offset::TITLE..npc_offset::TITLE + npc_offset::TITLE_MAX],
+        &npc.title,
+    );
+
+    debug_assert_eq!(body.len() + MIN_FRAME, CREATE_MOB_SIZE);
+    frame::encode(
+        &Message { sender: npc.id, opcode: OP_CREATE_MOB, time: 0, body },
+        rand::random(),
+    )
 }
 
 /// `0x301` body (`TMovementPacket`, `Data/Packets.pas`): destination as two
@@ -1100,6 +1242,7 @@ fn write_fixed_str(dest: &mut [u8], value: &str) {
 mod tests {
     use super::*;
     use crate::config::{Config, DevAccount, DevCharacter};
+    use crate::world::World;
 
     fn state_with(characters: Vec<DevCharacter>) -> State {
         let cfg = Config {
@@ -1162,6 +1305,49 @@ mod tests {
 
     /// Whatever id the registry would have handed this connection.
     const TEST_CLIENT_ID: u16 = 7;
+
+    /// A townsperson, built rather than read: the `.npc` files belong to the
+    /// original pack and are not in this repository.
+    fn npc(id: u16, title: &str, x: f32, y: f32) -> Npc {
+        Npc {
+            id,
+            title: title.into(),
+            label: String::new(),
+            name_index: Some(43),
+            options: vec![1, 2, 8],
+            equip: [234, 234, 0, 0, 0, 0, 0, 0],
+            sizes: [7, 119, 119, 3],
+            max_hp: 20000,
+            cur_hp: 20000,
+            max_mp: 20000,
+            cur_mp: 0,
+            x,
+            y,
+            rotation: 0,
+            speed_move: 0,
+            stale_id: None,
+        }
+    }
+
+    /// Spawn packets in a batch of frames, by the id they are addressed to.
+    fn spawned_ids(frames: &[Vec<u8>]) -> Vec<u16> {
+        frames
+            .iter()
+            .map(|frame| decode(frame))
+            .filter(|m| m.opcode == OP_CREATE_MOB)
+            .map(|m| m.sender)
+            .collect()
+    }
+
+    /// Removal packets in a batch of frames.
+    fn removed_ids(frames: &[Vec<u8>]) -> Vec<u16> {
+        frames
+            .iter()
+            .map(|frame| decode(frame))
+            .filter(|m| m.opcode == OP_REMOVE_MOB)
+            .map(|m| u32::from_le_bytes(m.body[0..4].try_into().unwrap()) as u16)
+            .collect()
+    }
 
     fn enter_world(slot: u32) -> Message {
         Message {
@@ -1590,5 +1776,115 @@ mod tests {
         assert!(prefix.feed(&[0x11, 0xF3]).is_none(), "2 bytes are not enough to decide");
         let rest = prefix.feed(&[0x11, 0x1F, 0x00, 0x00]);
         assert!(rest.is_some(), "6 bytes are enough to decide");
+    }
+
+
+    /// The city has to be populated when the player arrives, or it looks
+    /// broken: the buildings are drawn by the client, the people are not.
+    #[test]
+    fn the_townspeople_appear_when_the_player_enters_the_world() {
+        let mut state = state_with(vec![dev_character("Athus", 0)]);
+        state.world = World::with_npcs(vec![
+            npc(2050, "Merchant", 3455.0, 700.0),  // 12 away from the spawn
+            npc(2051, "Skill Master", 3460.0, 695.0), // 11 away
+            npc(2500, "Far Away", 9000.0, 9000.0),
+        ]);
+
+        let mut session = logged_in(&state);
+        let Action::Reply(frames) = handle_message(&state, &mut session, &enter_world(0)) else {
+            panic!("entering the world produced no frames");
+        };
+        let _ = frames;
+
+        let Action::Reply(frames) = handle_client_ready(&state, &mut session) else {
+            panic!("the world burst produced no frames");
+        };
+
+        let spawned = spawned_ids(&frames);
+        assert!(spawned.contains(&2050), "the merchant is not on screen: {spawned:?}");
+        assert!(spawned.contains(&2051));
+        assert!(!spawned.contains(&2500), "an npc across the map was spawned");
+    }
+
+    /// Walking past an NPC and away again places it once and removes it once.
+    #[test]
+    fn an_npc_is_placed_once_and_removed_once() {
+        let mut state = state_with(vec![dev_character("Athus", 0)]);
+        state.world = World::with_npcs(vec![npc(2050, "Merchant", 3455.0, 700.0)]);
+
+        let mut session = logged_in(&state);
+        handle_message(&state, &mut session, &enter_world(0));
+        handle_client_ready(&state, &mut session);
+        assert!(session.visible_npcs.contains(&2050), "never placed");
+
+        // standing still must not place it a second time
+        let frames = refresh_npc_visibility(&state, &mut session);
+        assert!(frames.is_empty(), "the merchant was sent twice");
+
+        // walking off the map edge of the watch radius takes it away
+        session.character.as_mut().unwrap().x = 9000;
+        let frames = refresh_npc_visibility(&state, &mut session);
+        assert_eq!(removed_ids(&frames), vec![2050]);
+        assert!(!session.visible_npcs.contains(&2050));
+
+        // and once gone, it stays gone until the player walks back
+        assert!(refresh_npc_visibility(&state, &mut session).is_empty());
+    }
+
+    /// The gap between watching and forgetting is what stops an NPC from
+    /// flickering while a player paces across the edge of the radius.
+    #[test]
+    fn an_npc_just_outside_the_watch_radius_is_not_forgotten_yet() {
+        let mut state = state_with(vec![dev_character("Athus", 0)]);
+        state.world = World::with_npcs(vec![npc(2050, "Merchant", 3450.0, 690.0)]);
+
+        let mut session = logged_in(&state);
+        handle_message(&state, &mut session, &enter_world(0));
+        handle_client_ready(&state, &mut session);
+
+        // 55 away: past DISTANCE_TO_WATCH, short of DISTANCE_TO_FORGET
+        session.character.as_mut().unwrap().x = 3505;
+        assert!(refresh_npc_visibility(&state, &mut session).is_empty());
+        assert!(session.visible_npcs.contains(&2050));
+
+        // 65 away: gone
+        session.character.as_mut().unwrap().x = 3515;
+        assert_eq!(removed_ids(&refresh_npc_visibility(&state, &mut session)), vec![2050]);
+    }
+
+    /// What the client reads out of the packet has to be what the file said.
+    #[test]
+    fn the_spawn_carries_the_model_the_position_and_the_title() {
+        let merchant = npc(2050, "Merchant", 3468.4, 963.4);
+        let message = decode(&encode_npc_spawn(&merchant));
+
+        assert_eq!(message.opcode, OP_CREATE_MOB);
+        assert_eq!(message.sender, 2050, "the header identifies the npc");
+
+        use spawn_offset as off;
+        let body = &message.body;
+        assert_eq!(
+            u16::from_le_bytes(body[off::EQUIP..off::EQUIP + 2].try_into().unwrap()),
+            234,
+            "the model the client draws"
+        );
+        assert_eq!(
+            f32::from_le_bytes(body[off::POSITION_X..off::POSITION_X + 4].try_into().unwrap()),
+            3468.4
+        );
+        assert_eq!(body[npc_offset::IS_SERVICE], NPC_IS_SERVICE);
+        assert_eq!(body[off::UNK0], NPC_UNK0, "an npc is not a player");
+
+        // the name travels as the digits of a string index, not as text
+        let name: String =
+            body[..16].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+        assert_eq!(name, "43");
+
+        let title: String = body[npc_offset::TITLE..npc_offset::TITLE + 8]
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as char)
+            .collect();
+        assert_eq!(title, "Merchant");
     }
 }

@@ -44,6 +44,14 @@ binds = [
 ]
 # The original server refuses any other version (Version=124 in the ini).
 client_version = 124
+# Where the `.npc` files are, relative to the directory the server is started
+# from. They come from the original server's data, are read and never executed,
+# and are not tracked here — copy them into `data/NPCs` yourself. Leave empty
+# to run with no townspeople.
+#
+# Never put an absolute path in this file: it is tracked, and a path carries
+# the name of whoever's machine it came from.
+npc_dir = "data/NPCs"
 
 # What the launcher receives when it checks the client version. It must match
 # the client's `update.dat` byte for byte, or the launcher believes a patch is

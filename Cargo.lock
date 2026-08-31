@@ -23,6 +23,7 @@ version = "0.1.0"
 name = "aika-server"
 version = "0.1.0"
 dependencies = [
+ "aika-data",
  "aika-net",
  "anyhow",
  "hex",

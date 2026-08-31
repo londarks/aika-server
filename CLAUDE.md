@@ -7,6 +7,17 @@ what our client actually talks to) and **[AikaEmu](https://github.com/lemestwo/A
 in C# (GPL-3.0, more readable, used for cross-checking). Because of AikaEmu this
 project is GPL-3.0 too.
 
+## Never in a tracked file
+
+- **No absolute paths.** A path carries the username and the folder layout of
+  the machine it came from. Data outside the repository is referenced through a
+  relative path in `config.toml`, and the data itself goes in `data/`, which is
+  ignored. This rule exists because it was broken once and pushed.
+- **No real account data.** The original MySQL dump had live emails and password
+  hashes; only `sql/schema.sql` (structure, no rows) is tracked.
+- **No client or original-server data.** `SL.bin`, `ItemList.bin`, `data/NPCs`
+  and anything else from the pack is read locally and never redistributed.
+
 ## Conventions
 
 **Everything in English.** Code, comments, doc comments, log messages, test

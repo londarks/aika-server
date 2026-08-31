@@ -1937,7 +1937,15 @@ async fn handle_create_character(
         match db.insert_character(account.id as i64, &character).await {
             Ok(id) => character.id = id,
             Err(e) => {
-                warn!(user = %username, name = %character.name, error = %e, "character not stored");
+                // The whole chain, not only the outermost context: the
+                // one time this fired, the reason was two layers down and
+                // the log said nothing useful.
+                warn!(
+                    user = %username,
+                    name = %character.name,
+                    error = format!("{e:#}"),
+                    "character not stored"
+                );
                 return Action::Reply(vec![
                     encode_client_message(session.client_id, "The character could not be saved."),
                     encode_char_list(account, session.client_id, state.uptime_ms()),
@@ -2022,7 +2030,12 @@ async fn handle_delete_character(
 
     if let Some(db) = state.db() {
         if let Err(e) = db.soft_delete_character(doomed.id).await {
-            warn!(user = %username, name = %doomed.name, error = %e, "character not deleted");
+            warn!(
+                user = %username,
+                name = %doomed.name,
+                error = format!("{e:#}"),
+                "character not deleted"
+            );
             return Action::Reply(vec![
                 encode_client_message(session.client_id, "The character could not be deleted."),
                 encode_char_list(account, session.client_id, state.uptime_ms()),

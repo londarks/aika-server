@@ -510,13 +510,28 @@ impl Database {
         })
     }
 
+    /// Marks a character deleted and moves it out of its slot.
+    ///
+    /// Both halves matter. Keeping the row is what makes a mistaken deletion
+    /// recoverable and what stops the name being claimed a minute later. But
+    /// `UNIQUE (account_id, slot)` does not care whether a row is deleted, so
+    /// a row left sitting in slot 1 blocks the next character from being made
+    /// there — which is exactly what happened to somebody.
+    ///
+    /// The slot becomes the negative of the row id: unique by construction,
+    /// never in the 0 to 2 a live character uses, and it still says where the
+    /// character was. A partial index would be the tidier fix and MySQL does
+    /// not have them, so this is the portable one.
     pub async fn soft_delete_character(&self, character_id: i64) -> Result<()> {
-        sqlx::query("UPDATE characters SET deleted_at = ? WHERE id = ?")
-            .bind(now())
-            .bind(character_id)
-            .execute(&self.pool)
-            .await
-            .context("deleting character")?;
+        sqlx::query(
+            "UPDATE characters SET deleted_at = ?, slot = -id
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(now())
+        .bind(character_id)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("deleting character {character_id}"))?;
         Ok(())
     }
 }
@@ -636,6 +651,70 @@ mod tests {
         db.save_session(&character).await.unwrap();
 
         assert!(db.load_items(character.id).await.unwrap().is_empty(), "sold items came back");
+    }
+
+    /// Deleting frees the slot. A row left sitting in it blocks the next
+    /// character from being made there, because the unique index does not
+    /// care whether a row is deleted.
+    #[tokio::test]
+    async fn deleting_frees_the_slot_for_a_new_character() {
+        let db = memory_db().await;
+        db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
+
+        let mut second = Character::from(&crate::config::DevCharacter {
+            name: "Segundo".into(),
+            slot: 1,
+            level: 1,
+            class_index: 20,
+            hair: 7702,
+            nation: 0,
+            gold: 0,
+            exp: 0,
+            x: None,
+            y: None,
+            speed_move: None,
+        });
+        let id = db.insert_character(1, &second).await.unwrap();
+        db.soft_delete_character(id).await.unwrap();
+
+        // the same slot, again
+        second.name = "Terceiro".into();
+        db.insert_character(1, &second)
+            .await
+            .expect("the deleted character is still holding the slot");
+
+        let account = &db.load_accounts().await.unwrap()[0];
+        let names: Vec<&str> = account.characters.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Athus", "Terceiro"], "the deleted one came back");
+    }
+
+    /// The name stays taken, which is the point of keeping the row.
+    #[tokio::test]
+    async fn a_deleted_characters_name_stays_taken() {
+        let db = memory_db().await;
+        db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
+
+        let id = db.load_accounts().await.unwrap()[0].characters[0].id;
+        db.soft_delete_character(id).await.unwrap();
+
+        let mut clone = Character::from(&crate::config::DevCharacter {
+            name: "Athus".into(),
+            slot: 1,
+            level: 1,
+            class_index: 20,
+            hair: 7702,
+            nation: 0,
+            gold: 0,
+            exp: 0,
+            x: None,
+            y: None,
+            speed_move: None,
+        });
+        clone.slot = 1;
+        assert!(
+            db.insert_character(1, &clone).await.is_err(),
+            "the name of a deleted character was handed out again"
+        );
     }
 
     /// A character is inserted with whatever it is holding, not as a bare row.

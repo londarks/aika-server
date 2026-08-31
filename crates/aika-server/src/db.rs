@@ -12,6 +12,7 @@
 //! server actually uses, and grows as features land.
 
 use crate::config::DevAccount;
+use crate::inventory::Inventory;
 use crate::store::{Account, Character, Item, DEFAULT_SIZES, DEFAULT_SPEED_MOVE};
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -279,7 +280,7 @@ impl Database {
                     row.try_get::<i64, _>("luck")? as u16,
                     row.try_get::<i64, _>("free_points")? as u16,
                 ],
-                items: self.load_items(id).await?,
+                items: self.load_items(id).await?.into(),
             });
         }
         Ok(characters)
@@ -411,6 +412,77 @@ impl Database {
 
     /// Marks a character deleted without dropping the row, the way the
     /// original schedules a deletion instead of performing it.
+    /// Replaces everything a character carries.
+    ///
+    /// Written as a delete and a set of inserts inside one transaction rather
+    /// than as an upsert, because the two dialects spell upserts differently
+    /// and this file has to work on both. It is also the only shape that gets
+    /// an emptied slot right: an update alone would leave the old row behind.
+    pub async fn save_inventory(
+        &self,
+        character_id: i64,
+        items: &Inventory,
+    ) -> Result<usize> {
+        let mut tx = self.pool.begin().await.context("saving the inventory")?;
+
+        sqlx::query("DELETE FROM items WHERE character_id = ?")
+            .bind(character_id)
+            .execute(&mut *tx)
+            .await
+            .context("clearing the old inventory")?;
+
+        let mut written = 0;
+        for item in items.iter().filter(|i| !i.is_empty()) {
+            sqlx::query(
+                "INSERT INTO items
+                   (character_id, container, slot, item_index, appearance, identific,
+                    effect1_index, effect2_index, effect3_index,
+                    effect1_value, effect2_value, effect3_value,
+                    durability_min, durability_max, refine, expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(character_id)
+            .bind(item.container as i64)
+            .bind(item.slot as i64)
+            .bind(item.index as i64)
+            .bind(item.appearance as i64)
+            .bind(item.identific as i64)
+            .bind(item.effect_index[0] as i64)
+            .bind(item.effect_index[1] as i64)
+            .bind(item.effect_index[2] as i64)
+            .bind(item.effect_value[0] as i64)
+            .bind(item.effect_value[1] as i64)
+            .bind(item.effect_value[2] as i64)
+            .bind(item.durability_min as i64)
+            .bind(item.durability_max as i64)
+            .bind(item.refine as i64)
+            .bind(item.expires_at as i64)
+            .execute(&mut *tx)
+            .await
+            .context("writing an item")?;
+            written += 1;
+        }
+
+        tx.commit().await.context("committing the inventory")?;
+        Ok(written)
+    }
+
+    /// What a session leaves behind: where the character stood, what it holds
+    /// and how much it has. One call so a disconnect cannot save half of it.
+    pub async fn save_session(&self, character: &Character) -> Result<()> {
+        sqlx::query("UPDATE characters SET x = ?, y = ?, gold = ? WHERE id = ?")
+            .bind(character.x as i64)
+            .bind(character.y as i64)
+            .bind(character.gold as i64)
+            .bind(character.id)
+            .execute(&self.pool)
+            .await
+            .context("saving the character")?;
+
+        self.save_inventory(character.id, &character.items).await?;
+        Ok(())
+    }
+
     pub async fn soft_delete_character(&self, character_id: i64) -> Result<()> {
         sqlx::query("UPDATE characters SET deleted_at = ? WHERE id = ?")
             .bind(now())
@@ -491,6 +563,52 @@ mod tests {
         assert_eq!(character.gold, 999);
         assert_eq!((character.x, character.y), (3450, 690));
         assert!(character.id > 0, "a loaded character carries its row id");
+    }
+
+    /// A session ends with three things worth keeping, and losing any one of
+    /// them is the bug players notice: gold that resets, a bought item that
+    /// vanishes, a walk that never happened.
+    #[tokio::test]
+    async fn a_session_saves_position_gold_and_what_was_carried() {
+        let db = memory_db().await;
+        db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
+
+        let mut character = db.load_accounts().await.unwrap()[0].characters[0].clone();
+        character.x = 4200;
+        character.y = 815;
+        character.gold = 12345;
+        character
+            .items
+            .put(Item { index: 1595, container: 1, slot: 3, refine: 7, ..Item::default() })
+            .unwrap();
+
+        db.save_session(&character).await.unwrap();
+
+        let reloaded = db.load_accounts().await.unwrap()[0].characters[0].clone();
+        assert_eq!((reloaded.x, reloaded.y), (4200, 815));
+        assert_eq!(reloaded.gold, 12345);
+        assert_eq!(reloaded.items.get(1, 3).unwrap().index, 1595);
+        assert_eq!(reloaded.items.get(1, 3).unwrap().refine, 7);
+    }
+
+    /// Selling everything has to leave the bag empty, not leave the old rows
+    /// behind. This is what an update alone would get wrong.
+    #[tokio::test]
+    async fn saving_an_emptied_bag_removes_the_old_rows() {
+        let db = memory_db().await;
+        db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
+
+        let mut character = db.load_accounts().await.unwrap()[0].characters[0].clone();
+        character.items.put(Item { index: 1000, container: 1, slot: 0, ..Item::default() }).unwrap();
+        character.items.put(Item { index: 2000, container: 1, slot: 1, ..Item::default() }).unwrap();
+        db.save_session(&character).await.unwrap();
+        assert_eq!(db.load_items(character.id).await.unwrap().len(), 2);
+
+        character.items.take(1, 0).unwrap();
+        character.items.take(1, 1).unwrap();
+        db.save_session(&character).await.unwrap();
+
+        assert!(db.load_items(character.id).await.unwrap().is_empty(), "sold items came back");
     }
 
     /// The whole point of persistence: log out somewhere, log back in there.

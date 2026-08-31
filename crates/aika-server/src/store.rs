@@ -7,6 +7,7 @@
 //! backend means replacing this struct's methods.
 
 use crate::config::{DevAccount, DevCharacter};
+use crate::inventory::Inventory;
 use md5::{Digest, Md5};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -81,7 +82,7 @@ pub struct Character {
     pub x: u32,
     pub y: u32,
     /// Everything the character carries, across every container.
-    pub items: Vec<Item>,
+    pub items: Inventory,
 }
 
 /// Where a brand new character appears.
@@ -117,7 +118,7 @@ impl From<&DevCharacter> for Character {
             attributes: [10, 10, 10, 10, 10, 0],
             x: dev.x.unwrap_or(CITY_SPAWN.0),
             y: dev.y.unwrap_or(CITY_SPAWN.1),
-            items: Vec::new(),
+            items: Inventory::new(),
         }
     }
 }
@@ -267,22 +268,21 @@ impl AccountStore {
     }
 
 
-    /// Moves a character in the in-memory copy. The database holds the
-    /// durable version of the same fact; this keeps a second login in the
-    /// same run from reading a stale position.
+    /// Replaces a character in the in-memory copy with what a session left.
+    /// The database holds the durable version of the same fact; this keeps a
+    /// second login in the same run from reading a stale one.
     ///
-    /// Returns whether the character was found, which is false for the id 0
-    /// a character has before it reaches the database.
-    pub fn update_position(&self, character_id: i64, x: u32, y: u32) -> bool {
-        if character_id == 0 {
+    /// Returns whether the character was found, which is false for the id 0 a
+    /// character has before it reaches the database.
+    pub fn update_character(&self, updated: &Character) -> bool {
+        if updated.id == 0 {
             return false;
         }
         let mut accounts = self.accounts.lock().unwrap();
         for account in accounts.values_mut() {
             for character in &mut account.characters {
-                if character.id == character_id {
-                    character.x = x;
-                    character.y = y;
+                if character.id == updated.id {
+                    *character = updated.clone();
                     return true;
                 }
             }

@@ -10,7 +10,9 @@
 //! that are dead: neither has a live call site.
 
 use crate::state::State;
-use crate::store::{Account, Character, MAX_CHARACTERS};
+use crate::inventory::{self, Inventory};
+use crate::store::{Account, Character, Item, MAX_CHARACTERS};
+use crate::{dialog, shop};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
 use aika_data::npc::Npc;
 use aika_net::frame::{self, FrameError, FrameReader, Message, MIN_FRAME};
@@ -37,6 +39,12 @@ pub const OP_CLIENT_READY: u16 = 0xF0B;
 /// Client to server: walked to a point. The server returns nothing to the
 /// mover, it only relays to the others who can see them.
 pub const OP_MOVE: u16 = 0x301;
+/// `TMoveItemPacket`: drag an item from one slot to another.
+pub const OP_MOVE_ITEM: u16 = 0x70F;
+/// Throw an item away.
+pub const OP_DELETE_ITEM: u16 = 0x32C;
+/// `TClientMessagePacket` (`Data/Packets.pas:152`): a line of text on screen.
+pub const OP_CLIENT_MESSAGE: u16 = 0x984;
 /// Walking, the only move type the original relays to other players
 /// (`Data/GlobalDefs.pas:216`). The real client also sends other values.
 const MOVE_NORMAL: u8 = 0;
@@ -104,6 +112,21 @@ const HP_MP_SIZE: usize = 32;
 /// The original writes a single `0xCC` byte into a WORD field of `0x108`
 /// (`Mob/BaseMob.pas:2434`), so the field reads `CC 00`.
 const LEVEL_UNK: u16 = 0x00CC;
+
+/// `TClientMessagePacket`, 144 bytes in total.
+const CLIENT_MESSAGE_SIZE: usize = 144;
+/// The text field inside it: 128 bytes, NUL terminated. The original walks it
+/// as a plain array from index zero, writing over what would be a Delphi
+/// short string's length byte, which tells us the client reads it as `char[]`
+/// and not as a Delphi string.
+const CLIENT_MESSAGE_TEXT: usize = 128;
+/// Yellow, at the top of the screen: what the original passes by default.
+const MESSAGE_NOTICE: u8 = 16;
+
+/// The index the original stamps on a menu entry (`NPCHandlers.pas:172`).
+/// Note that it is not the `0x7535` used everywhere else — the digits are
+/// swapped, and copying the wrong one puts the menu on nobody's screen.
+const MENU_ENTRY_INDEX: u16 = 0x3575;
 
 /// `TSendCreateMobPacket` (`Data/Packets.pas:344`), 508 bytes in total.
 const CREATE_MOB_SIZE: usize = 508;
@@ -192,8 +215,15 @@ mod character_offset {
     pub const CUR_MP: usize = SCORE + 28;
     pub const EXP: usize = 176;
     pub const LEVEL: usize = 184;
-    /// 16 items of 20 bytes; slot 0 is the class and slot 1 the hair.
+    /// 16 items of 20 bytes; slot 0 is the class and slot 1 the hair, so
+    /// real equipment starts at slot 2.
     pub const EQUIP: usize = 340;
+    /// 126 items of 20 bytes. The comment beside the field says 60, but
+    /// `EQUIP + 16 * 20 + 4 + 126 * 20` lands exactly on the gold, which is
+    /// the arithmetic that settles it.
+    pub const INVENTORY: usize = EQUIP + 16 * ITEM_SIZE + 4;
+    /// `TItem` (`Data/MiscData.pas:44`).
+    pub const ITEM_SIZE: usize = 20;
     pub const GOLD: usize = 3184;
     pub const LOCATION: usize = 3792;
 }
@@ -236,6 +266,10 @@ struct Session {
     /// NPCs already placed on this player's screen. Same reason as `visible`:
     /// sending a spawn twice makes the client draw two of them.
     visible_npcs: HashSet<u16>,
+    /// Which NPC has a window open, if any. Every shop packet is checked
+    /// against it: a client that never opened a shop must not be able to buy
+    /// from one, and the original refuses on the same grounds.
+    opened_npc: Option<u16>,
 }
 
 async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Result<()> {
@@ -264,9 +298,10 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Resu
     let result = read_loop(&state, &mut session, &outbox, &mut incoming).await;
 
     // Saved before anything else in the teardown: whatever went wrong with
-    // the connection, where the player stood is still worth keeping.
+    // the connection, where the player stood and what it was carrying are
+    // still worth keeping.
     if let Some(character) = session.character.as_ref() {
-        state.save_position(character).await;
+        state.save_session(character).await;
     }
 
     leave_world(&state, &session);
@@ -416,6 +451,12 @@ fn handle_message(state: &State, session: &mut Session, message: &Message) -> Ac
         OP_ENTER_WORLD => handle_enter_world(session, message, state.uptime_ms()),
         OP_CLIENT_READY => handle_client_ready(state, session),
         OP_MOVE => handle_move(state, session, message),
+        dialog::OP_OPEN_NPC => handle_open_npc(state, session, message),
+        dialog::OP_CLOSE_NPC_OPTION => handle_close_npc(session),
+        shop::OP_BUY => handle_buy(state, session, message),
+        shop::OP_SELL => handle_sell(state, session, message),
+        OP_MOVE_ITEM => handle_move_item(session, message),
+        OP_DELETE_ITEM => handle_delete_item(session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
@@ -1037,6 +1078,391 @@ fn encode_spawn(character: &Character, client_id: u16) -> Vec<u8> {
     )
 }
 
+/// `TItem` (`Data/MiscData.pas:44`), the twenty bytes an item travels as,
+/// in the character record and everywhere else the protocol carries one.
+///
+/// ```text
+/// 0   u16  Index, the id in the item table; zero means an empty slot
+/// 2   u16  APP, an appearance that overrides the real look
+/// 4   i32  Identific
+/// 8   u8[3] effect index, then u8[3] effect value
+/// 14  u8   durability now, u8 durability ceiling
+/// 16  u16  Refi, the refine level
+/// 18  u16  Time, when a rented item expires
+/// ```
+fn write_item(out: &mut [u8], item: &Item) {
+    debug_assert_eq!(out.len(), character_offset::ITEM_SIZE);
+    out[0..2].copy_from_slice(&item.index.to_le_bytes());
+    out[2..4].copy_from_slice(&item.appearance.to_le_bytes());
+    out[4..8].copy_from_slice(&item.identific.to_le_bytes());
+    out[8..11].copy_from_slice(&item.effect_index);
+    out[11..14].copy_from_slice(&item.effect_value);
+    out[14] = item.durability_min;
+    out[15] = item.durability_max;
+    out[16..18].copy_from_slice(&item.refine.to_le_bytes());
+    out[18..20].copy_from_slice(&item.expires_at.to_le_bytes());
+}
+
+
+/// `0x30F`: the player clicked an NPC, or picked something from its menu.
+///
+/// The same packet does both, told apart by the option field: zero is the
+/// click and anything else is a choice. The distance is checked on every one
+/// of them, not only on the click, because a window left open while walking
+/// away would otherwise keep working from across the map.
+fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> Action {
+    let Some(request) = dialog::OpenNpc::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x30F packet too short");
+        return Action::Ignore;
+    };
+
+    let Some(character) = session.character.as_ref() else {
+        return Action::Ignore;
+    };
+    let at = (character.x as f32, character.y as f32);
+
+    let npc_id = request.npc as u16;
+    let Some(npc) = state.world.npcs().iter().find(|n| n.id == npc_id) else {
+        debug!(npc = npc_id, "0x30F for an npc that is not in the world");
+        return Action::Reply(vec![encode_menu_close()]);
+    };
+
+    if !within(at, (npc.x, npc.y), dialog::TALK_RANGE) {
+        session.opened_npc = None;
+        return Action::Reply(vec![
+            encode_client_message(session.client_id, "You are too far away."),
+            encode_menu_close(),
+        ]);
+    }
+
+    match request.option {
+        dialog::option::OPEN => {
+            session.opened_npc = Some(npc_id);
+            let entries = dialog::entries(npc);
+            info!(npc = npc_id, name = %npc.label, entries = entries.len(), "npc menu");
+
+            let mut frames = Vec::with_capacity(entries.len() + 2);
+            frames.push(encode_menu_begin(session.client_id));
+            frames.push(encode_signal(dialog::OP_MENU_OWNER, session.client_id, 0, npc_id as u32));
+            frames.extend(entries.into_iter().map(encode_menu_entry));
+            Action::Reply(frames)
+        }
+        dialog::option::SHOP => {
+            if !npc.sells() {
+                return Action::Reply(vec![
+                    encode_client_message(session.client_id, "There is nothing for sale."),
+                    encode_menu_close(),
+                ]);
+            }
+            session.opened_npc = Some(npc_id);
+            info!(npc = npc_id, name = %npc.label, "shop opened");
+            Action::Reply(vec![encode_show_shop(session.client_id, npc)])
+        }
+        dialog::option::CLOSE => {
+            session.opened_npc = None;
+            Action::Reply(vec![encode_menu_close()])
+        }
+        other => {
+            // Everything else is a system we have not built. Saying so beats
+            // a window that opens onto nothing and never closes.
+            let name = dialog::option_text(other as u8);
+            debug!(npc = npc_id, option = other, text = name, "npc option not implemented");
+
+            let mut frames = vec![encode_client_message(
+                session.client_id,
+                &format!("{name} is not available yet."),
+            )];
+            if !request.keeps_window_open() {
+                frames.push(encode_menu_close());
+            }
+            Action::Reply(frames)
+        }
+    }
+}
+
+/// `0x348`: the client closed the window on its own.
+fn handle_close_npc(session: &mut Session) -> Action {
+    session.opened_npc = None;
+    Action::Ignore
+}
+
+/// `0x313`: buy from the shop that is open.
+fn handle_buy(state: &State, session: &mut Session, message: &Message) -> Action {
+    let Some(request) = shop::Buy::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x313 packet too short");
+        return Action::Ignore;
+    };
+
+    let Some(npc) = open_shop(state, session, request.npc as u16).cloned() else {
+        return Action::Reply(vec![encode_client_message(
+            session.client_id,
+            &shop::ShopError::WrongNpc.message(),
+        )]);
+    };
+
+    let client_id = session.client_id;
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+    let outcome = shop::buy(&npc, request, &mut character.items, character.gold, &state.items);
+
+    match outcome {
+        Ok(change) => {
+            character.gold = change.gold;
+            info!(
+                npc = npc.id,
+                item = change.item.index,
+                slot = change.slot,
+                gold = change.gold,
+                "bought"
+            );
+            Action::Reply(vec![
+                encode_refresh_item(inventory::BAG, change.slot, &change.item, true),
+                encode_refresh_money(change.gold),
+            ])
+        }
+        Err(e) => {
+            debug!(npc = npc.id, error = %e, "purchase refused");
+            Action::Reply(vec![encode_client_message(client_id, &e.message())])
+        }
+    }
+}
+
+/// `0x314`: sell a bag slot to the shop that is open.
+fn handle_sell(state: &State, session: &mut Session, message: &Message) -> Action {
+    let Some(request) = shop::Sell::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x314 packet too short");
+        return Action::Ignore;
+    };
+
+    if open_shop(state, session, request.npc as u16).is_none() {
+        return Action::Reply(vec![encode_client_message(
+            session.client_id,
+            &shop::ShopError::WrongNpc.message(),
+        )]);
+    }
+
+    let client_id = session.client_id;
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+    let outcome = shop::sell(request, &mut character.items, character.gold, &state.items);
+
+    match outcome {
+        Ok(change) => {
+            character.gold = change.gold;
+            info!(slot = change.slot, gold = change.gold, "sold");
+            Action::Reply(vec![
+                encode_refresh_item(inventory::BAG, change.slot, &change.item, true),
+                encode_refresh_money(change.gold),
+            ])
+        }
+        Err(e) => {
+            debug!(error = %e, "sale refused");
+            Action::Reply(vec![encode_client_message(client_id, &e.message())])
+        }
+    }
+}
+
+/// The NPC whose shop this session has open, if the client named the same one.
+///
+/// Checked on every purchase rather than once on opening: the id in the packet
+/// is the word of the client, and a modified one would otherwise buy from a
+/// shop it never walked to.
+fn open_shop<'a>(state: &'a State, session: &Session, claimed: u16) -> Option<&'a Npc> {
+    if session.opened_npc != Some(claimed) {
+        debug!(claimed, open = ?session.opened_npc, "shop packet for an npc that is not open");
+        return None;
+    }
+    state.world.npcs().iter().find(|n| n.id == claimed)
+}
+
+/// `0x70F`: an item dragged from one slot to another.
+fn handle_move_item(session: &mut Session, message: &Message) -> Action {
+    let Some(request) = MoveItem::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x70F packet too short");
+        return Action::Ignore;
+    };
+
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+
+    let from = (request.from_container, request.from_slot);
+    let to = (request.to_container, request.to_slot);
+    if let Err(e) = character.items.move_item(from, to) {
+        debug!(?from, ?to, error = %e, "item not moved");
+    }
+
+    // Both slots go back either way. The client has already drawn the item in
+    // its new place, so on a refusal it has to be told what is really there,
+    // and on success it needs the source cleared.
+    let there = slot_item(&character.items, to.0, to.1);
+    let here = slot_item(&character.items, from.0, from.1);
+    Action::Reply(vec![
+        encode_refresh_item(to.0, to.1, &there, false),
+        encode_refresh_item(from.0, from.1, &here, false),
+    ])
+}
+
+/// `0x32C`: throw an item away.
+fn handle_delete_item(session: &mut Session, message: &Message) -> Action {
+    let Some(request) = MoveItem::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x32C packet too short");
+        return Action::Ignore;
+    };
+
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+
+    match character.items.take(request.from_container, request.from_slot) {
+        Ok(gone) => {
+            info!(item = gone.index, slot = request.from_slot, "item thrown away");
+            Action::Reply(vec![encode_refresh_item(
+                request.from_container,
+                request.from_slot,
+                &Item::default(),
+                true,
+            )])
+        }
+        Err(e) => {
+            debug!(error = %e, "nothing to throw away");
+            Action::Ignore
+        }
+    }
+}
+
+/// What is in a slot, or an empty item addressed to it when nothing is.
+fn slot_item(inventory: &Inventory, container: u8, slot: u16) -> Item {
+    inventory
+        .get(container, slot)
+        .cloned()
+        .unwrap_or(Item { container, slot, ..Item::default() })
+}
+
+/// `0x70F` and `0x32C`: a source slot and a destination, each a container and
+/// a slot number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveItem {
+    pub from_container: u8,
+    pub from_slot: u16,
+    pub to_container: u8,
+    pub to_slot: u16,
+}
+
+impl MoveItem {
+    pub const BODY_SIZE: usize = 8;
+
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        if body.len() < Self::BODY_SIZE {
+            return None;
+        }
+        Some(Self {
+            from_container: body[0],
+            from_slot: u16::from_le_bytes(body[2..4].try_into().ok()?),
+            to_container: body[4],
+            to_slot: u16::from_le_bytes(body[6..8].try_into().ok()?),
+        })
+    }
+
+    pub fn to_body(self) -> Vec<u8> {
+        let mut body = vec![0u8; Self::BODY_SIZE];
+        body[0] = self.from_container;
+        body[2..4].copy_from_slice(&self.from_slot.to_le_bytes());
+        body[4] = self.to_container;
+        body[6..8].copy_from_slice(&self.to_slot.to_le_bytes());
+        body
+    }
+}
+
+/// A bare header, which is all a signal is (`ServerSocket.pas:3168`).
+fn encode_bare_signal(opcode: u16, index: u16) -> Vec<u8> {
+    frame::encode(&Message { sender: index, opcode, time: 0, body: Vec::new() }, rand::random())
+}
+
+fn encode_menu_begin(client_id: u16) -> Vec<u8> {
+    encode_bare_signal(dialog::OP_MENU_BEGIN, client_id)
+}
+
+/// Closing is addressed to the fixed index, not to the player: that is what
+/// the original sends (`PacketHandlers.pas:3385`).
+fn encode_menu_close() -> Vec<u8> {
+    encode_bare_signal(dialog::OP_MENU_CLOSE, dialog::FIXED_INDEX)
+}
+
+/// `TShowOptionsPacket` (`0x112`): one line of the menu.
+fn encode_menu_entry(option: u8) -> Vec<u8> {
+    let body = dialog::menu_entry_body(option);
+    debug_assert_eq!(body.len() + MIN_FRAME, dialog::MENU_ENTRY_SIZE);
+    frame::encode(
+        &Message { sender: MENU_ENTRY_INDEX, opcode: dialog::OP_MENU_ENTRY, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `TShowShopPacket` (`0x106`): the forty ids the window shows.
+fn encode_show_shop(client_id: u16, npc: &Npc) -> Vec<u8> {
+    let mut body = Vec::with_capacity(shop::SHOW_SHOP_SIZE - MIN_FRAME);
+    body.extend_from_slice(&npc.id.to_le_bytes());
+    body.extend_from_slice(&shop::SHOP_DEF_BYTE.to_le_bytes());
+    for id in shop::stock(npc) {
+        body.extend_from_slice(&id.to_le_bytes());
+    }
+
+    debug_assert_eq!(body.len() + MIN_FRAME, shop::SHOW_SHOP_SIZE);
+    frame::encode(
+        &Message { sender: client_id, opcode: shop::OP_SHOW_SHOP, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `TRefreshItemPacket` (`0xF0E`): one slot changed. An empty item clears it.
+fn encode_refresh_item(container: u8, slot: u16, item: &Item, notice: bool) -> Vec<u8> {
+    let mut body = Vec::with_capacity(shop::REFRESH_ITEM_SIZE - MIN_FRAME);
+    body.push(notice as u8);
+    body.push(container);
+    body.extend_from_slice(&slot.to_le_bytes());
+
+    let at = body.len();
+    body.resize(at + character_offset::ITEM_SIZE, 0);
+    write_item(&mut body[at..], item);
+
+    debug_assert_eq!(body.len() + MIN_FRAME, shop::REFRESH_ITEM_SIZE);
+    frame::encode(
+        &Message { sender: dialog::FIXED_INDEX, opcode: shop::OP_REFRESH_ITEM, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `TRefreshMoneyPacket` (`0x312`): the purse, and the storage purse we do
+/// not keep yet.
+fn encode_refresh_money(gold: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(shop::REFRESH_MONEY_SIZE - MIN_FRAME);
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&gold.to_le_bytes());
+    body.extend_from_slice(&0u64.to_le_bytes());
+
+    debug_assert_eq!(body.len() + MIN_FRAME, shop::REFRESH_MONEY_SIZE);
+    frame::encode(
+        &Message { sender: dialog::FIXED_INDEX, opcode: shop::OP_REFRESH_MONEY, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `TClientMessagePacket` (`0x984`): a line of text for the player.
+fn encode_client_message(client_id: u16, text: &str) -> Vec<u8> {
+    let mut body = vec![0u8; CLIENT_MESSAGE_SIZE - MIN_FRAME];
+    body[1] = MESSAGE_NOTICE;
+    write_fixed_str(&mut body[4..4 + CLIENT_MESSAGE_TEXT], text);
+
+    debug_assert_eq!(body.len() + MIN_FRAME, CLIENT_MESSAGE_SIZE);
+    frame::encode(
+        &Message { sender: client_id, opcode: OP_CLIENT_MESSAGE, time: 0, body },
+        rand::random(),
+    )
+}
+
 /// `TSignalData` (`Data/Packets.pas:31`): a header and one DWORD. 16 bytes.
 fn encode_signal(opcode: u16, client_id: u16, time: u32, data: u32) -> Vec<u8> {
     frame::encode(
@@ -1101,9 +1527,24 @@ fn encode_character(character: &Character, client_id: u16) -> Vec<u8> {
     // Same convention as the character list: the client adds 1.
     put16(&mut out, off::LEVEL, character.level.saturating_sub(1));
 
+    // Everything carried, at the slot it occupies. Written before the
+    // appearance below, because slots 0 and 1 of the equipment are the body
+    // and the hair rather than real items, and those have to win.
+    for item in character.items.iter() {
+        let base = match item.container {
+            inventory::EQUIP => off::EQUIP,
+            inventory::BAG => off::INVENTORY,
+            _ => continue,
+        };
+        let at = base + item.slot as usize * off::ITEM_SIZE;
+        if at + off::ITEM_SIZE <= out.len() {
+            write_item(&mut out[at..at + off::ITEM_SIZE], item);
+        }
+    }
+
     // Equip[0] is the class and Equip[1] the hair, in each item's `Index`.
     put16(&mut out, off::EQUIP, character.class_index);
-    put16(&mut out, off::EQUIP + 20, character.hair);
+    put16(&mut out, off::EQUIP + off::ITEM_SIZE, character.hair);
 
     out[off::GOLD..off::GOLD + 8].copy_from_slice(&character.gold.to_le_bytes());
     put32(&mut out, off::LOCATION, 0);
@@ -1317,6 +1758,7 @@ mod tests {
             options: vec![1, 2, 8],
             equip: [234, 234, 0, 0, 0, 0, 0, 0],
             sizes: [7, 119, 119, 3],
+            shop: [0; aika_data::npc::SHOP_SLOTS],
             max_hp: 20000,
             cur_hp: 20000,
             max_mp: 20000,
@@ -1886,5 +2328,382 @@ mod tests {
             .map(|&b| b as char)
             .collect();
         assert_eq!(title, "Merchant");
+    }
+
+    // ---- talking to an NPC, buying, and carrying things -----------------
+
+    /// A merchant standing where the character spawns, so every test below
+    /// starts within talking distance.
+    fn shop_state() -> State {
+        let mut state = state_with(vec![dev_character("Athus", 0)]);
+        let mut merchant = npc(2050, "Merchant", 3450.0, 690.0);
+        merchant.shop[0] = 1000;
+        merchant.shop[1] = 4351;
+        merchant.options = vec![1, 2, 5, 8];
+
+        let mut farmer = npc(2049, "Farmer", 3452.0, 692.0);
+        farmer.options = vec![1, 2, 5, 8];
+
+        state.world = World::with_npcs(vec![merchant, farmer]);
+        state.items = item_table();
+        state
+    }
+
+    /// Prices for the two things the merchant above sells.
+    fn item_table() -> aika_data::itemlist::ItemList {
+        use aika_data::itemlist::{field, ItemList, RECORD_SIZE};
+        let mut raw = vec![0u8; 5000 * RECORD_SIZE];
+
+        let mut define = |id: usize, gold: u32, sell: u32, groups: bool| {
+            let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
+            r[field::NAME.start] = b'x';
+            r[field::PRICE_GOLD..field::PRICE_GOLD + 4].copy_from_slice(&gold.to_le_bytes());
+            r[field::SELL_PRICE..field::SELL_PRICE + 4].copy_from_slice(&sell.to_le_bytes());
+            r[field::CAN_GROUP] = groups as u8;
+        };
+        define(1000, 500, 120, false);
+        define(4351, 10, 3, true);
+
+        ItemList::decode(&raw).expect("the fixture table is malformed")
+    }
+
+    /// A session standing in the world, ready to talk to somebody.
+    fn in_world(state: &State) -> Session {
+        let mut session = logged_in(state);
+        handle_message(state, &mut session, &enter_world(0));
+        handle_client_ready(state, &mut session);
+        session
+    }
+
+    fn open_npc(npc: u32, option: u32) -> Message {
+        Message {
+            sender: TEST_CLIENT_ID,
+            opcode: dialog::OP_OPEN_NPC,
+            time: 0,
+            body: dialog::OpenNpc { npc, option, extra: 0 }.to_body(),
+        }
+    }
+
+    fn frames_of(action: Action) -> Vec<Vec<u8>> {
+        match action {
+            Action::Reply(frames) => frames,
+            other => panic!("expected frames, got {other:?}"),
+        }
+    }
+
+    fn opcodes(frames: &[Vec<u8>]) -> Vec<u16> {
+        frames.iter().map(|f| decode(f).opcode).collect()
+    }
+
+    /// The text of a `0x984`, which is how the server says no to the player.
+    fn message_text(frame: &[u8]) -> String {
+        let body = decode(frame).body;
+        body[4..].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect()
+    }
+
+    #[test]
+    fn clicking_an_npc_sends_its_menu() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+
+        let frames = frames_of(handle_message(&state, &mut session, &open_npc(2050, 0)));
+
+        assert_eq!(
+            opcodes(&frames),
+            vec![
+                dialog::OP_MENU_BEGIN,
+                dialog::OP_MENU_OWNER,
+                dialog::OP_MENU_ENTRY,
+                dialog::OP_MENU_ENTRY,
+                dialog::OP_MENU_ENTRY,
+                dialog::OP_MENU_ENTRY,
+            ],
+            "a menu is an opening signal, the owner, then one packet per entry"
+        );
+
+        // the second packet names which NPC the menu belongs to
+        let owner = decode(&frames[1]);
+        assert_eq!(u32::from_le_bytes(owner.body[0..4].try_into().unwrap()), 2050);
+
+        // and the first entry reads as it should
+        let entry = decode(&frames[2]);
+        let text: String =
+            entry.body[8..].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+        assert_eq!(text, "Talk");
+    }
+
+    /// An NPC with nothing to sell must not offer a shop, or the player opens
+    /// an empty window and thinks the server is broken.
+    #[test]
+    fn a_merchant_with_no_stock_does_not_offer_a_shop() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+
+        let frames = frames_of(handle_message(&state, &mut session, &open_npc(2049, 0)));
+
+        // four options in the file, but the shop is dropped
+        assert_eq!(frames.len(), 2 + 3, "the shop entry survived on an empty shop");
+    }
+
+    /// The distance is checked on every packet, not only on the first click:
+    /// a window left open while walking away must stop working.
+    #[test]
+    fn talking_from_too_far_away_is_refused() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+        session.character.as_mut().unwrap().x = 9000;
+
+        let frames = frames_of(handle_message(&state, &mut session, &open_npc(2050, 0)));
+
+        assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE, dialog::OP_MENU_CLOSE]);
+        assert_eq!(message_text(&frames[0]), "You are too far away.");
+        assert_eq!(session.opened_npc, None);
+    }
+
+    #[test]
+    fn opening_the_shop_sends_what_is_for_sale() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+
+        let frames = frames_of(handle_message(
+            &state,
+            &mut session,
+            &open_npc(2050, dialog::option::SHOP),
+        ));
+
+        let window = decode(&frames[0]);
+        assert_eq!(window.opcode, shop::OP_SHOW_SHOP);
+        assert_eq!(window.body.len() + MIN_FRAME, shop::SHOW_SHOP_SIZE);
+        assert_eq!(u16::from_le_bytes(window.body[0..2].try_into().unwrap()), 2050);
+        assert_eq!(u16::from_le_bytes(window.body[4..6].try_into().unwrap()), 1000);
+        assert_eq!(u16::from_le_bytes(window.body[6..8].try_into().unwrap()), 4351);
+        assert_eq!(session.opened_npc, Some(2050));
+    }
+
+    #[test]
+    fn buying_moves_gold_into_an_item() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+        session.character.as_mut().unwrap().gold = 2000;
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::SHOP));
+
+        let buy = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: shop::OP_BUY,
+            time: 0,
+            body: shop::Buy { npc: 2050, slot: 0, amount: 1 }.to_body(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &buy));
+
+        assert_eq!(opcodes(&frames), vec![shop::OP_REFRESH_ITEM, shop::OP_REFRESH_MONEY]);
+
+        let character = session.character.as_ref().unwrap();
+        assert_eq!(character.gold, 1500, "the price was not taken");
+        assert_eq!(character.items.get(inventory::BAG, 0).unwrap().index, 1000);
+
+        // the client is told exactly which slot changed and to what
+        let refresh = decode(&frames[0]);
+        assert_eq!(refresh.body[1], inventory::BAG);
+        assert_eq!(u16::from_le_bytes(refresh.body[2..4].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(refresh.body[4..6].try_into().unwrap()), 1000);
+
+        let money = decode(&frames[1]);
+        assert_eq!(u64::from_le_bytes(money.body[4..12].try_into().unwrap()), 1500);
+    }
+
+    /// The id in a buy packet is the word of the client. Without the check,
+    /// a modified one buys from a shop it never walked to.
+    #[test]
+    fn buying_from_a_shop_that_was_never_opened_is_refused() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+        session.character.as_mut().unwrap().gold = 2000;
+
+        let buy = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: shop::OP_BUY,
+            time: 0,
+            body: shop::Buy { npc: 2050, slot: 0, amount: 1 }.to_body(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &buy));
+
+        assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
+        assert_eq!(session.character.as_ref().unwrap().gold, 2000, "gold was taken anyway");
+        assert!(session.character.as_ref().unwrap().items.is_empty());
+    }
+
+    /// Walking away closes the shop, and the next purchase has to fail with
+    /// it. This is the same hole as above, reached by playing normally.
+    #[test]
+    fn walking_away_closes_the_shop() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+        session.character.as_mut().unwrap().gold = 2000;
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::SHOP));
+
+        session.character.as_mut().unwrap().x = 9000;
+        handle_message(&state, &mut session, &open_npc(2050, 0));
+        assert_eq!(session.opened_npc, None);
+
+        let buy = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: shop::OP_BUY,
+            time: 0,
+            body: shop::Buy { npc: 2050, slot: 0, amount: 1 }.to_body(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &buy));
+        assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
+        assert_eq!(session.character.as_ref().unwrap().gold, 2000);
+    }
+
+    #[test]
+    fn buying_and_selling_a_stack_comes_out_even() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+        session.character.as_mut().unwrap().gold = 1000;
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::SHOP));
+
+        let buy = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: shop::OP_BUY,
+            time: 0,
+            body: shop::Buy { npc: 2050, slot: 1, amount: 20 }.to_body(),
+        };
+        handle_message(&state, &mut session, &buy);
+        assert_eq!(session.character.as_ref().unwrap().gold, 800, "20 potions at 10");
+
+        let sell = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: shop::OP_SELL,
+            time: 0,
+            body: shop::Sell { npc: 2050, slot: 0 }.to_body(),
+        };
+        handle_message(&state, &mut session, &sell);
+
+        let character = session.character.as_ref().unwrap();
+        assert_eq!(character.gold, 860, "20 potions back at 3 each");
+        assert!(character.items.is_empty(), "the stack is still in the bag");
+    }
+
+    #[test]
+    fn move_item_body_roundtrip() {
+        let original =
+            MoveItem { from_container: 1, from_slot: 7, to_container: 0, to_slot: 3 };
+        assert_eq!(MoveItem::parse(&original.to_body()), Some(original));
+        assert_eq!(MoveItem::parse(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn dragging_an_item_tells_the_client_about_both_slots() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item { index: 1000, container: inventory::BAG, slot: 7, ..Item::default() })
+            .unwrap();
+
+        let drag = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_MOVE_ITEM,
+            time: 0,
+            body: MoveItem {
+                from_container: inventory::BAG,
+                from_slot: 7,
+                to_container: inventory::BAG,
+                to_slot: 3,
+            }
+            .to_body(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &drag));
+
+        assert_eq!(opcodes(&frames), vec![shop::OP_REFRESH_ITEM, shop::OP_REFRESH_ITEM]);
+
+        // slot 3 now holds it, and slot 7 is reported empty
+        let filled = decode(&frames[0]);
+        assert_eq!(u16::from_le_bytes(filled.body[2..4].try_into().unwrap()), 3);
+        assert_eq!(u16::from_le_bytes(filled.body[4..6].try_into().unwrap()), 1000);
+
+        let emptied = decode(&frames[1]);
+        assert_eq!(u16::from_le_bytes(emptied.body[2..4].try_into().unwrap()), 7);
+        assert_eq!(u16::from_le_bytes(emptied.body[4..6].try_into().unwrap()), 0);
+    }
+
+    /// A refused drag still has to answer, because the client has already
+    /// drawn the item in its new place and will keep it there otherwise.
+    #[test]
+    fn a_refused_drag_still_tells_the_client_the_truth() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+
+        let drag = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_MOVE_ITEM,
+            time: 0,
+            body: MoveItem {
+                from_container: inventory::BAG,
+                from_slot: 7,
+                to_container: inventory::BAG,
+                to_slot: 3,
+            }
+            .to_body(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &drag));
+
+        assert_eq!(frames.len(), 2);
+        for frame in &frames {
+            let body = decode(frame).body;
+            assert_eq!(
+                u16::from_le_bytes(body[4..6].try_into().unwrap()),
+                0,
+                "both slots have to come back empty"
+            );
+        }
+    }
+
+    #[test]
+    fn what_a_character_carries_reaches_the_client_in_the_world_packet() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+        let character = session.character.as_mut().unwrap();
+        character
+            .items
+            .put(Item { index: 1595, container: inventory::BAG, slot: 2, refine: 7, ..Item::default() })
+            .unwrap();
+        character.gold = 4242;
+
+        let character = session.character.as_ref().unwrap().clone();
+        let record = encode_character(&character, TEST_CLIENT_ID);
+
+        use character_offset as off;
+        let at = off::INVENTORY + 2 * off::ITEM_SIZE;
+        assert_eq!(u16::from_le_bytes(record[at..at + 2].try_into().unwrap()), 1595);
+        assert_eq!(u16::from_le_bytes(record[at + 16..at + 18].try_into().unwrap()), 7);
+        assert_eq!(
+            u64::from_le_bytes(record[off::GOLD..off::GOLD + 8].try_into().unwrap()),
+            4242
+        );
+
+        // and the appearance slots still win over anything in equipment
+        assert_eq!(
+            u16::from_le_bytes(record[off::EQUIP..off::EQUIP + 2].try_into().unwrap()),
+            character.class_index
+        );
+    }
+
+    #[test]
+    fn an_unimplemented_option_says_so_instead_of_going_quiet() {
+        let state = shop_state();
+        let mut session = in_world(&state);
+
+        let frames = frames_of(handle_message(
+            &state,
+            &mut session,
+            &open_npc(2050, dialog::option::QUESTS),
+        ));
+
+        assert_eq!(message_text(&frames[0]), "Quest is not available yet.");
     }
 }

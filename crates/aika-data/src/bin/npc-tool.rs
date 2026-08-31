@@ -86,6 +86,12 @@ fn show(dir: &str, id: u16) -> Fallible {
     }
     println!("  position   ({:.1}, {:.1})  rotation {}", npc.x, npc.y, npc.rotation);
     println!("  menu       {:?}", npc.options);
+    let stock: Vec<u16> = npc.stock().map(|(_, id)| id).collect();
+    if stock.is_empty() {
+        println!("  shop       sells nothing");
+    } else {
+        println!("  shop       {} items: {:?}", stock.len(), &stock[..stock.len().min(12)]);
+    }
     if let Some(stale) = npc.stale_id {
         println!("  note       the record says {stale}; the file name says {}", npc.id);
     }

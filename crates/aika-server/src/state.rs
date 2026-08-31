@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::store::{AccountStore, Character};
 use crate::world::World;
+use aika_data::itemlist::ItemList;
 use aika_data::npc::NpcSet;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -13,6 +14,9 @@ pub struct State {
     pub store: AccountStore,
     /// Who is online and where, shared by every game connection.
     pub world: World,
+    /// What everything costs and what it does. Empty when no table was
+    /// configured, which makes every lookup miss rather than panic.
+    pub items: ItemList,
     /// Where the world is kept between runs. Unit tests that only build
     /// packets leave it out; every server that people log into has one.
     db: Option<Database>,
@@ -40,7 +44,8 @@ impl State {
             Duration::from_secs(cfg.login.block_minutes * 60),
         )?;
         let world = World::with_npcs(load_npcs(&cfg.game.npc_dir));
-        Ok(Self { cfg, store, world, db: Some(db), started: Instant::now() })
+        let items = load_items(&cfg.game.item_list);
+        Ok(Self { cfg, store, world, items, db: Some(db), started: Instant::now() })
     }
 
     /// State with no database behind it, for tests about packets rather than
@@ -52,24 +57,27 @@ impl State {
             Duration::from_secs(cfg.login.block_minutes * 60),
         )?;
         let world = World::with_npcs(load_npcs(&cfg.game.npc_dir));
-        Ok(Self { cfg, store, world, db: None, started: Instant::now() })
+        let items = load_items(&cfg.game.item_list);
+        Ok(Self { cfg, store, world, items, db: None, started: Instant::now() })
     }
 
     pub fn db(&self) -> Option<&Database> {
         self.db.as_ref()
     }
 
-    /// Remembers where a character stopped, in the database and in the copy
-    /// the login screen reads, so the next login starts there either way.
+    /// Writes back everything a session changed: where the character stopped,
+    /// what it is carrying and how much gold it has. Goes to the database and
+    /// to the copy the login screen reads, so a second login in the same run
+    /// sees the same thing a restart would.
     ///
     /// A failure is logged rather than returned: this runs while a connection
     /// is being torn down, and there is nobody left to tell.
-    pub async fn save_position(&self, character: &Character) {
-        self.store.update_position(character.id, character.x, character.y);
+    pub async fn save_session(&self, character: &Character) {
+        self.store.update_character(character);
 
         let Some(db) = &self.db else { return };
-        if let Err(e) = db.save_position(character.id, character.x, character.y).await {
-            warn!(character = %character.name, error = %e, "could not save the position");
+        if let Err(e) = db.save_session(character).await {
+            warn!(character = %character.name, error = %e, "could not save the session");
         }
     }
 
@@ -108,4 +116,33 @@ fn load_npcs(dir: &str) -> Vec<aika_data::npc::Npc> {
     info!(dir, npcs = set.len(), "npcs loaded");
 
     set.iter().cloned().collect()
+}
+
+/// Reads the item table, if one was configured.
+///
+/// Like the NPCs, a missing table is a warning rather than a refusal to
+/// start: everything except buying and selling works without it.
+fn load_items(path: &str) -> ItemList {
+    if path.is_empty() {
+        return ItemList::default();
+    }
+
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(path, error = %e, "could not read the item table; shops will be empty");
+            return ItemList::default();
+        }
+    };
+
+    match ItemList::decode(&bytes) {
+        Ok(list) => {
+            info!(path, ids = list.len(), defined = list.defined().count(), "item table loaded");
+            list
+        }
+        Err(e) => {
+            warn!(path, error = %e, "the item table is malformed; shops will be empty");
+            ItemList::default()
+        }
+    }
 }

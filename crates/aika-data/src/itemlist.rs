@@ -28,7 +28,11 @@
 /// measured between item names in the shipped file.
 pub const RECORD_SIZE: usize = 464;
 
-mod field {
+/// Where each field sits inside a record.
+///
+/// Public because it is the format itself: a tool that writes a table, or a
+/// test that needs one without the 14 MB file, has to know these.
+pub mod field {
     use std::ops::Range;
     pub const NAME: Range<usize> = 0..64;
     pub const NAME_ENGLISH: Range<usize> = 64..128;
@@ -211,6 +215,9 @@ impl std::fmt::Debug for ItemDef {
     }
 }
 
+/// The item table. Empty by default, which is what a server without the file
+/// runs on: every lookup misses, so nothing can be bought and nothing crashes.
+#[derive(Default)]
 pub struct ItemList {
     items: Vec<ItemDef>,
 }

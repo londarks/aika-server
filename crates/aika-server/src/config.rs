@@ -68,6 +68,10 @@ pub struct GameConfig {
     /// townspeople, which is a playable but very lonely city.
     #[serde(default)]
     pub npc_dir: String,
+    /// The server's `ItemList.bin`, which prices everything. Empty means the
+    /// shops open and refuse every purchase.
+    #[serde(default)]
+    pub item_list: String,
 }
 
 /// What the launcher receives when it checks the client version.
@@ -210,6 +214,7 @@ impl Default for GameConfig {
             binds: vec!["127.0.0.1:8822".parse().unwrap()],
             client_version: default_client_version(),
             npc_dir: String::new(),
+            item_list: String::new(),
         }
     }
 }

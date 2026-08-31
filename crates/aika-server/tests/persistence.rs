@@ -7,14 +7,19 @@
 //! Nothing is shared between the two servers except the file, so a position
 //! that survives has genuinely been through the database.
 
+use aika_data::itemlist::ItemList;
+use aika_data::npc::Npc;
 use aika_net::frame::{self, FrameReader, Message};
 use aika_server::config::{Config, DatabaseConfig, DevAccount, DevCharacter};
 use aika_server::db::Database;
 use aika_server::game::{
     self, Movement, RequestLogin, OP_CHAR_LIST, OP_CLIENT_READY, OP_CREATE_MOB, OP_ENTER_WORLD,
-    OP_MOVE, OP_REQUEST_LOGIN,
+    OP_MOVE, OP_REMOVE_MOB, OP_REQUEST_LOGIN,
 };
+use aika_server::inventory;
+use aika_server::shop;
 use aika_server::store::CITY_SPAWN;
+use aika_server::world::World;
 use aika_server::{login, web, State};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,6 +28,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration, Instant};
 
 const CLIENT_VERSION: u16 = 124;
+const MERCHANT_ID: u16 = 2050;
+const SWORD: u16 = 1000;
+const SWORD_PRICE: u32 = 500;
 /// Body offsets in `0x349`, the spawn packet.
 const SPAWN_X: usize = 44;
 const SPAWN_Y: usize = 48;
@@ -72,10 +80,52 @@ fn config(database_path: &str) -> Config {
     }
 }
 
+/// A merchant standing on the spawn point, selling one sword.
+///
+/// Built rather than read: the `.npc` files and the 14 MB item table belong to
+/// the original pack and are not in this repository, but the shop code has to
+/// be exercised against a real socket all the same.
+fn merchant() -> Npc {
+    let mut shop = [0u16; aika_data::npc::SHOP_SLOTS];
+    shop[0] = SWORD;
+    Npc {
+        id: MERCHANT_ID,
+        title: "Merchant".into(),
+        label: "Thomas Henrikson".into(),
+        name_index: Some(43),
+        options: vec![1, 5, 8],
+        equip: [234, 234, 0, 0, 0, 0, 0, 0],
+        sizes: [7, 119, 119, 3],
+        shop,
+        max_hp: 20000,
+        cur_hp: 20000,
+        max_mp: 20000,
+        cur_mp: 0,
+        x: CITY_SPAWN.0 as f32,
+        y: CITY_SPAWN.1 as f32,
+        rotation: 0,
+        speed_move: 0,
+        stale_id: None,
+    }
+}
+
+fn item_table() -> ItemList {
+    use aika_data::itemlist::{field, RECORD_SIZE};
+    let mut raw = vec![0u8; (SWORD as usize + 1) * RECORD_SIZE];
+    let r = &mut raw[SWORD as usize * RECORD_SIZE..];
+    r[field::NAME.start] = b'x';
+    r[field::PRICE_GOLD..field::PRICE_GOLD + 4].copy_from_slice(&SWORD_PRICE.to_le_bytes());
+    r[field::SELL_PRICE..field::SELL_PRICE + 4].copy_from_slice(&60u32.to_le_bytes());
+    ItemList::decode(&raw).expect("the fixture table is malformed")
+}
+
 /// Starts a server on the given database. Calling it twice on the same path
 /// is what a restart looks like from the outside.
 async fn spawn_servers(database_path: &str) -> Servers {
-    let state = Arc::new(State::open(config(database_path)).await.unwrap());
+    let mut state = State::open(config(database_path)).await.unwrap();
+    state.world = World::with_npcs(vec![merchant()]);
+    state.items = item_table();
+    let state = Arc::new(state);
 
     let web_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let login_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -130,15 +180,51 @@ impl GameClient {
 
     /// Picks slot 0 and reports the scene as loaded, which is what makes the
     /// server send the spawn. Returns where the spawn puts the character.
+    ///
+    /// Townspeople arrive on the same opcode, so the one addressed to a
+    /// player id is the one to read. Without that, a merchant standing on the
+    /// spawn point answers for the character.
     async fn enter_world(&mut self) -> (f32, f32) {
         self.send(OP_ENTER_WORLD, 0u32.to_le_bytes().to_vec()).await;
         self.send(OP_CLIENT_READY, Vec::new()).await;
 
-        let spawn = self.expect(OP_CREATE_MOB).await;
+        let spawn = self.expect_player_spawn().await;
         (
             f32::from_le_bytes(spawn.body[SPAWN_X..SPAWN_X + 4].try_into().unwrap()),
             f32::from_le_bytes(spawn.body[SPAWN_Y..SPAWN_Y + 4].try_into().unwrap()),
         )
+    }
+
+    /// The next `0x349` that is about a player rather than a townsperson.
+    async fn expect_player_spawn(&mut self) -> Message {
+        loop {
+            let message = self.expect(OP_CREATE_MOB).await;
+            if message.sender < aika_server::world::FIRST_NPC_ID {
+                return message;
+            }
+        }
+    }
+
+    /// Opens the shop and buys slot zero.
+    async fn buy_from_shop(&mut self) {
+        let open = aika_server::dialog::OpenNpc {
+            npc: MERCHANT_ID as u32,
+            option: aika_server::dialog::option::SHOP,
+            extra: 0,
+        };
+        self.send(aika_server::dialog::OP_OPEN_NPC, open.to_body()).await;
+        self.expect(shop::OP_SHOW_SHOP).await;
+
+        let buy = shop::Buy { npc: MERCHANT_ID as u32, slot: 0, amount: 1 };
+        self.send(shop::OP_BUY, buy.to_body()).await;
+        self.expect(shop::OP_REFRESH_MONEY).await;
+    }
+
+    /// Reads the character record out of the world packet the server sends on
+    /// entering, which is where the client learns what it is carrying.
+    async fn world_record(&mut self) -> Vec<u8> {
+        let packet = self.expect(0x925).await;
+        packet.body[4..].to_vec()
     }
 
     async fn walk_to(&mut self, x: f32, y: f32) {
@@ -210,7 +296,13 @@ async fn a_character_comes_back_where_it_logged_out() {
         "a fresh character starts in the city"
     );
 
+    // Walking away puts the merchant off the screen, and waiting for that is
+    // how the test knows the server has actually applied the movement.
+    // Closing the socket while frames are still unread makes the client send
+    // a reset, and a reset throws away whatever the server had not read yet -
+    // including the movement.
     client.walk_to(WALKED_TO.0, WALKED_TO.1).await;
+    client.expect(OP_REMOVE_MOB).await;
     drop(client);
 
     await_saved_position(&path, (WALKED_TO.0 as u32, WALKED_TO.1 as u32)).await;
@@ -246,4 +338,99 @@ async fn the_configuration_does_not_overwrite_a_played_character() {
     let account = state.store.get("admin").unwrap();
     assert_eq!(account.characters.len(), 1, "the character was seeded twice");
     assert_eq!((account.characters[0].x, account.characters[0].y), (4200, 815));
+}
+
+/// Buying is only real if the sword is still there after a restart. This is
+/// the whole chain: a shop packet over a socket, a purchase, a disconnect, a
+/// second server on the same file, and the item read back out of the record
+/// the client receives.
+#[tokio::test]
+async fn a_bought_item_and_the_gold_it_cost_survive_a_restart() {
+    let path = fresh_database_path("bought-item");
+
+    let first = spawn_servers(&path).await;
+    let token = token_for(first.web).await;
+    let mut client = GameClient::join(first.game, &token).await;
+    client.enter_world().await;
+
+    let before = gold_in_database(&path).await;
+    client.buy_from_shop().await;
+    drop(client);
+
+    await_saved_gold(&path, before - SWORD_PRICE as u64).await;
+
+    // A different server, sharing nothing but the file.
+    let second = spawn_servers(&path).await;
+    let token = token_for(second.web).await;
+    let mut client = GameClient::join(second.game, &token).await;
+
+    client.send(OP_ENTER_WORLD, 0u32.to_le_bytes().to_vec()).await;
+    let record = client.world_record().await;
+
+    // The bag is at 664 inside the record, twenty bytes to an item.
+    let at = 664;
+    assert_eq!(
+        u16::from_le_bytes(record[at..at + 2].try_into().unwrap()),
+        SWORD,
+        "the sword did not come back"
+    );
+    assert_eq!(
+        u64::from_le_bytes(record[3184..3192].try_into().unwrap()),
+        before - SWORD_PRICE as u64,
+        "the gold came back wrong"
+    );
+}
+
+async fn gold_in_database(path: &str) -> u64 {
+    let db = Database::open(path).await.unwrap();
+    db.load_accounts().await.unwrap()[0].characters[0].gold
+}
+
+async fn await_saved_gold(path: &str, expected: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let found = gold_in_database(path).await;
+        if found == expected {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("the purchase never reached the database: {found} gold");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The bag has to survive too, not only the gold.
+#[tokio::test]
+async fn an_item_thrown_away_stays_thrown_away() {
+    let path = fresh_database_path("thrown-away");
+
+    let first = spawn_servers(&path).await;
+    let token = token_for(first.web).await;
+    let mut client = GameClient::join(first.game, &token).await;
+    client.enter_world().await;
+    client.buy_from_shop().await;
+
+    let throw = aika_server::game::MoveItem {
+        from_container: inventory::BAG,
+        from_slot: 0,
+        to_container: inventory::BAG,
+        to_slot: 0,
+    };
+    client.send(aika_server::game::OP_DELETE_ITEM, throw.to_body()).await;
+    client.expect(shop::OP_REFRESH_ITEM).await;
+    drop(client);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let db = Database::open(&path).await.unwrap();
+        let id = db.load_accounts().await.unwrap()[0].characters[0].id;
+        if db.load_items(id).await.unwrap().is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("the thrown away item is still in the database");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

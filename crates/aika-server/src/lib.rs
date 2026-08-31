@@ -15,10 +15,13 @@
 
 pub mod config;
 pub mod db;
+pub mod dialog;
 pub mod game;
 pub mod http;
+pub mod inventory;
 pub mod login;
 pub mod state;
+pub mod shop;
 pub mod store;
 pub mod web;
 pub mod world;

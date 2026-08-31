@@ -17,6 +17,8 @@
 //! 606    u8[4]     Sizes, the body proportions
 //! 610    u32       MaxHP, then CurHP, MaxMP, CurMP
 //! 902    u16[8]    Equip; the first two hold the model to render
+//! 1226   TItem[40] Inventory; only the id of each is read, and it is what
+//!                  the NPC sells (`TNPCHandlers.ShowShop`)
 //! 4770   u16       SpeedMove
 //! 4774   u16       Rotation
 //! 4799   f32,f32   LastPos, zero in every shipped file
@@ -50,6 +52,10 @@ pub const RECORD_SIZE: usize = 5639;
 /// Menu entries a single NPC can offer.
 pub const MAX_OPTIONS: usize = 10;
 
+/// Slots the shop window has. The original sends all forty whether they hold
+/// anything or not (`TNPCHandlers.ShowShop`).
+pub const SHOP_SLOTS: usize = 40;
+
 mod offset {
     pub const TITLE_LEN: usize = 0;
     pub const TITLE: usize = 1;
@@ -66,6 +72,11 @@ mod offset {
     pub const MAX_MP: usize = CLIENT_ID + 56;
     pub const CUR_MP: usize = CLIENT_ID + 60;
     pub const EQUIP: usize = CLIENT_ID + 340;
+    /// 16 equipment slots of 20 bytes, then a spare DWORD.
+    pub const INVENTORY: usize = EQUIP + 16 * ITEM_SIZE + 4;
+    /// `TItem` (`Data/MiscData.pas:44`): index, appearance, identification,
+    /// effects, durability, refine and expiry.
+    pub const ITEM_SIZE: usize = 20;
     pub const SPEED_MOVE: usize = 4770;
     pub const ROTATION: usize = 4774;
     pub const POSITION: usize = 4807;
@@ -118,6 +129,9 @@ pub struct Npc {
     pub equip: [u16; 8],
     /// Height, torso, legs and body.
     pub sizes: [u8; 4],
+    /// What this NPC sells, by item id, one per shop slot. Zero is an empty
+    /// slot, and an NPC that is not a merchant has forty of them.
+    pub shop: [u16; SHOP_SLOTS],
     pub max_hp: u32,
     pub cur_hp: u32,
     pub max_mp: u32,
@@ -133,6 +147,17 @@ pub struct Npc {
 }
 
 impl Npc {
+    /// Whether this NPC sells anything, which is what makes the shop entry in
+    /// its menu worth showing.
+    pub fn sells(&self) -> bool {
+        self.shop.iter().any(|&id| id != 0)
+    }
+
+    /// The ids on offer, in slot order, without the empty slots.
+    pub fn stock(&self) -> impl Iterator<Item = (usize, u16)> + '_ {
+        self.shop.iter().copied().enumerate().filter(|(_, id)| *id != 0)
+    }
+
     /// Reads a record. `id` is the one from the file name, which wins over
     /// the one in the record for the reason in the module documentation;
     /// pass `None` to trust the record.
@@ -181,6 +206,13 @@ impl Npc {
             *slot = u16::from_le_bytes(read2(data, offset::EQUIP + i * 2));
         }
 
+        // Only the id of each inventory entry matters: the price, the level
+        // requirement and everything else come from the item table.
+        let mut shop = [0u16; SHOP_SLOTS];
+        for (i, slot) in shop.iter_mut().enumerate() {
+            *slot = u16::from_le_bytes(read2(data, offset::INVENTORY + i * offset::ITEM_SIZE));
+        }
+
         Ok(Self {
             id,
             title,
@@ -189,6 +221,7 @@ impl Npc {
             options,
             equip,
             sizes: data[offset::SIZES..offset::SIZES + 4].try_into().unwrap(),
+            shop,
             max_hp: u32::from_le_bytes(read4(data, offset::MAX_HP)),
             cur_hp: u32::from_le_bytes(read4(data, offset::CUR_HP)),
             max_mp: u32::from_le_bytes(read4(data, offset::MAX_MP)),
@@ -318,6 +351,10 @@ mod tests {
     fn record(id: u32, title: &str, name: &str, options: &[u8], x: f32, y: f32) -> Vec<u8> {
         let mut data = vec![0u8; RECORD_SIZE];
         data[offset::EQUIP..offset::EQUIP + 4].copy_from_slice(&[234, 0, 234, 0]);
+        for (i, id) in [4351u16, 4391, 4616].iter().enumerate() {
+            let at = offset::INVENTORY + i * offset::ITEM_SIZE;
+            data[at..at + 2].copy_from_slice(&id.to_le_bytes());
+        }
         data[offset::SIZES..offset::SIZES + 4].copy_from_slice(&[7, 119, 119, 3]);
         data[offset::MAX_HP..offset::MAX_HP + 4].copy_from_slice(&20000u32.to_le_bytes());
         data[offset::CUR_HP..offset::CUR_HP + 4].copy_from_slice(&20000u32.to_le_bytes());
@@ -345,6 +382,8 @@ mod tests {
         assert_eq!((npc.x, npc.y), (3468.4, 963.4));
         assert_eq!(npc.equip, [234, 234, 0, 0, 0, 0, 0, 0], "the model the client draws");
         assert_eq!(npc.sizes, [7, 119, 119, 3]);
+        assert_eq!(npc.stock().collect::<Vec<_>>(), vec![(0, 4351), (1, 4391), (2, 4616)]);
+        assert!(npc.sells());
         assert_eq!((npc.max_hp, npc.cur_hp), (20000, 20000));
         assert_eq!(npc.stale_id, None);
     }
@@ -425,5 +464,10 @@ mod tests {
         assert_eq!(merchant.title, "Merchant");
         assert_eq!(merchant.label, "Thomas Henrikson");
         assert_eq!(merchant.equip[0], 234);
+        assert!(merchant.sells(), "the merchant has an empty shop");
+
+        // a farmer sells nothing, and must not offer a shop
+        let farmer = set.get(2049).expect("npc 2049 is missing");
+        assert!(!farmer.sells());
     }
 }

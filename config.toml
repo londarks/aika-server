@@ -52,6 +52,9 @@ client_version = 124
 # Never put an absolute path in this file: it is tracked, and a path carries
 # the name of whoever's machine it came from.
 npc_dir = "data/NPCs"
+# The server's item table, which is what prices a shop. Same rules as above:
+# copy it into `data/` yourself, and never write an absolute path here.
+item_list = "data/ItemList.bin"
 
 # What the launcher receives when it checks the client version. It must match
 # the client's `update.dat` byte for byte, or the launcher believes a patch is

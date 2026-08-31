@@ -87,6 +87,11 @@ impl State {
         self.started.elapsed().as_millis() as u32
     }
 
+    /// How long a change may sit in memory before it is written.
+    pub fn autosave_every(&self) -> Duration {
+        Duration::from_secs(self.cfg.database.autosave_secs)
+    }
+
     pub fn token_ttl(&self) -> Duration {
         Duration::from_secs(self.cfg.login.token_ttl_secs)
     }

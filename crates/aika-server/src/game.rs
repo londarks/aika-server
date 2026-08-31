@@ -312,6 +312,11 @@ struct Session {
     /// takes them down yet; they live here so a potion has somewhere to go.
     cur_hp: u32,
     cur_mp: u32,
+    /// Something changed that the database has not been told about yet.
+    dirty: bool,
+    /// When the last write went out, so a player walking in a straight line
+    /// does not write a row per step.
+    saved_at: Option<std::time::Instant>,
     /// Which NPC has a window open, if any. Every shop packet is checked
     /// against it: a client that never opened a shop must not be able to buy
     /// from one, and the original refuses on the same grounds.
@@ -346,13 +351,40 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Resu
     // Saved before anything else in the teardown: whatever went wrong with
     // the connection, where the player stood and what it was carrying are
     // still worth keeping.
-    if let Some(character) = session.character.as_ref() {
-        state.save_session(character).await;
-    }
+    autosave(&state, &mut session, true).await;
 
     leave_world(&state, &session);
     writer.abort();
     result
+}
+
+/// Writes the session out if it owes anything and enough time has passed.
+///
+/// Saving only on disconnect is not enough: a crash, a power cut or a kill
+/// takes the whole session with it, and to the player that is
+/// indistinguishable from a database that does not work. The interval is a
+/// trade — short enough that losing it costs a few steps, long enough that
+/// walking across a map is a handful of writes rather than a hundred.
+/// `force` ignores the clock, which is what a disconnect wants.
+async fn autosave(state: &State, session: &mut Session, force: bool) {
+    if !session.dirty {
+        return;
+    }
+    let due = session
+        .saved_at
+        .is_none_or(|at| at.elapsed() >= state.autosave_every());
+    if !force && !due {
+        return;
+    }
+
+    let Some(character) = session.character.as_ref() else {
+        session.dirty = false;
+        return;
+    };
+
+    state.save_session(character).await;
+    session.dirty = false;
+    session.saved_at = Some(std::time::Instant::now());
 }
 
 async fn read_loop(
@@ -377,15 +409,19 @@ async fn read_loop(
 
         while let Some(message) = reader.next_message() {
             match message {
-                Ok(message) => match handle_message(state, session, &message).await {
-                    Action::Reply(frames) => {
-                        for frame in frames {
-                            let _ = outbox.send(frame);
+                Ok(message) => {
+                    let action = handle_message(state, session, &message).await;
+                    autosave(state, session, false).await;
+                    match action {
+                        Action::Reply(frames) => {
+                            for frame in frames {
+                                let _ = outbox.send(frame);
+                            }
                         }
+                        Action::Ignore => {}
+                        Action::Disconnect => return Ok(()),
                     }
-                    Action::Ignore => {}
-                    Action::Disconnect => return Ok(()),
-                },
+                }
                 Err(FrameError::BadChecksum) => {
                     warn!("game packet with invalid checksum");
                     return Ok(());
@@ -509,7 +545,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         shop::OP_SELL => handle_sell(state, session, message),
         OP_ROTATE => handle_rotate(state, session, message),
         OP_BACK_TO_CHARACTER_SELECT => handle_back_to_character_select(session),
-        creation::OP_DELETE_CHARACTER => {
+        creation::OP_DELETE_CHARACTER | creation::OP_DELETE_CHARACTER_ALT => {
             handle_delete_character(state, session, message).await
         }
         creation::OP_CREATE_CHARACTER => {
@@ -521,9 +557,13 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
+            // The body goes in the log too. Working out what an unknown
+            // packet means starts with seeing what it carries, and asking a
+            // person to reproduce it a second time is a wasted round trip.
             warn!(
                 opcode = format!("0x{opcode:03x}"),
                 size = message.body.len(),
+                body = %hex_dump(&message.body),
                 "game packet not implemented yet"
             );
             Action::Ignore
@@ -896,6 +936,7 @@ fn handle_move(state: &State, session: &mut Session, message: &Message) -> Actio
     if let Some(character) = session.character.as_mut() {
         character.x = x;
         character.y = y;
+        session.dirty = true;
     }
     state.world.move_to(session.client_id, x, y);
 
@@ -1297,6 +1338,7 @@ fn handle_buy(state: &State, session: &mut Session, message: &Message) -> Action
     match outcome {
         Ok(change) => {
             character.gold = change.gold;
+            session.dirty = true;
             info!(
                 npc = npc.id,
                 item = change.item.index,
@@ -1339,6 +1381,7 @@ fn handle_sell(state: &State, session: &mut Session, message: &Message) -> Actio
     match outcome {
         Ok(change) => {
             character.gold = change.gold;
+            session.dirty = true;
             info!(slot = change.slot, gold = change.gold, "sold");
             Action::Reply(vec![
                 encode_refresh_item(inventory::BAG, change.slot, &change.item, true),
@@ -1389,9 +1432,12 @@ fn handle_move_item(session: &mut Session, message: &Message) -> Action {
     };
 
     let (from, to) = (request.from(), request.to());
-    if let Err(e) = character.items.move_item(from, to) {
-        debug!(?from, ?to, error = %e, "item not moved");
+    match character.items.move_item(from, to) {
+        Ok(()) => session.dirty = true,
+        Err(e) => debug!(?from, ?to, error = %e, "item not moved"),
     }
+
+    let character = session.character.as_ref().expect("checked above");
 
     // Both slots go back either way. The client has already drawn the item in
     // its new place, so on a refusal it has to be told what is really there,
@@ -1418,6 +1464,7 @@ fn handle_delete_item(session: &mut Session, message: &Message) -> Action {
 
     match character.items.take(container, slot) {
         Ok(gone) => {
+            session.dirty = true;
             info!(item = gone.index, container, slot, "item thrown away");
             Action::Reply(vec![encode_refresh_item(container, slot, &Item::default(), true)])
         }
@@ -1499,6 +1546,7 @@ fn handle_use_item(state: &State, session: &mut Session, message: &Message) -> A
         kept
     };
 
+    session.dirty = true;
     info!(item = item.index, container, slot, left, "item used");
     Action::Reply(vec![
         encode_hp_mp(character, session.client_id, session.cur_hp, session.cur_mp),

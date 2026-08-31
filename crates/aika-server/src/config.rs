@@ -159,16 +159,27 @@ pub struct DatabaseConfig {
     /// A file path, or `:memory:` for a database that dies with the process.
     #[serde(default = "default_database_path")]
     pub path: String,
+    /// How long a change may sit in memory before it is written, in seconds.
+    ///
+    /// Saving only when a player disconnects loses the whole session to a
+    /// crash or a kill, which to the player is indistinguishable from a
+    /// database that does not work. Zero writes on every change.
+    #[serde(default = "default_autosave_secs")]
+    pub autosave_secs: u64,
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
-        Self { path: default_database_path() }
+        Self { path: default_database_path(), autosave_secs: default_autosave_secs() }
     }
 }
 
 fn default_database_path() -> String {
     "aika.db".to_string()
+}
+
+fn default_autosave_secs() -> u64 {
+    5
 }
 
 fn default_token_ttl() -> u64 {

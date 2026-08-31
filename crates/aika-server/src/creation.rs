@@ -24,6 +24,15 @@ use crate::store::{Character, Item, DEFAULT_SIZES, DEFAULT_SPEED_MOVE, MAX_CHARA
 
 pub const OP_CREATE_CHARACTER: u16 = 0x3E04;
 pub const OP_DELETE_CHARACTER: u16 = 0x3E01;
+/// The opcode our client actually sends to delete a character.
+///
+/// It is nowhere in the original's source, which is consistent with what that
+/// server does: its `DeleteChar` is disabled, so nobody ever noticed that the
+/// client had stopped using `0x3E01`. The body is the first twelve bytes of
+/// `TDeleteChar` — a spare DWORD, the slot, and the four character PIN — with
+/// the record's trailing 32 bytes absent from the wire, the same way the
+/// login and creation packets are shorter than their records.
+pub const OP_DELETE_CHARACTER_ALT: u16 = 0x3F33;
 
 /// `TDeleteChar` (`Data/Packets.pas:284`): a spare DWORD, the slot, and a
 /// four character PIN.

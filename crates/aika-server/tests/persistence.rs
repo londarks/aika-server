@@ -54,7 +54,9 @@ fn fresh_database_path(name: &str) -> String {
 
 fn config(database_path: &str) -> Config {
     Config {
-        database: DatabaseConfig { path: database_path.to_string() },
+        // Every change is written at once, so the tests do not have to wait
+        // out an interval to see one.
+        database: DatabaseConfig { path: database_path.to_string(), autosave_secs: 0 },
         accounts: vec![DevAccount {
             username: "admin".into(),
             password: Some("admin".into()),
@@ -529,4 +531,50 @@ fn name_in_slot(body: &[u8], slot: usize) -> String {
     const ENTRY: usize = 104;
     let at = 12 + slot * ENTRY;
     body[at..at + 16].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect()
+}
+
+/// A purchase has to survive a server that is killed rather than shut down.
+///
+/// This is the case that made a player say the database did not work: the
+/// save only ran on a clean disconnect, so anything that ended a session
+/// another way - a crash, a power cut, a kill - took the whole session with
+/// it. Nothing here disconnects: the client stays connected and the row is
+/// read out from underneath it.
+#[tokio::test]
+async fn a_purchase_reaches_the_database_without_a_disconnect() {
+    let path = fresh_database_path("autosave");
+
+    let servers = spawn_servers(&path).await;
+    let token = token_for(servers.web).await;
+    let mut client = GameClient::join(servers.game, &token).await;
+    client.enter_world().await;
+
+    let before = gold_in_database(&path).await;
+    client.buy_from_shop().await;
+
+    // The connection is deliberately left open.
+    await_saved_gold(&path, before - SWORD_PRICE as u64).await;
+
+    let db = Database::open(&path).await.unwrap();
+    let character = db.load_accounts().await.unwrap()[0].characters[0].clone();
+    assert!(!character.items.is_empty(), "the item is not in the database yet");
+
+    drop(client);
+}
+
+/// Walking is written too, so a kill costs a few steps rather than a session.
+#[tokio::test]
+async fn walking_reaches_the_database_without_a_disconnect() {
+    let path = fresh_database_path("autosave-walk");
+
+    let servers = spawn_servers(&path).await;
+    let token = token_for(servers.web).await;
+    let mut client = GameClient::join(servers.game, &token).await;
+    client.enter_world().await;
+
+    client.walk_to(WALKED_TO.0, WALKED_TO.1).await;
+    client.expect(OP_REMOVE_MOB).await;
+
+    await_saved_position(&path, (WALKED_TO.0 as u32, WALKED_TO.1 as u32)).await;
+    drop(client);
 }

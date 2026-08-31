@@ -24,6 +24,11 @@ pad_status_to = 0
 # a level here will not raise a character that has been played.
 [database]
 path = "aika.db"
+# How long a change may sit in memory before it is written, in seconds.
+# Saving only when a player disconnects loses the whole session to a crash or
+# a kill, which to the player looks exactly like a database that does not
+# work. Zero writes on every change.
+autosave_secs = 5
 
 [login]
 bind = "127.0.0.1:8831"

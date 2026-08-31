@@ -4,6 +4,13 @@
 //! given character has, what using one costs, and how long it has to wait
 //! before using it again.
 //!
+//! # The table is a grid
+//!
+//! Every class owns 960 consecutive ids, every one of its sixty slots owns
+//! sixteen of them, and the rank picks one. So a skill id says which class,
+//! which slot and which rank without a lookup, and whether a client may cast
+//! something is a range check rather than a search.
+//!
 //! # Known skills are derived, not stored
 //!
 //! In the original a character *learns* skills: `0x31C` spends skill points
@@ -112,38 +119,70 @@ impl UseSkill {
     }
 }
 
-/// The ids a character of this class and level can use, best rank of each
-/// spell first, at most as many as the list packet carries.
-///
-/// # Class zero is not "everybody"
-///
-/// It reads that way and it is not. The 412 spells the file files under class
-/// zero are monster abilities, siege weapon abilities and the effects items
-/// grant when used — `Siege Boss AOE`, `BIG Head Potion`, `Plain Verband
-/// Soup`. A player's own skills always carry their class, basic attack
-/// included: `Attack` is class 21 for the third class and class 11 for the
-/// second.
-///
-/// Treating class zero as common filled thirty-four of the forty slots on the
-/// skill bar with soup.
-pub fn known_by(table: &SkillTable, base_class: u32, level: u32) -> Vec<usize> {
-    let mut best: HashMap<u32, (usize, u32)> = HashMap::new();
+/// Skills the table gives each class: sixty slots of sixteen ranks.
+pub const SLOTS_PER_CLASS: usize = 60;
+pub const RANKS_PER_SLOT: usize = 16;
+/// So a class owns this many consecutive ids.
+pub const IDS_PER_CLASS: usize = SLOTS_PER_CLASS * RANKS_PER_SLOT;
 
-    for (id, skill) in table.defined() {
-        if skill.base_class() != Some(base_class) || skill.min_level() > level {
-            continue;
-        }
-        // One entry per spell, the highest rank the level allows.
-        let slot = best.entry(skill.family()).or_insert((id, skill.rank()));
-        if skill.rank() >= slot.1 {
-            *slot = (id, skill.rank());
-        }
+/// The six basic slots, which the client draws apart from the rest.
+pub const BASIC_SLOTS: usize = 6;
+
+/// Where a class's skills start.
+///
+/// The first class begins at 1 and the rest at whole multiples of 960. That
+/// off-by-one is the original's, not a mistake here: `GetSkillIndex` opens
+/// with `Result := 1` and only overwrites it when the class is not the first
+/// (`Functions/SkillFunctions.pas:85`).
+pub fn class_block(class_number: u32) -> usize {
+    if class_number <= 1 {
+        1
+    } else {
+        (class_number as usize - 1) * IDS_PER_CLASS
     }
+}
 
-    let mut ids: Vec<usize> = best.into_values().map(|(id, _)| id).collect();
-    ids.sort_unstable();
-    ids.truncate(SKILL_SLOTS);
-    ids
+/// The id of one skill: which class, which of its sixty slots, which rank.
+///
+/// This is `TSkillFunctions.GetSkillIndex`, and it is a grid rather than a
+/// lookup: every class owns 960 consecutive ids, every slot owns sixteen of
+/// them, and the rank picks one. Checked against the six character templates
+/// the original ships, which carry the ids this produces.
+pub fn skill_index(class_number: u32, slot: usize, rank: u32) -> usize {
+    let mut id = class_block(class_number);
+    if slot > 1 {
+        id += (slot - 1) * RANKS_PER_SLOT;
+    }
+    // Rank 1 and rank 2 land on the same id. That is what the original does.
+    id + if rank > 1 { rank as usize - 1 } else { 1 }
+}
+
+/// Whether an id is one of this class's, which is what stops a client asking
+/// for another class's spell by number.
+pub fn belongs_to(class_number: u32, id: usize) -> bool {
+    let start = class_block(class_number);
+    (start..start + IDS_PER_CLASS).contains(&id)
+}
+
+/// The skills a character of this class starts with, in slot order: the six
+/// basic ones, then the forty the bar carries.
+///
+/// Every slot at rank one, which is what the templates hold. Slots the table
+/// has nothing in are dropped rather than sent as an id that resolves to
+/// nothing.
+pub fn known_by(table: &SkillTable, class_number: u32, level: u32) -> Vec<usize> {
+    (1..=BASIC_SLOTS + SKILL_SLOTS)
+        .map(|slot| skill_index(class_number, slot, 1))
+        .filter(|id| table.get(*id).is_some_and(|s| s.min_level() <= level))
+        .collect()
+}
+
+/// Just the forty the bar carries, which is what `0x106` sends.
+pub fn bar_of(table: &SkillTable, class_number: u32, level: u32) -> Vec<usize> {
+    (BASIC_SLOTS + 1..=BASIC_SLOTS + SKILL_SLOTS)
+        .map(|slot| skill_index(class_number, slot, 1))
+        .filter(|id| table.get(*id).is_some_and(|s| s.min_level() <= level))
+        .collect()
 }
 
 /// When each skill may be used again.
@@ -178,7 +217,8 @@ impl Cooldowns {
 /// Everything a cast has to be checked against, gathered in one place so the
 /// decision is one function and can be tested without a socket.
 pub struct Caster {
-    pub base_class: u32,
+    /// Which of the six, counted from one.
+    pub class_number: u32,
     pub level: u32,
     pub mana: u32,
     pub at: (f32, f32),
@@ -210,9 +250,11 @@ pub fn check(
 ) -> Result<Cast, CastError> {
     let skill = table.get(id as usize).ok_or(CastError::NoSuchSkill(id))?;
 
-    // Same rule as `known_by`: a player's skills carry their class, and the
-    // class-zero pile belongs to monsters and items.
-    if skill.base_class() != Some(caster.base_class) || skill.min_level() > caster.level {
+    // The id has to be one of this class's sixty slots. Checking the block
+    // rather than the skill's own class column is what the grid makes
+    // possible, and it is stricter: the column would let a client ask for a
+    // higher tier of its own class that it has not earned.
+    if !belongs_to(caster.class_number, id as usize) || skill.min_level() > caster.level {
         return Err(CastError::NotLearned(id));
     }
 
@@ -251,127 +293,163 @@ mod tests {
     use super::*;
     use aika_data::skills::{field, RECORD_SIZE};
 
-    /// A handful of skills, so the tests do not need the 8 MB file.
+    /// The third class, which is the Atirador.
+    const CLASS: u32 = 3;
+
+    /// A table with the third class's first ten slots filled in, at every
+    /// rank, laid out the way the real file lays them out.
     fn table() -> SkillTable {
-        let mut raw = vec![0u8; 40 * RECORD_SIZE];
+        let mut raw = vec![0u8; 4000 * RECORD_SIZE];
 
-        let mut define = |id: usize,
-                          family: u32,
-                          rank: u32,
-                          min_level: u32,
-                          class: u32,
-                          mana: u32,
-                          damage: u32,
-                          range: u32,
-                          cooldown: u32| {
-            let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
-            let put = |r: &mut [u8], at: usize, v: u32| {
-                r[at..at + 4].copy_from_slice(&v.to_le_bytes());
-            };
-            put(r, field::FAMILY, family);
-            put(r, field::RANK, rank);
-            put(r, field::MIN_LEVEL, min_level);
-            put(r, field::CLASS, class);
-            put(r, field::MANA, mana);
-            put(r, field::DAMAGE, damage);
-            put(r, field::RANGE, range);
-            put(r, field::COOLDOWN, cooldown);
-            put(r, field::AGGRESSIVE, 1);
-            r[field::NAME_ENGLISH.start] = b'x';
-        };
-
-        // class zero: a monster or item effect, never a player's
-        define(1, 0, 1, 1, 0, 0, 1, 0, 400);
-        define(2, 0, 2, 10, 0, 0, 1, 0, 400);
-        define(17, 5, 1, 4, 21, 10, 120, 300, 3000); // class 2 only
-        define(18, 5, 2, 14, 21, 18, 260, 300, 3000);
-        define(30, 9, 1, 1, 51, 5, 40, 200, 1000); // class 5 only
-
+        for slot in 1..=10usize {
+            for rank in 1..=RANKS_PER_SLOT as u32 {
+                let id = class_block(CLASS) + (slot - 1) * RANKS_PER_SLOT + rank as usize;
+                let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
+                let put = |r: &mut [u8], at: usize, v: u32| {
+                    r[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                };
+                put(r, field::FAMILY, slot as u32);
+                put(r, field::RANK, rank);
+                // later slots need a higher character level
+                put(r, field::MIN_LEVEL, if slot <= 6 { 1 } else { slot as u32 * 5 });
+                put(r, field::CLASS, (CLASS - 1) * 10 + 1);
+                put(r, field::MANA, 10 * rank);
+                put(r, field::DAMAGE, 100 * rank);
+                put(r, field::RANGE, 300);
+                put(r, field::COOLDOWN, 3000);
+                put(r, field::AGGRESSIVE, 1);
+                r[field::NAME_ENGLISH.start] = b'x';
+            }
+        }
         SkillTable::decode(&raw).expect("the fixture table is malformed")
     }
 
-    fn caster(base_class: u32, level: u32, mana: u32) -> Caster {
-        Caster { base_class, level, mana, at: (100.0, 100.0) }
+    fn caster(class_number: u32, level: u32, mana: u32) -> Caster {
+        Caster { class_number, level, mana, at: (100.0, 100.0) }
     }
 
     #[test]
     fn use_skill_body_roundtrip() {
-        let original = UseSkill { skill: 17, target: 3048, at: (100.0, 200.0) };
+        let original = UseSkill { skill: 1921, target: 3048, at: (100.0, 200.0) };
         assert_eq!(UseSkill::parse(&original.to_body()), Some(original));
         assert_eq!(UseSkill::parse(&[0u8; 8]), None);
     }
 
-    /// A character has the best rank of each spell its class and level allow,
-    /// and nothing from anyone else's class.
+    /// The grid, against the ids the original's own character templates
+    /// carry. Getting this wrong hands out somebody else's spells.
     #[test]
-    fn what_a_character_knows_is_the_best_rank_of_each_of_its_spells() {
-        let t = table();
-
-        assert!(known_by(&t, 2, 1).is_empty(), "nothing is learnable at level 1");
-        assert_eq!(known_by(&t, 2, 12), vec![17], "rank 1 of the class spell");
-        assert_eq!(known_by(&t, 2, 20), vec![18], "the better rank replaces the earlier one");
-        assert_eq!(known_by(&t, 5, 20), vec![30], "another class gets its own");
-        assert!(known_by(&t, 9, 20).is_empty(), "a class with nothing of its own");
-
-        // and the class-zero pile never reaches anybody
-        assert!(
-            !known_by(&t, 2, 999).contains(&1),
-            "a class-zero entry reached the bar; those are monster and item effects"
-        );
-    }
-
-    /// The list packet holds forty, so the answer must never be longer.
-    #[test]
-    fn the_list_never_outgrows_the_packet() {
-        let t = table();
-        assert!(known_by(&t, 2, 999).len() <= SKILL_SLOTS);
-    }
-
-    /// A class-zero skill is not the player's, whatever their class.
-    #[test]
-    fn nobody_can_cast_a_class_zero_skill() {
-        let t = table();
+    fn the_grid_matches_the_templates() {
+        // Guerreiro: the first class starts at 1, not at 0
         assert_eq!(
-            check(&t, &caster(0, 99, 999), &Cooldowns::new(), 1, None, Instant::now()),
-            Err(CastError::NotLearned(1))
+            (1..=6).map(|s| skill_index(1, s, 1)).collect::<Vec<_>>(),
+            vec![2, 18, 34, 50, 66, 82]
         );
+        // Atirador
+        assert_eq!(
+            (1..=6).map(|s| skill_index(3, s, 1)).collect::<Vec<_>>(),
+            vec![1921, 1937, 1953, 1969, 1985, 2001]
+        );
+        // Cleriga
+        assert_eq!(
+            (1..=6).map(|s| skill_index(6, s, 1)).collect::<Vec<_>>(),
+            vec![4801, 4817, 4833, 4849, 4865, 4881]
+        );
+    }
+
+    #[test]
+    fn a_class_owns_nine_hundred_and_sixty_consecutive_ids() {
+        assert_eq!(IDS_PER_CLASS, 960);
+        assert!(belongs_to(CLASS, 1920) && belongs_to(CLASS, 2879));
+        assert!(!belongs_to(CLASS, 1919), "the class before it");
+        assert!(!belongs_to(CLASS, 2880), "the class after it");
+    }
+
+    /// Ranks are consecutive within a slot, so a rank is a step and not a
+    /// lookup — with one wrinkle that is the original's and not ours.
+    ///
+    /// `GetSkillIndex` adds `Level` when the level is one and `Level - 1`
+    /// otherwise, so ranks one and two land on the same id. Ranks three and
+    /// up then trail the rank by one. Copying the arithmetic exactly matters
+    /// more than tidying it: the ids in the shipped character templates are
+    /// what this produces.
+    #[test]
+    fn ranks_sit_next_to_each_other_inside_a_slot() {
+        let first = skill_index(CLASS, 1, 1);
+
+        assert_eq!(skill_index(CLASS, 1, 2), first, "ranks one and two share an id");
+        assert_eq!(skill_index(CLASS, 1, 3), first + 1);
+        assert_eq!(skill_index(CLASS, 1, 16), first + 14);
+        assert_eq!(skill_index(CLASS, 2, 1), first + RANKS_PER_SLOT);
+    }
+
+    /// The bar carries forty, and a level too low to have a slot leaves it
+    /// out rather than sending an id that resolves to nothing.
+    #[test]
+    fn the_bar_holds_what_the_level_allows() {
+        let t = table();
+
+        let low = bar_of(&t, CLASS, 1);
+        assert!(low.is_empty(), "a level 1 has none of the bar slots yet");
+
+        let mid = bar_of(&t, CLASS, 40);
+        assert_eq!(mid, vec![skill_index(CLASS, 7, 1), skill_index(CLASS, 8, 1)]);
+
+        assert!(bar_of(&t, CLASS, 999).len() <= SKILL_SLOTS);
+    }
+
+    /// The six basic ones come before the bar, and everybody has them from
+    /// the first level.
+    #[test]
+    fn the_basics_are_the_first_six_slots() {
+        let t = table();
+        let known = known_by(&t, CLASS, 1);
+
+        assert_eq!(known.len(), BASIC_SLOTS);
+        assert_eq!(known[0], skill_index(CLASS, 1, 1));
+        assert_eq!(known[5], skill_index(CLASS, 6, 1));
     }
 
     #[test]
     fn a_cast_that_is_allowed_reports_what_it_costs() {
         let t = table();
+        let id = skill_index(CLASS, 1, 1) as u32;
         let cast = check(
             &t,
-            &caster(2, 20, 100),
+            &caster(CLASS, 20, 100),
             &Cooldowns::new(),
-            17,
+            id,
             Some((110.0, 100.0)),
             Instant::now(),
         )
         .unwrap();
 
         assert_eq!(cast.mana, 10);
-        assert_eq!(cast.damage, 120);
+        assert_eq!(cast.damage, 100);
         assert_eq!(cast.cooldown, Duration::from_millis(3000));
-        assert_eq!(cast.family, 5);
         assert!(cast.is_aggressive);
     }
 
+    /// Asking for a spell by a number outside your class is the obvious way
+    /// to try to cast something you should not have.
     #[test]
-    fn another_class_cannot_use_it() {
+    fn another_classs_id_is_refused() {
         let t = table();
+        let id = skill_index(CLASS, 1, 1) as u32;
+
         assert_eq!(
-            check(&t, &caster(5, 20, 100), &Cooldowns::new(), 17, None, Instant::now()),
-            Err(CastError::NotLearned(17))
+            check(&t, &caster(1, 99, 999), &Cooldowns::new(), id, None, Instant::now()),
+            Err(CastError::NotLearned(id)),
+            "the first class cast the third class's spell"
         );
     }
 
     #[test]
     fn a_level_too_low_cannot_use_it() {
         let t = table();
+        let id = skill_index(CLASS, 8, 1) as u32; // needs level 40
         assert_eq!(
-            check(&t, &caster(2, 3, 100), &Cooldowns::new(), 17, None, Instant::now()),
-            Err(CastError::NotLearned(17))
+            check(&t, &caster(CLASS, 3, 100), &Cooldowns::new(), id, None, Instant::now()),
+            Err(CastError::NotLearned(id))
         );
     }
 
@@ -379,16 +457,18 @@ mod tests {
     fn a_skill_that_does_not_exist_is_refused() {
         let t = table();
         assert_eq!(
-            check(&t, &caster(2, 20, 100), &Cooldowns::new(), 999, None, Instant::now()),
-            Err(CastError::NoSuchSkill(999))
+            check(&t, &caster(CLASS, 20, 100), &Cooldowns::new(), 2500, None, Instant::now()),
+            Err(CastError::NoSuchSkill(2500)),
+            "an empty slot inside the class block"
         );
     }
 
     #[test]
     fn not_enough_mana_says_how_much_short() {
         let t = table();
+        let id = skill_index(CLASS, 1, 1) as u32;
         assert_eq!(
-            check(&t, &caster(2, 20, 4), &Cooldowns::new(), 17, None, Instant::now()),
+            check(&t, &caster(CLASS, 20, 4), &Cooldowns::new(), id, None, Instant::now()),
             Err(CastError::NotEnoughMana { needed: 10, held: 4 })
         );
     }
@@ -396,28 +476,16 @@ mod tests {
     #[test]
     fn a_target_out_of_the_skills_range_is_refused() {
         let t = table();
-        let far = check(
-            &t,
-            &caster(2, 20, 100),
-            &Cooldowns::new(),
-            17,
-            Some((9000.0, 9000.0)),
-            Instant::now(),
-        );
-        assert_eq!(far, Err(CastError::OutOfRange));
-    }
-
-    /// A skill whose range column reads zero must not become a way to hit
-    /// anything anywhere.
-    #[test]
-    fn a_skill_with_no_range_still_has_to_reach() {
-        let t = table();
-        let now = Instant::now();
-
-        // skill 30 has a range of 200; from 700 away it cannot reach
-        assert!(check(&t, &caster(5, 20, 50), &Cooldowns::new(), 30, Some((105.0, 100.0)), now).is_ok());
+        let id = skill_index(CLASS, 1, 1) as u32;
         assert_eq!(
-            check(&t, &caster(5, 20, 50), &Cooldowns::new(), 30, Some((900.0, 100.0)), now),
+            check(
+                &t,
+                &caster(CLASS, 20, 100),
+                &Cooldowns::new(),
+                id,
+                Some((9000.0, 9000.0)),
+                Instant::now()
+            ),
             Err(CastError::OutOfRange)
         );
     }
@@ -425,37 +493,41 @@ mod tests {
     #[test]
     fn a_skill_still_cooling_is_refused_and_says_how_long() {
         let t = table();
+        let id = skill_index(CLASS, 1, 1) as u32;
         let now = Instant::now();
-        let mut cooldowns = Cooldowns::new();
-        cooldowns.start(5, Duration::from_millis(3000), now);
+        let family = t.get(id as usize).unwrap().family();
 
-        let err = check(&t, &caster(2, 20, 100), &cooldowns, 17, None, now).unwrap_err();
+        let mut cooldowns = Cooldowns::new();
+        cooldowns.start(family, Duration::from_millis(3000), now);
+
+        let err = check(&t, &caster(CLASS, 20, 100), &cooldowns, id, None, now).unwrap_err();
         assert!(matches!(err, CastError::Cooling { .. }), "got {err}");
 
-        // and it is usable again once the time is up
         assert!(check(
             &t,
-            &caster(2, 20, 100),
+            &caster(CLASS, 20, 100),
             &cooldowns,
-            17,
+            id,
             None,
             now + Duration::from_millis(3001)
         )
         .is_ok());
     }
 
-    /// Cooldowns are per spell, not per rank: learning a better rank must not
-    /// hand somebody a fresh one.
+    /// Cooldowns are per spell, not per rank: a better rank of the same
+    /// spell must not come up ready.
     #[test]
-    fn a_better_rank_shares_the_cooldown_of_its_spell() {
+    fn a_better_rank_shares_the_cooldown_of_its_slot() {
         let t = table();
         let now = Instant::now();
-        let mut cooldowns = Cooldowns::new();
+        let rank1 = skill_index(CLASS, 1, 1) as u32;
+        let rank3 = skill_index(CLASS, 1, 3) as u32;
 
-        // rank 1 was cast, so rank 2 of the same spell is cooling too
-        cooldowns.start(t.get(17).unwrap().family(), Duration::from_millis(3000), now);
+        let mut cooldowns = Cooldowns::new();
+        cooldowns.start(t.get(rank1 as usize).unwrap().family(), Duration::from_millis(3000), now);
+
         assert!(matches!(
-            check(&t, &caster(2, 20, 100), &cooldowns, 18, None, now),
+            check(&t, &caster(CLASS, 20, 100), &cooldowns, rank3, None, now),
             Err(CastError::Cooling { .. })
         ));
     }

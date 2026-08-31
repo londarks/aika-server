@@ -94,26 +94,35 @@ pub const DEFAULT_SIZES: [u8; 4] = [0x07, 0x77, 0x77, 0x00];
 pub const DEFAULT_SPEED_MOVE: u8 = 50;
 
 impl Character {
-    /// The class the client names, counted from one.
+    /// Which of the six the creation screen offers, counted from one.
     ///
-    /// The creation screen offers six, and the class index it sends is that
-    /// position times ten: Guerreiro 10-19, Templario 20-29, Atirador 30-39,
-    /// Pistoleiro 40-49, Feiticeiro Negro 50-59, Clerigo 60-69. So the class
-    /// is the index divided by ten, and it starts at one.
+    /// The screen shows them in a fixed order and sends that position times
+    /// ten: Guerreiro 10-19, Templaria 20-29, Atirador 30-39, Pistoleira
+    /// 40-49, Feiticeiro 50-59, Cleriga 60-69.
+    pub fn class_number(&self) -> u16 {
+        (self.class_index / 10).clamp(1, 6)
+    }
+
+    /// The code the client reads to name a class, which is not the position.
     ///
-    /// This was off by one for a while, which showed as an Atirador being
-    /// drawn and described as a Templario — the class before it in the list.
-    /// The value goes in `TCharacterListData.ClassInfo` and in the character
-    /// record, and both are what the client reads to name a class.
+    /// Read out of the six templates the original ships in `Data/BaseAccs`,
+    /// at offset 29 of the `TCharacter` inside each: Guerreiro 1, Templaria
+    /// 11, Atirador 21, Pistoleira 31, Feiticeiro 41, Cleriga 51. So it is
+    /// the position minus one, times ten, plus one — the same code the skill
+    /// table uses for a class at its first tier, and advancing tiers is what
+    /// the second digit is for.
+    ///
+    /// Sending the position instead put a 6 in here for a Cleriga, which is
+    /// not a code at all, and the client fell back to naming everybody a
+    /// Fighter.
     pub fn class_info(&self) -> u16 {
-        self.class_index / 10
+        (self.class_number() - 1) * 10 + 1
     }
 
     /// The same class counted from zero, which is how the skill table groups
-    /// them: its class column is this times ten plus a tier, so Atirador's
-    /// skills are 21, 22 and 23.
+    /// them: an Atirador's skills carry 21, 22 and 23, so its group is 2.
     pub fn skill_class(&self) -> u16 {
-        self.class_info().saturating_sub(1)
+        self.class_number() - 1
     }
 }
 
@@ -639,21 +648,42 @@ mod class_tests {
 
     /// The six the creation screen offers, in the order it offers them.
     #[test]
-    fn the_class_is_the_index_over_ten_counted_from_one() {
-        for (index, class) in [(10, 1), (19, 1), (20, 2), (30, 3), (45, 4), (59, 5), (69, 6)] {
-            assert_eq!(with_index(index).class_info(), class, "class index {index}");
+    fn the_class_number_is_the_index_over_ten() {
+        for (index, number) in [(10, 1), (19, 1), (20, 2), (30, 3), (45, 4), (59, 5), (69, 6)] {
+            assert_eq!(with_index(index).class_number(), number, "class index {index}");
         }
     }
 
-    /// An Atirador is the third class, and its skills are the third group in
-    /// the skill table, which that file counts from zero.
+    /// The six codes, read out of the templates the original ships. Getting
+    /// one of these wrong makes the client name the wrong class, and there is
+    /// no way to tell from our side that it did.
     #[test]
-    fn the_skill_group_is_the_same_class_counted_from_zero() {
+    fn the_class_code_is_the_one_the_templates_carry() {
+        for (index, code) in
+            [(10, 1), (20, 11), (30, 21), (40, 31), (50, 41), (60, 51)]
+        {
+            assert_eq!(with_index(index).class_info(), code, "class index {index}");
+        }
+    }
+
+    /// An Atirador is the third class, its code is 21, and its skills are the
+    /// third group in the table, which counts from zero.
+    #[test]
+    fn the_three_numbers_of_one_class_agree() {
         let atirador = with_index(30);
-        assert_eq!(atirador.class_info(), 3, "the client names it the third");
-        assert_eq!(atirador.skill_class(), 2, "the table groups it as the third of six");
+        assert_eq!(atirador.class_number(), 3);
+        assert_eq!(atirador.class_info(), 21);
+        assert_eq!(atirador.skill_class(), 2);
 
         assert_eq!(with_index(10).skill_class(), 0, "the first class is group zero");
         assert_eq!(with_index(69).skill_class(), 5, "the sixth is group five");
+    }
+
+    /// A class index the client should never send must not produce a code
+    /// that names some other class.
+    #[test]
+    fn an_impossible_class_index_is_clamped() {
+        assert_eq!(with_index(0).class_number(), 1);
+        assert_eq!(with_index(999).class_number(), 6);
     }
 }

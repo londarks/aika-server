@@ -2074,7 +2074,7 @@ async fn handle_delete_character(
 
 /// The skills a character has, worked out from the table.
 fn known_skills(state: &State, character: &Character) -> Vec<usize> {
-    ability::known_by(&state.skills, character.skill_class() as u32, character.level as u32)
+    ability::bar_of(&state.skills, character.class_number() as u32, character.level as u32)
 }
 
 /// `TSendSkillsPacket` (`0x106`): the forty skills the client draws on the
@@ -2127,7 +2127,7 @@ fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> 
     let target_at = target.as_ref().map(|m| m.position());
 
     let caster = ability::Caster {
-        base_class: character.skill_class() as u32,
+        class_number: character.class_number() as u32,
         level: character.level as u32,
         mana: session.cur_mp,
         at,
@@ -2793,8 +2793,8 @@ mod tests {
         assert_eq!(u16::from_le_bytes(slot1[16..18].try_into().unwrap()), 2, "nation");
         assert_eq!(
             u16::from_le_bytes(slot1[18..20].try_into().unwrap()),
-            2,
-            "class index 20 is the second class the creation screen offers"
+            11,
+            "class index 20 is the second class, whose code the templates give as 11"
         );
         assert_eq!(u16::from_le_bytes(slot1[24..26].try_into().unwrap()), 20, "Equip[0] = class");
         assert_eq!(u16::from_le_bytes(slot1[26..28].try_into().unwrap()), 7702, "Equip[1] = hair");
@@ -4335,12 +4335,15 @@ mod tests {
 
     // ---- casting -----------------------------------------------------------
 
-    /// A world with a monster to aim at and a small skill table behind it.
+    /// A world with a monster to aim at and a skill table laid out the way
+    /// the real one is: the test character is class index 20, which is the
+    /// second class, so its skills live in the second block.
     fn cast_state() -> State {
         use aika_data::skills::{field, SkillTable, RECORD_SIZE};
 
         let mut state = fight_state();
-        let mut raw = vec![0u8; 40 * RECORD_SIZE];
+        let mut raw = vec![0u8; 4000 * RECORD_SIZE];
+
         let mut define = |id: usize, family: u32, min_level: u32, class: u32,
                           mana: u32, damage: u32, range: u32, cooldown: u32| {
             let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
@@ -4358,14 +4361,19 @@ mod tests {
             put(r, field::AGGRESSIVE, 1);
             r[field::NAME_ENGLISH.start] = b'x';
         };
-        // The test character is class_index 20, which is base class 1.
-        define(1, 0, 1, 0, 0, 1, 0, 400);      // class zero: not a player's
-        define(17, 5, 1, 11, 30, 500, 300, 3000);  // class 1 only
-        define(30, 9, 1, 51, 5, 40, 200, 1000);    // class 5 only
+
+        define(SPELL as usize, 1, 1, 11, 30, 500, 300, 3000);       // ours
+        define(OTHER_SPELL as usize, 1, 1, 51, 5, 40, 200, 1000);   // another class
 
         state.skills = SkillTable::decode(&raw).unwrap();
         state
     }
+
+    /// The second class owns ids 960 to 1919, and its seventh slot - the
+    /// first one the bar carries - is at 960 + 6 * 16 + 1.
+    const SPELL: u32 = 960 + 6 * 16 + 1;
+    /// The fifth class's, which the test character must not be able to reach.
+    const OTHER_SPELL: u32 = 4 * 960 + 1;
 
     fn cast_message(skill: u32, target: u32) -> Message {
         Message {
@@ -4398,11 +4406,10 @@ mod tests {
             })
             .collect();
 
-        assert!(ids.contains(&17), "the class spell is not on the bar");
-        assert!(!ids.contains(&30), "another class's spell is on the bar");
+        assert!(ids.contains(&(SPELL as u16)), "the class spell is not on the bar");
         assert!(
-            !ids.contains(&1),
-            "a class-zero entry reached the bar; those are monster and item effects"
+            !ids.contains(&(OTHER_SPELL as u16)),
+            "another class's spell is on the bar"
         );
     }
 
@@ -4412,7 +4419,7 @@ mod tests {
         let mut session = in_world(&state).await;
         let mana = session.cur_mp;
 
-        let frames = frames_of(handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await);
+        let frames = frames_of(handle_message(&state, &mut session, &cast_message(SPELL, RAT as u32)).await);
 
         assert_eq!(
             opcodes(&frames),
@@ -4434,7 +4441,7 @@ mod tests {
 
         let state = cast_state();
         let mut session = in_world(&state).await;
-        handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await;
+        handle_message(&state, &mut session, &cast_message(SPELL, RAT as u32)).await;
         let by_spell = RAT_HP - state.world.mob(RAT).unwrap().hp;
 
         assert!(by_spell > by_swing, "the spell did {by_spell} and the swing {by_swing}");
@@ -4445,11 +4452,11 @@ mod tests {
         let state = cast_state();
         let mut session = in_world(&state).await;
 
-        handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await;
+        handle_message(&state, &mut session, &cast_message(SPELL, RAT as u32)).await;
         let mana = session.cur_mp;
         let hp = state.world.mob(RAT).unwrap().hp;
 
-        let frames = frames_of(handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await);
+        let frames = frames_of(handle_message(&state, &mut session, &cast_message(SPELL, RAT as u32)).await);
 
         assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
         assert_eq!(session.cur_mp, mana, "the refused cast spent mana");
@@ -4461,8 +4468,8 @@ mod tests {
         let state = cast_state();
         let mut session = in_world(&state).await;
 
-        let frames = frames_of(handle_message(&state, &mut session, &cast_message(30, RAT as u32)).await);
-        assert_eq!(message_text(&frames[0]), "You have not learned skill 30.");
+        let frames = frames_of(handle_message(&state, &mut session, &cast_message(OTHER_SPELL, RAT as u32)).await);
+        assert_eq!(message_text(&frames[0]), format!("You have not learned skill {OTHER_SPELL}."));
     }
 
     #[tokio::test]
@@ -4471,7 +4478,7 @@ mod tests {
         let mut session = in_world(&state).await;
         session.cur_mp = 5;
 
-        let frames = frames_of(handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await);
+        let frames = frames_of(handle_message(&state, &mut session, &cast_message(SPELL, RAT as u32)).await);
         assert_eq!(message_text(&frames[0]), "You need 30 mana and have 5.");
         assert_eq!(session.cur_mp, 5);
     }
@@ -4483,7 +4490,7 @@ mod tests {
         let mut session = in_world(&state).await;
         session.character.as_mut().unwrap().x = 9000;
 
-        let frames = frames_of(handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await);
+        let frames = frames_of(handle_message(&state, &mut session, &cast_message(SPELL, RAT as u32)).await);
         assert_eq!(message_text(&frames[0]), "That is too far away.");
         assert_eq!(state.world.mob(RAT).unwrap().hp, RAT_HP);
     }
@@ -4499,7 +4506,7 @@ mod tests {
         while state.world.mob(RAT).is_some_and(|m| m.is_alive()) && casts < 200 {
             // the cooldown is the reason a fight is not one packet
             session.cooldowns = ability::Cooldowns::new();
-            handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await;
+            handle_message(&state, &mut session, &cast_message(SPELL, RAT as u32)).await;
             casts += 1;
         }
 

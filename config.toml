@@ -23,7 +23,7 @@ pad_status_to = 0
 # it has accounts, this file is ignored and the database is the truth: editing
 # a level here will not raise a character that has been played.
 [database]
-path = "aika.db"
+path = "var/aika.db"
 # How long a change may sit in memory before it is written, in seconds.
 # Saving only when a player disconnects loses the whole session to a crash or
 # a kill, which to the player looks exactly like a database that does not
@@ -51,15 +51,15 @@ binds = [
 client_version = 124
 # Where the `.npc` files are, relative to the directory the server is started
 # from. They come from the original server's data, are read and never executed,
-# and are not tracked here — copy them into `data/NPCs` yourself. Leave empty
+# and are not tracked here — copy them into `assets/npcs` yourself. Leave empty
 # to run with no townspeople.
 #
 # Never put an absolute path in this file: it is tracked, and a path carries
 # the name of whoever's machine it came from.
-npc_dir = "data/NPCs"
+npc_dir = "assets/npcs"
 # The server's item table, which is what prices a shop. Same rules as above:
 # copy it into `data/` yourself, and never write an absolute path here.
-item_list = "data/ItemList.bin"
+item_list = "assets/items/ItemList.bin"
 
 # What the launcher receives when it checks the client version. It must match
 # the client's `update.dat` byte for byte, or the launcher believes a patch is
@@ -93,7 +93,7 @@ name = "Delta"
 online = 1
 
 # Accounts written into a database that has none, so a fresh checkout has
-# somewhere to log in. Delete `aika.db` to seed again from here.
+# somewhere to log in. Delete `var/aika.db` to seed again from here.
 # `password` is plaintext and becomes an MD5 on the way in; use `password_hash`
 # to paste a hash straight from the `password_hash` column of the MySQL dump.
 [[accounts]]

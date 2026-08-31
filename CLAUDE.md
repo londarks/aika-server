@@ -15,7 +15,7 @@ project is GPL-3.0 too.
   ignored. This rule exists because it was broken once and pushed.
 - **No real account data.** The original MySQL dump had live emails and password
   hashes; only `sql/schema.sql` (structure, no rows) is tracked.
-- **No client or original-server data.** `SL.bin`, `ItemList.bin`, `data/NPCs`
+- **No client or original-server data.** `SL.bin`, `ItemList.bin`, `assets/`
   and anything else from the pack is read locally and never redistributed.
 
 ## Conventions
@@ -32,6 +32,21 @@ is not obvious.
 `BinParser.exe`, `PacketAnalyzer.exe`, `MasterEditor.exe`, installers). They are
 documentation only: read the sources and data, reimplement in Rust. The one
 agreed exception is the game client itself, used for visual testing.
+
+## Where things live
+
+```text
+crates/          the source; aika-net (protocol), aika-data (file formats),
+                 aika-server (the server itself)
+sql/             the original MySQL schema, structure only, as documentation
+assets/          data copied from the original pack, read and never written:
+                 assets/npcs/ and assets/items/. Ignored by git.
+var/             everything the server writes: var/aika.db. Ignored by git.
+config.toml      the one file to edit to run it
+```
+
+Nothing the server reads or writes sits at the root, and neither directory is
+tracked: `assets/` is somebody else's data and `var/` is this machine's state.
 
 ## Layout
 
@@ -94,7 +109,7 @@ portable: every query lives in `crates/aika-server/src/db.rs`, only
 
 The database is the truth. `config.toml` seeds an *empty* one so a fresh
 checkout has somewhere to log in, and is ignored from then on: to seed again,
-delete `aika.db`. Positions are written as a player disconnects, so logging out
+delete `var/aika.db`. Positions are written as a player disconnects, so logging out
 somewhere means logging back in there; `tests/persistence.rs` proves it across
 two servers that share nothing but the file.
 
@@ -105,5 +120,5 @@ cargo run -p aika-server -- config.toml   # from the repo root
 RUST_LOG=aika_server=debug cargo run -p aika-server -- config.toml
 ```
 
-Channels live in `config.toml`; accounts and characters live in `aika.db` after
+Channels live in `config.toml`; accounts and characters live in `var/aika.db` after
 the first run. No rebuild is needed after editing either.

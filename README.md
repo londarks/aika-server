@@ -174,6 +174,20 @@ treated as one.
   strdef-tool scan    /path/to/client/UI/FieldSceneB4.bin
   ```
 
+  And `jit-tool` converts the client textures, which is what the whole
+  interface is made of:
+
+  ```sh
+  jit-tool info   /path/to/client/UI/1024login.jit
+  jit-tool to-dds /path/to/client/UI/1024login.jit    # edit the DDS anywhere
+  jit-tool to-jit /path/to/client/UI/1024login.jit edited.dds
+  ```
+
+  A `.jit` is a twelve-byte header in front of raw DXT blocks, so the pixel
+  data is copied untouched in both directions and a round trip changes nothing.
+  `to-jit` takes the original as a template so it can refuse a replacement the
+  client would not accept, and writes to a `.new` file.
+
   The table is 3096 fixed 128-byte records of plain latin-1 text, so the whole
   interface can be retranslated by editing a TSV. Records nobody touched come
   back byte for byte, and `import` writes to a `.new` file rather than over the

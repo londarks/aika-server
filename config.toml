@@ -64,6 +64,8 @@ item_list = "assets/items/ItemList.bin"
 # exist, and where each copy of them stands. Empty means a world with nothing
 # in it to fight.
 mob_dir = "assets/mobs"
+# Every skill in the game, at every rank. Empty means nobody can cast.
+skill_data = "assets/skills/SkillData.bin"
 
 # What the launcher receives when it checks the client version. It must match
 # the client's `update.dat` byte for byte, or the launcher believes a patch is

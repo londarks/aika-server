@@ -108,7 +108,20 @@ impl Blow {
 /// shrinks against a tougher target, and never falls to nothing — a hit that
 /// does no damage reads as a broken server rather than a hard fight.
 pub fn swing(attacker_level: u16, target_level: u16, rng: &mut impl Rng) -> Blow {
-    let base = 10 + attacker_level as i32 * 4;
+    swing_with(attacker_level, target_level, 0, rng)
+}
+
+/// The same, with a skill's own damage as the floor.
+///
+/// A spell that the table says hits for 260 has to hit for at least about
+/// that, or ranks stop meaning anything; the level still matters on top.
+pub fn swing_with(
+    attacker_level: u16,
+    target_level: u16,
+    skill_damage: u32,
+    rng: &mut impl Rng,
+) -> Blow {
+    let base = 10 + attacker_level as i32 * 4 + skill_damage as i32;
     // A monster ten levels above you is hard; one ten below is not free.
     let gap = (attacker_level as i32 - target_level as i32).clamp(-20, 20);
     let scaled = (base + gap * 3).max(1) as u32;

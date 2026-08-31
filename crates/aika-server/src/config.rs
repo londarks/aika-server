@@ -76,6 +76,9 @@ pub struct GameConfig {
     /// means a world with nothing in it to fight.
     #[serde(default)]
     pub mob_dir: String,
+    /// The server's `SkillData.bin`. Empty means nobody can cast anything.
+    #[serde(default)]
+    pub skill_data: String,
 }
 
 /// What the launcher receives when it checks the client version.
@@ -231,6 +234,7 @@ impl Default for GameConfig {
             npc_dir: String::new(),
             item_list: String::new(),
             mob_dir: String::new(),
+            skill_data: String::new(),
         }
     }
 }

@@ -12,7 +12,7 @@
 use crate::state::State;
 use crate::inventory::{self, Inventory};
 use crate::store::{Account, Character, Item, MAX_CHARACTERS};
-use crate::{combat, creation, dialog, shop};
+use crate::{ability, combat, creation, dialog, shop};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
 use aika_data::npc::Npc;
 use aika_net::frame::{self, FrameError, FrameReader, Message, MIN_FRAME};
@@ -320,6 +320,10 @@ struct Session {
     /// When the last write went out, so a player walking in a straight line
     /// does not write a row per step.
     saved_at: Option<std::time::Instant>,
+    /// When each spell this character has cast may be cast again. On the
+    /// session rather than the character: a cooldown that survived a logout
+    /// would be a reason to log out.
+    cooldowns: ability::Cooldowns,
     /// Monsters already on this player's screen, for the same reason as the
     /// players and the NPCs: sending a spawn twice draws two of them.
     visible_mobs: HashSet<u16>,
@@ -586,6 +590,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         OP_MOVE_ITEM => handle_move_item(session, message),
         OP_USE_ITEM => handle_use_item(state, session, message),
         combat::OP_ATTACK => handle_attack(state, session, message),
+        ability::OP_USE_SKILL => handle_use_skill(state, session, message),
         OP_DELETE_ITEM => handle_delete_item(session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
@@ -754,7 +759,8 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
     session.spawned = true;
     state.world.enter(session.client_id, character.clone());
 
-    let mut frames = world_burst(&character, session.client_id);
+    let skills = known_skills(state, &character);
+    let mut frames = world_burst(&character, session.client_id, &skills);
 
     // The city is drawn by the client; the people in it are not. Without this
     // the player arrives in an empty town.
@@ -800,12 +806,12 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
 /// right size and a zeroed body, which is what an empty list looks like
 /// anyway. Three packets from the original are still missing because their
 /// size is unknown: `0x138` (cash inventory), `0x936` and `0x91A` (nation).
-fn world_burst(character: &Character, client_id: u16) -> Vec<Vec<u8>> {
+fn world_burst(character: &Character, client_id: u16, skills: &[usize]) -> Vec<Vec<u8>> {
     let (hp, mp) = vitals(character);
 
     let mut frames = vec![
         encode_spawn(character, client_id),
-        encode_skills(client_id),
+        encode_skill_list(client_id, skills),
         encode_signal(OP_CASH, 0, 0, character.gold.min(u32::MAX as u64) as u32),
         zeroed(OP_ACCOUNT_STATUS, client_id, SIGNAL_SIZE),
         zeroed(OP_BUFFS, client_id, BUFFS_SIZE),
@@ -2032,6 +2038,142 @@ async fn handle_delete_character(
     Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
 }
 
+
+
+/// The skills a character has, worked out from the table.
+fn known_skills(state: &State, character: &Character) -> Vec<usize> {
+    ability::known_by(&state.skills, character.class_info() as u32, character.level as u32)
+}
+
+/// `TSendSkillsPacket` (`0x106`): the forty skills the client draws on the
+/// bar. Same opcode and size as the shop window, which is why it must only
+/// go out when the client is expecting a skill list.
+fn encode_skill_list(client_id: u16, skills: &[usize]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(SKILLS_SIZE - MIN_FRAME);
+    body.extend_from_slice(&0u16.to_le_bytes()); // no npc asked for it
+    body.extend_from_slice(&0u16.to_le_bytes()); // and so no send type
+    for slot in 0..ability::SKILL_SLOTS {
+        let id = skills.get(slot).copied().unwrap_or(0) as u16;
+        body.extend_from_slice(&id.to_le_bytes());
+    }
+
+    debug_assert_eq!(body.len() + MIN_FRAME, SKILLS_SIZE);
+    frame::encode(
+        &Message { sender: client_id, opcode: ability::OP_SKILL_LIST, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `0x320`: the player used a skill.
+///
+/// The original spends the mana, checks the cooldown and the target, relays
+/// the packet to everyone who can see it so they get the animation, and only
+/// then works out what it did (`PacketHandlers.pas:7550`). Same order here:
+/// the relay is what makes a spell look like it happened.
+fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> Action {
+    let Some(request) = ability::UseSkill::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x320 packet too short");
+        return Action::Ignore;
+    };
+
+    let Some(character) = session.character.as_ref() else {
+        return Action::Ignore;
+    };
+    let client_id = session.client_id;
+    let at = (character.x as f32, character.y as f32);
+
+    // A skill aimed at something needs that something to exist. Its position
+    // comes from the world, never from the packet.
+    let target = state.world.mob(request.target as u16).filter(|m| m.is_alive());
+    let target_at = target.as_ref().map(|m| m.position());
+
+    let caster = ability::Caster {
+        base_class: character.class_info() as u32,
+        level: character.level as u32,
+        mana: session.cur_mp,
+        at,
+    };
+
+    let now = std::time::Instant::now();
+    let cast = match ability::check(
+        &state.skills,
+        &caster,
+        &session.cooldowns,
+        request.skill,
+        target_at,
+        now,
+    ) {
+        Ok(cast) => cast,
+        Err(e) => {
+            debug!(skill = request.skill, error = %e, "cast refused");
+            return Action::Reply(vec![encode_client_message(client_id, &e.message())]);
+        }
+    };
+
+    session.cur_mp = session.cur_mp.saturating_sub(cast.mana);
+    session.cooldowns.start(cast.family, cast.cooldown, now);
+
+    // Everyone who can see the caster sees the cast, animation and all.
+    let relay = frame::encode(
+        &Message {
+            sender: client_id,
+            opcode: ability::OP_USE_SKILL,
+            time: message.time,
+            body: message.body.clone(),
+        },
+        rand::random(),
+    );
+    state.world.send_to_visible(client_id, relay.clone());
+
+    let (max_hp, max_mp) = vitals(session.character.as_ref().expect("checked above"));
+    let mut frames = vec![relay, encode_hp_mp(
+        session.character.as_ref().expect("checked above"),
+        client_id,
+        session.cur_hp.min(max_hp),
+        session.cur_mp.min(max_mp),
+    )];
+
+    // A skill that hurts something works out its damage the same way a swing
+    // does, with the skill's own number as the floor rather than the level.
+    let Some(target) = target else {
+        return Action::Reply(frames);
+    };
+    if !cast.is_aggressive {
+        return Action::Reply(frames);
+    }
+
+    let blow = combat::swing_with(
+        character.level,
+        target.level,
+        cast.damage,
+        &mut rand::thread_rng(),
+    );
+    let Some((target, killed)) = state.world.wound_mob(target.id, blow.damage, now) else {
+        return Action::Reply(frames);
+    };
+
+    let report = combat::Damage {
+        skill: cast.skill as u16,
+        attacker: client_id,
+        attacker_at: at,
+        attacker_hp: session.cur_hp.min(max_hp),
+        animation: cast.animation as u16,
+        target: target.id,
+        target_hp: target.hp,
+        blow,
+        at: target.position(),
+    };
+    let damage_frame = encode_damage(&report);
+    state.world.send_to_visible(client_id, damage_frame.clone());
+    frames.push(damage_frame);
+
+    if killed {
+        info!(monster = %target.name, skill = cast.skill, "killed with a skill");
+        frames.extend(reward_for(session, &target));
+        session.visible_mobs.remove(&target.id);
+    }
+    Action::Reply(frames)
+}
 
 /// `0x302`: the player swung at something.
 ///
@@ -3750,7 +3892,7 @@ mod tests {
         );
 
         // the copy the player gets of itself is the ordinary kind
-        let own = decode(&world_burst(&character, session.client_id)[0]);
+        let own = decode(&world_burst(&character, session.client_id, &[])[0]);
         assert_eq!(own.body[spawn_offset::SPAWN_TYPE], SPAWN_NORMAL);
     }
 
@@ -4146,5 +4288,177 @@ mod tests {
         assert_eq!(opcodes(&frames), vec![OP_CREATE_MOB]);
         assert!(session.visible_mobs.contains(&RAT), "it never came back on screen");
         assert_eq!(state.world.mob(RAT).unwrap().hp, RAT_HP, "it came back hurt");
+    }
+
+    // ---- casting -----------------------------------------------------------
+
+    /// A world with a monster to aim at and a small skill table behind it.
+    fn cast_state() -> State {
+        use aika_data::skills::{field, SkillTable, RECORD_SIZE};
+
+        let mut state = fight_state();
+        let mut raw = vec![0u8; 40 * RECORD_SIZE];
+        let mut define = |id: usize, family: u32, min_level: u32, class: u32,
+                          mana: u32, damage: u32, range: u32, cooldown: u32| {
+            let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
+            let put = |r: &mut [u8], at: usize, v: u32| {
+                r[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            };
+            put(r, field::FAMILY, family);
+            put(r, field::RANK, 1);
+            put(r, field::MIN_LEVEL, min_level);
+            put(r, field::CLASS, class);
+            put(r, field::MANA, mana);
+            put(r, field::DAMAGE, damage);
+            put(r, field::RANGE, range);
+            put(r, field::COOLDOWN, cooldown);
+            put(r, field::AGGRESSIVE, 1);
+            r[field::NAME_ENGLISH.start] = b'x';
+        };
+        // The test character is class_index 20, which is base class 1.
+        define(1, 0, 1, 0, 0, 1, 0, 400);      // everybody
+        define(17, 5, 1, 11, 30, 500, 300, 3000);  // class 1 only
+        define(30, 9, 1, 51, 5, 40, 200, 1000);    // class 5 only
+
+        state.skills = SkillTable::decode(&raw).unwrap();
+        state
+    }
+
+    fn cast_message(skill: u32, target: u32) -> Message {
+        Message {
+            sender: TEST_CLIENT_ID,
+            opcode: ability::OP_USE_SKILL,
+            time: 0,
+            body: ability::UseSkill { skill, target, at: (3452.0, 692.0) }.to_body(),
+        }
+    }
+
+    /// The client draws the skill bar from what the server sends on arrival.
+    #[tokio::test]
+    async fn the_skill_list_reaches_the_client_on_arrival() {
+        let state = cast_state();
+        let mut session = logged_in(&state).await;
+        handle_message(&state, &mut session, &enter_world(0)).await;
+
+        let frames = frames_of(handle_client_ready(&state, &mut session));
+        let list = frames
+            .iter()
+            .map(|f| decode(f))
+            .find(|m| m.opcode == ability::OP_SKILL_LIST)
+            .expect("no skill list");
+
+        assert_eq!(list.body.len() + MIN_FRAME, SKILLS_SIZE);
+        let ids: Vec<u16> = (0..ability::SKILL_SLOTS)
+            .map(|i| {
+                let at = 4 + i * 2;
+                u16::from_le_bytes(list.body[at..at + 2].try_into().unwrap())
+            })
+            .collect();
+
+        assert!(ids.contains(&1), "the basic attack is not on the bar");
+        assert!(ids.contains(&17), "the class spell is not on the bar");
+        assert!(!ids.contains(&30), "another class's spell is on the bar");
+    }
+
+    #[tokio::test]
+    async fn casting_spends_mana_and_hurts_the_target() {
+        let state = cast_state();
+        let mut session = in_world(&state).await;
+        let mana = session.cur_mp;
+
+        let frames = frames_of(handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await);
+
+        assert_eq!(
+            opcodes(&frames),
+            vec![ability::OP_USE_SKILL, OP_HP_MP, combat::OP_DAMAGE],
+            "the cast has to be relayed, the mana reported, and the damage sent"
+        );
+        assert_eq!(session.cur_mp, mana - 30, "the mana was not spent");
+        assert!(state.world.mob(RAT).unwrap().hp < RAT_HP, "the spell did nothing");
+    }
+
+    /// A spell hits harder than a swing, because the table says what it does.
+    #[tokio::test]
+    async fn a_spell_hits_harder_than_a_swing() {
+        let state = cast_state();
+
+        let mut session = in_world(&state).await;
+        handle_message(&state, &mut session, &attack_message(RAT)).await;
+        let by_swing = RAT_HP - state.world.mob(RAT).unwrap().hp;
+
+        let state = cast_state();
+        let mut session = in_world(&state).await;
+        handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await;
+        let by_spell = RAT_HP - state.world.mob(RAT).unwrap().hp;
+
+        assert!(by_spell > by_swing, "the spell did {by_spell} and the swing {by_swing}");
+    }
+
+    #[tokio::test]
+    async fn a_spell_still_cooling_is_refused_and_costs_nothing() {
+        let state = cast_state();
+        let mut session = in_world(&state).await;
+
+        handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await;
+        let mana = session.cur_mp;
+        let hp = state.world.mob(RAT).unwrap().hp;
+
+        let frames = frames_of(handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await);
+
+        assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
+        assert_eq!(session.cur_mp, mana, "the refused cast spent mana");
+        assert_eq!(state.world.mob(RAT).unwrap().hp, hp, "the refused cast hurt it");
+    }
+
+    #[tokio::test]
+    async fn another_classs_spell_is_refused() {
+        let state = cast_state();
+        let mut session = in_world(&state).await;
+
+        let frames = frames_of(handle_message(&state, &mut session, &cast_message(30, RAT as u32)).await);
+        assert_eq!(message_text(&frames[0]), "You have not learned skill 30.");
+    }
+
+    #[tokio::test]
+    async fn casting_without_the_mana_is_refused() {
+        let state = cast_state();
+        let mut session = in_world(&state).await;
+        session.cur_mp = 5;
+
+        let frames = frames_of(handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await);
+        assert_eq!(message_text(&frames[0]), "You need 30 mana and have 5.");
+        assert_eq!(session.cur_mp, 5);
+    }
+
+    /// Reaching across the map with a spell is the same hole as with a swing.
+    #[tokio::test]
+    async fn a_target_out_of_the_spells_range_is_refused() {
+        let state = cast_state();
+        let mut session = in_world(&state).await;
+        session.character.as_mut().unwrap().x = 9000;
+
+        let frames = frames_of(handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await);
+        assert_eq!(message_text(&frames[0]), "That is too far away.");
+        assert_eq!(state.world.mob(RAT).unwrap().hp, RAT_HP);
+    }
+
+    #[tokio::test]
+    async fn killing_with_a_spell_pays_the_same_as_killing_with_a_swing() {
+        let state = cast_state();
+        let mut session = in_world(&state).await;
+        let before = session.character.as_ref().unwrap().exp;
+        session.cur_mp = 100_000;
+
+        let mut casts = 0;
+        while state.world.mob(RAT).is_some_and(|m| m.is_alive()) && casts < 200 {
+            // the cooldown is the reason a fight is not one packet
+            session.cooldowns = ability::Cooldowns::new();
+            handle_message(&state, &mut session, &cast_message(17, RAT as u32)).await;
+            casts += 1;
+        }
+
+        assert!(casts < 200, "the monster would not die");
+        assert_eq!(session.character.as_ref().unwrap().exp, before + 25);
+        assert!(!session.visible_mobs.contains(&RAT));
     }
 }

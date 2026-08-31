@@ -13,6 +13,7 @@
 //! [`world`] holds the registry of who is online, which is what lets two
 //! players see each other.
 
+pub mod ability;
 pub mod combat;
 pub mod config;
 pub mod creation;

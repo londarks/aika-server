@@ -7,5 +7,6 @@ pub mod itemlist;
 pub mod jit;
 pub mod mobs;
 pub mod npc;
+pub mod skills;
 pub mod sl;
 pub mod strdef;

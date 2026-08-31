@@ -56,6 +56,15 @@ Reference sources live outside this repo, in sibling directories:
   the client's own terrain.
 - **Keep the protocol at the edge.** Wire quirks (level minus one, fixed refine
   slots) are converted when encoding, never stored in game logic.
+- **Data files are Delphi records written straight to disk.** `.npc` is a raw
+  `TNPCFile`. Read the record definition, then confirm each offset against all
+  the files at once by searching for the value that has to be there.
+- **The `.npc` id is in the file name, not in the record.** The files were made
+  by copying one another; `[2700] Lilola Hawn.npc` says 2215 inside. The
+  original patches a hardcoded few and lets the rest overwrite each other.
+- **Players and NPCs share one id space.** 1..2000 for players, 2048..3048 for
+  NPCs (`Connections/ServerSocket.pas:44`). Player ids are capped so a
+  connection can never be drawn on top of a townsperson.
 
 ## Database
 

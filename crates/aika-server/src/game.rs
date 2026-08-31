@@ -216,6 +216,10 @@ const SPAWN_ARMA_REFINE: u8 = 15;
 /// not look like one who was standing there all along.
 const SPAWN_TELEPORT_IN: u8 = 1;
 
+/// The send type the original stamps on a skill list that came from a
+/// trainer rather than from arriving in the world (`NPCHandlers.pas:7119`).
+const SKILL_LIST_FROM_NPC: u16 = 0x0B;
+
 /// What the original gives every monster (`ServerSocket.pas:655`).
 const MOB_SPEED_MOVE: u8 = 22;
 /// `SPAWN_NORMAL` in `Data/GlobalDefs.pas:211`. There is also 1 (teleport)
@@ -1381,6 +1385,21 @@ fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> A
             // quests and the menu heading (`PacketHandlers.pas:3382`).
             Action::Reply(vec![encode_menu_close(), encode_show_shop(session.client_id, npc)])
         }
+        dialog::option::SKILLS => {
+            // The skill master's window is the same packet as the bar, with
+            // the NPC named and a send type that tells the client to open the
+            // trainer rather than redraw the bar
+            // (`TNPCHandlers.ShowSkills` -> `SendPlayerSkills(NpcId)`).
+            let Some(character) = session.character.as_ref() else {
+                return Action::Ignore;
+            };
+            let skills = known_skills(state, character);
+            info!(npc = npc_id, name = %npc.label, skills = skills.len(), "skill trainer");
+            Action::Reply(vec![
+                encode_menu_close(),
+                encode_skill_list_from(session.client_id, npc_id, &skills),
+            ])
+        }
         dialog::option::CLOSE => {
             session.opened_npc = None;
             Action::Reply(vec![encode_menu_close()])
@@ -2062,9 +2081,16 @@ fn known_skills(state: &State, character: &Character) -> Vec<usize> {
 /// bar. Same opcode and size as the shop window, which is why it must only
 /// go out when the client is expecting a skill list.
 fn encode_skill_list(client_id: u16, skills: &[usize]) -> Vec<u8> {
+    encode_skill_list_from(client_id, 0, skills)
+}
+
+/// The same list, said to come from an NPC. The send type is what makes the
+/// client open a trainer instead of redrawing the bar.
+fn encode_skill_list_from(client_id: u16, npc: u16, skills: &[usize]) -> Vec<u8> {
     let mut body = Vec::with_capacity(SKILLS_SIZE - MIN_FRAME);
-    body.extend_from_slice(&0u16.to_le_bytes()); // no npc asked for it
-    body.extend_from_slice(&0u16.to_le_bytes()); // and so no send type
+    body.extend_from_slice(&npc.to_le_bytes());
+    let send_type: u16 = if npc > 0 { SKILL_LIST_FROM_NPC } else { 0 };
+    body.extend_from_slice(&send_type.to_le_bytes());
     for slot in 0..ability::SKILL_SLOTS {
         let id = skills.get(slot).copied().unwrap_or(0) as u16;
         body.extend_from_slice(&id.to_le_bytes());
@@ -4329,7 +4355,7 @@ mod tests {
             r[field::NAME_ENGLISH.start] = b'x';
         };
         // The test character is class_index 20, which is base class 1.
-        define(1, 0, 1, 0, 0, 1, 0, 400);      // everybody
+        define(1, 0, 1, 0, 0, 1, 0, 400);      // class zero: not a player's
         define(17, 5, 1, 11, 30, 500, 300, 3000);  // class 1 only
         define(30, 9, 1, 51, 5, 40, 200, 1000);    // class 5 only
 
@@ -4368,9 +4394,12 @@ mod tests {
             })
             .collect();
 
-        assert!(ids.contains(&1), "the basic attack is not on the bar");
         assert!(ids.contains(&17), "the class spell is not on the bar");
         assert!(!ids.contains(&30), "another class's spell is on the bar");
+        assert!(
+            !ids.contains(&1),
+            "a class-zero entry reached the bar; those are monster and item effects"
+        );
     }
 
     #[tokio::test]

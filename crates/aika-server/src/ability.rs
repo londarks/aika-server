@@ -115,17 +115,22 @@ impl UseSkill {
 /// The ids a character of this class and level can use, best rank of each
 /// spell first, at most as many as the list packet carries.
 ///
-/// A skill belongs either to everybody (class zero) or to one base class,
-/// which the file writes as the class times ten plus a tier.
+/// # Class zero is not "everybody"
+///
+/// It reads that way and it is not. The 412 spells the file files under class
+/// zero are monster abilities, siege weapon abilities and the effects items
+/// grant when used — `Siege Boss AOE`, `BIG Head Potion`, `Plain Verband
+/// Soup`. A player's own skills always carry their class, basic attack
+/// included: `Attack` is class 21 for the third class and class 11 for the
+/// second.
+///
+/// Treating class zero as common filled thirty-four of the forty slots on the
+/// skill bar with soup.
 pub fn known_by(table: &SkillTable, base_class: u32, level: u32) -> Vec<usize> {
     let mut best: HashMap<u32, (usize, u32)> = HashMap::new();
 
     for (id, skill) in table.defined() {
-        let theirs = match skill.base_class() {
-            None => true,
-            Some(c) => c == base_class,
-        };
-        if !theirs || skill.min_level() > level {
+        if skill.base_class() != Some(base_class) || skill.min_level() > level {
             continue;
         }
         // One entry per spell, the highest rank the level allows.
@@ -205,8 +210,9 @@ pub fn check(
 ) -> Result<Cast, CastError> {
     let skill = table.get(id as usize).ok_or(CastError::NoSuchSkill(id))?;
 
-    let theirs = skill.base_class().is_none_or(|c| c == caster.base_class);
-    if !theirs || skill.min_level() > caster.level {
+    // Same rule as `known_by`: a player's skills carry their class, and the
+    // class-zero pile belongs to monsters and items.
+    if skill.base_class() != Some(caster.base_class) || skill.min_level() > caster.level {
         return Err(CastError::NotLearned(id));
     }
 
@@ -274,8 +280,9 @@ mod tests {
             r[field::NAME_ENGLISH.start] = b'x';
         };
 
-        define(1, 0, 1, 1, 0, 0, 1, 0, 400); // Attack, everybody, rank 1
-        define(2, 0, 2, 10, 0, 0, 1, 0, 400); // Attack rank 2
+        // class zero: a monster or item effect, never a player's
+        define(1, 0, 1, 1, 0, 0, 1, 0, 400);
+        define(2, 0, 2, 10, 0, 0, 1, 0, 400);
         define(17, 5, 1, 4, 21, 10, 120, 300, 3000); // class 2 only
         define(18, 5, 2, 14, 21, 18, 260, 300, 3000);
         define(30, 9, 1, 1, 51, 5, 40, 200, 1000); // class 5 only
@@ -300,11 +307,17 @@ mod tests {
     fn what_a_character_knows_is_the_best_rank_of_each_of_its_spells() {
         let t = table();
 
-        assert_eq!(known_by(&t, 2, 1), vec![1], "level 1 has only the basic attack");
-        assert_eq!(known_by(&t, 2, 12), vec![2, 17], "rank 2 of attack, rank 1 of the spell");
-        assert_eq!(known_by(&t, 2, 20), vec![2, 18], "the better rank replaces the earlier one");
-        assert_eq!(known_by(&t, 5, 20), vec![2, 30], "another class gets its own");
-        assert_eq!(known_by(&t, 0, 20), vec![2], "a class with nothing of its own");
+        assert!(known_by(&t, 2, 1).is_empty(), "nothing is learnable at level 1");
+        assert_eq!(known_by(&t, 2, 12), vec![17], "rank 1 of the class spell");
+        assert_eq!(known_by(&t, 2, 20), vec![18], "the better rank replaces the earlier one");
+        assert_eq!(known_by(&t, 5, 20), vec![30], "another class gets its own");
+        assert!(known_by(&t, 9, 20).is_empty(), "a class with nothing of its own");
+
+        // and the class-zero pile never reaches anybody
+        assert!(
+            !known_by(&t, 2, 999).contains(&1),
+            "a class-zero entry reached the bar; those are monster and item effects"
+        );
     }
 
     /// The list packet holds forty, so the answer must never be longer.
@@ -312,6 +325,16 @@ mod tests {
     fn the_list_never_outgrows_the_packet() {
         let t = table();
         assert!(known_by(&t, 2, 999).len() <= SKILL_SLOTS);
+    }
+
+    /// A class-zero skill is not the player's, whatever their class.
+    #[test]
+    fn nobody_can_cast_a_class_zero_skill() {
+        let t = table();
+        assert_eq!(
+            check(&t, &caster(0, 99, 999), &Cooldowns::new(), 1, None, Instant::now()),
+            Err(CastError::NotLearned(1))
+        );
     }
 
     #[test]
@@ -391,9 +414,10 @@ mod tests {
         let t = table();
         let now = Instant::now();
 
-        assert!(check(&t, &caster(0, 20, 0), &Cooldowns::new(), 1, Some((105.0, 100.0)), now).is_ok());
+        // skill 30 has a range of 200; from 700 away it cannot reach
+        assert!(check(&t, &caster(5, 20, 50), &Cooldowns::new(), 30, Some((105.0, 100.0)), now).is_ok());
         assert_eq!(
-            check(&t, &caster(0, 20, 0), &Cooldowns::new(), 1, Some((900.0, 100.0)), now),
+            check(&t, &caster(5, 20, 50), &Cooldowns::new(), 30, Some((900.0, 100.0)), now),
             Err(CastError::OutOfRange)
         );
     }

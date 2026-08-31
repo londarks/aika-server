@@ -401,8 +401,9 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Resu
 ///
 /// Only one thing does so far: monsters whose respawn time is up. A second is
 /// finer than any respawn in the shipped data, the shortest of which is
-/// thirty, so nothing waits noticeably longer than the file says.
-const WORLD_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+/// thirty, so nothing waits noticeably longer than the file says. It is also
+/// what a monster's step is measured against, so it sets how fast they amble.
+const WORLD_TICK: std::time::Duration = crate::mob::TICK;
 
 /// Brings monsters back on their own clock.
 ///
@@ -444,7 +445,7 @@ pub fn spawn_world_tick(state: Arc<State>) -> tokio::task::JoinHandle<()> {
                 // A walk is told to everyone who can see it, once, with the
                 // destination. The client animates the way there itself.
                 if let Some(to) = turn.walk {
-                    let frame = encode_mob_walk(&mob, to);
+                    let frame = encode_mob_walk(&mob, to, turn.speed);
                     for (id, at) in &players {
                         if within(*at, mob.position(), DISTANCE_TO_WATCH) {
                             state.world.send_to(*id, frame.clone());
@@ -462,12 +463,12 @@ pub fn spawn_world_tick(state: Arc<State>) -> tokio::task::JoinHandle<()> {
 /// get there at. The client walks it the whole way on its own — which is why
 /// sending a short step every tick instead made monsters jump: they arrived
 /// early and stood still until the next packet.
-fn encode_mob_walk(mob: &crate::mob::Mob, to: (f32, f32)) -> Vec<u8> {
+fn encode_mob_walk(mob: &crate::mob::Mob, to: (f32, f32), speed: u8) -> Vec<u8> {
     let mut body = vec![0u8; Movement::BODY_SIZE];
     body[0..4].copy_from_slice(&to.0.to_le_bytes());
     body[4..8].copy_from_slice(&to.1.to_le_bytes());
     body[Movement::MOVE_TYPE] = MOVE_NORMAL;
-    body[Movement::SPEED] = crate::mob::WALK_SPEED;
+    body[Movement::SPEED] = speed;
 
     frame::encode(
         &Message { sender: mob.id, opcode: OP_MOVE, time: 0, body },
@@ -2287,7 +2288,7 @@ fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> 
         cast.damage + stats::base_damage(stats.magic_attack, target.level as u32),
         &mut rand::thread_rng(),
     );
-    let Some((target, killed)) = state.world.wound_mob(target.id, blow.damage, now) else {
+    let Some((target, killed)) = state.world.wound_mob(target.id, blow.damage, client_id, now) else {
         return Action::Reply(frames);
     };
 
@@ -2485,7 +2486,12 @@ fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Act
         &mut rand::thread_rng(),
     );
     let Some((target, killed)) =
-        state.world.wound_mob(request.target, blow.damage, std::time::Instant::now())
+        state.world.wound_mob(
+            request.target,
+            blow.damage,
+            session.client_id,
+            std::time::Instant::now(),
+        )
     else {
         // Somebody else landed the last blow between the checks above and
         // here. Theirs, not ours.

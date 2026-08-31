@@ -131,12 +131,20 @@ impl World {
     ///
     /// The whole thing happens under one lock, which is what stops two
     /// players being paid for the same corpse.
-    pub fn wound_mob(&self, id: u16, damage: u32, now: Instant) -> Option<(Mob, bool)> {
+    pub fn wound_mob(
+        &self,
+        id: u16,
+        damage: u32,
+        by: u16,
+        now: Instant,
+    ) -> Option<(Mob, bool)> {
         let mut mobs = self.mobs.lock().unwrap();
         let mob = mobs.iter_mut().find(|m| m.id == id)?;
         if !mob.is_alive() {
             return None;
         }
+        // Hitting a monster is what makes a passive one fight back.
+        mob.provoked_by(by);
         let killed = mob.wound(damage, now);
         Some((mob.clone(), killed))
     }

@@ -83,6 +83,12 @@ Reference sources live outside this repo, in sibling directories:
   the client's own terrain.
 - **Keep the protocol at the edge.** Wire quirks (level minus one, fixed refine
   slots) are converted when encoding, never stored in game logic.
+- **Find the file that owns the behaviour before writing any of it.** The
+  monster AI lives in `Mob/MOB.pas`, which went unread for two attempts while
+  behaviour was invented from fragments elsewhere. Every number was wrong:
+  aggro 20 against 8, reach 12 against 3, a step of 22 against 1.5. Grep for
+  the *state* a behaviour keeps (`MovedTo`, `IsAttacked`) rather than for the
+  verb, and the owning file falls out.
 - **Data files are Delphi records written straight to disk.** `.npc` is a raw
   `TNPCFile`. Read the record definition, then confirm each offset against all
   the files at once by searching for the value that has to be there.

@@ -58,9 +58,10 @@ Reference sources live outside this repo, in sibling directories:
   each other by 16 and 32 bytes. Trust the declared types, never the comments.
 - **Dead code hides behind `Exit;`** — check that a handler's body is actually
   reachable before porting it.
-- **When the two references disagree, the Delphi wins.** It is the one our
-  client speaks to. (The AikaEmu README says the channel list has 56 values; the
-  real client wants one per channel.)
+- **The Delphi server is the authority; AikaEmu is a last resort.** The Delphi
+  is what our client actually speaks to. Reach for AikaEmu only for something
+  it alone documents, and never take game data from it: its tables are from a
+  different build of the game and describe a different server.
 - **The packet checksum does not protect the payload.** The cipher is linear, so
   the sum difference depends only on seed and length. Not an integrity check.
 - **Coordinates are always `f32` pairs, and there is no Z.** Height comes from

@@ -211,7 +211,12 @@ impl Database {
         .await
         .with_context(|| format!("inserting character {}", character.name))?;
 
-        Ok(row.try_get::<i64, _>("id")?)
+        // A new character is handed starting gear, and it has to go in with
+        // it: writing the row alone leaves a character that arrives empty
+        // after the first restart.
+        let id: i64 = row.try_get("id")?;
+        self.save_inventory(id, &character.items).await?;
+        Ok(id)
     }
 
     /// Every account with its characters and their items.
@@ -609,6 +614,37 @@ mod tests {
         db.save_session(&character).await.unwrap();
 
         assert!(db.load_items(character.id).await.unwrap().is_empty(), "sold items came back");
+    }
+
+    /// A character is inserted with whatever it is holding, not as a bare row.
+    #[tokio::test]
+    async fn inserting_a_character_stores_what_it_starts_with() {
+        let db = memory_db().await;
+        db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
+
+        let mut fresh = Character::from(&crate::config::DevCharacter {
+            name: "Novato".into(),
+            slot: 1,
+            level: 1,
+            class_index: 20,
+            hair: 7702,
+            nation: 0,
+            gold: 0,
+            exp: 0,
+            x: None,
+            y: None,
+            speed_move: None,
+        });
+        fresh
+            .items
+            .put(Item { index: 5300, container: 1, slot: 0, refine: 1, ..Item::default() })
+            .unwrap();
+
+        let id = db.insert_character(1, &fresh).await.unwrap();
+        let stored = db.load_items(id).await.unwrap();
+
+        assert_eq!(stored.len(), 1, "the starting gear was not stored");
+        assert_eq!(stored[0].index, 5300);
     }
 
     /// The whole point of persistence: log out somewhere, log back in there.

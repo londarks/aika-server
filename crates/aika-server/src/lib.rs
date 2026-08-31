@@ -14,6 +14,7 @@
 //! players see each other.
 
 pub mod config;
+pub mod creation;
 pub mod db;
 pub mod dialog;
 pub mod game;

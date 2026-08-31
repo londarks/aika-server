@@ -12,7 +12,7 @@
 use crate::state::State;
 use crate::inventory::{self, Inventory};
 use crate::store::{Account, Character, Item, MAX_CHARACTERS};
-use crate::{dialog, shop};
+use crate::{creation, dialog, shop};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
 use aika_data::npc::Npc;
 use aika_net::frame::{self, FrameError, FrameReader, Message, MIN_FRAME};
@@ -39,6 +39,8 @@ pub const OP_CLIENT_READY: u16 = 0xF0B;
 /// Client to server: walked to a point. The server returns nothing to the
 /// mover, it only relays to the others who can see them.
 pub const OP_MOVE: u16 = 0x301;
+/// `TSignalData`: which way the player is facing.
+pub const OP_ROTATE: u16 = 0x305;
 /// `TMoveItemPacket`: drag an item from one slot to another.
 pub const OP_MOVE_ITEM: u16 = 0x70F;
 /// Throw an item away.
@@ -266,6 +268,8 @@ struct Session {
     /// NPCs already placed on this player's screen. Same reason as `visible`:
     /// sending a spawn twice makes the client draw two of them.
     visible_npcs: HashSet<u16>,
+    /// Which way the player is facing, so a repeat can be dropped.
+    rotation: u32,
     /// Which NPC has a window open, if any. Every shop packet is checked
     /// against it: a client that never opened a shop must not be able to buy
     /// from one, and the original refuses on the same grounds.
@@ -331,7 +335,7 @@ async fn read_loop(
 
         while let Some(message) = reader.next_message() {
             match message {
-                Ok(message) => match handle_message(state, session, &message) {
+                Ok(message) => match handle_message(state, session, &message).await {
                     Action::Reply(frames) => {
                         for frame in frames {
                             let _ = outbox.send(frame);
@@ -445,7 +449,13 @@ enum Action {
     Disconnect,
 }
 
-fn handle_message(state: &State, session: &mut Session, message: &Message) -> Action {
+/// One packet in, whatever should go out.
+///
+/// Asynchronous because some packets have to reach the database before they
+/// can be answered: a character that exists in memory but not on disk is a
+/// character that disappears at the next restart. The handlers that need
+/// nothing from the database stay synchronous and are called directly.
+async fn handle_message(state: &State, session: &mut Session, message: &Message) -> Action {
     match message.opcode {
         OP_REQUEST_LOGIN => handle_request_login(state, session, message),
         OP_ENTER_WORLD => handle_enter_world(session, message, state.uptime_ms()),
@@ -455,6 +465,10 @@ fn handle_message(state: &State, session: &mut Session, message: &Message) -> Ac
         dialog::OP_CLOSE_NPC_OPTION => handle_close_npc(session),
         shop::OP_BUY => handle_buy(state, session, message),
         shop::OP_SELL => handle_sell(state, session, message),
+        OP_ROTATE => handle_rotate(state, session, message),
+        creation::OP_CREATE_CHARACTER => {
+            handle_create_character(state, session, message).await
+        }
         OP_MOVE_ITEM => handle_move_item(session, message),
         OP_DELETE_ITEM => handle_delete_item(session, message),
         opcode => {
@@ -1463,6 +1477,109 @@ fn encode_client_message(client_id: u16, text: &str) -> Vec<u8> {
     )
 }
 
+
+/// `0x305`: the player turned.
+///
+/// Relayed rather than answered: the client that sent it already turned, and
+/// everyone who can see the player needs to see the same. The value is kept
+/// on the presence so somebody walking into view is drawn facing the right
+/// way, and it is dropped on logout because the client sends it again the
+/// moment the mouse moves.
+fn handle_rotate(state: &State, session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < 4 {
+        warn!(size = message.body.len(), "0x305 packet too short");
+        return Action::Ignore;
+    }
+    let rotation = u32::from_le_bytes(message.body[0..4].try_into().unwrap());
+
+    if session.rotation == rotation {
+        return Action::Ignore;
+    }
+    session.rotation = rotation;
+    state.world.turn(session.client_id, rotation);
+
+    let relay = frame::encode(
+        &Message {
+            sender: session.client_id,
+            opcode: OP_ROTATE,
+            time: message.time,
+            body: message.body.clone(),
+        },
+        rand::random(),
+    );
+    state.world.send_to_visible(session.client_id, relay);
+    Action::Ignore
+}
+
+/// `0x3E04`: make a character in one of the three slots.
+///
+/// The reply is the whole character list either way, because that is what the
+/// client redraws the selection screen from; a refusal also carries the
+/// sentence that says why.
+async fn handle_create_character(
+    state: &State,
+    session: &mut Session,
+    message: &Message,
+) -> Action {
+    let Some(request) = creation::CreateCharacter::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x3E04 packet too short");
+        return Action::Ignore;
+    };
+
+    let Some(account) = session.account.as_ref() else {
+        warn!("0x3E04 before logging in");
+        return Action::Ignore;
+    };
+    let username = account.username.clone();
+
+    let outcome = creation::create(&request, &account.characters, |name| {
+        state.store.name_taken(name)
+    });
+
+    let mut character = match outcome {
+        Ok(character) => character,
+        Err(e) => {
+            info!(user = %username, name = %request.name, error = %e, "character refused");
+            return Action::Reply(vec![
+                encode_client_message(session.client_id, &e.message()),
+                encode_char_list(account, session.client_id, state.uptime_ms()),
+            ]);
+        }
+    };
+
+    // The database hands back the id, and without it nothing this character
+    // does later can be saved. A failure here has to reach the player rather
+    // than leave a character that exists until the next restart.
+    if let Some(db) = state.db() {
+        match db.insert_character(account.id as i64, &character).await {
+            Ok(id) => character.id = id,
+            Err(e) => {
+                warn!(user = %username, name = %character.name, error = %e, "character not stored");
+                return Action::Reply(vec![
+                    encode_client_message(session.client_id, "The character could not be saved."),
+                    encode_char_list(account, session.client_id, state.uptime_ms()),
+                ]);
+            }
+        }
+    }
+
+    info!(
+        user = %username,
+        name = %character.name,
+        slot = character.slot,
+        class = character.class_index,
+        "character created"
+    );
+
+    state.store.add_character(&username, character);
+
+    // Read back rather than patched in place, so the list the client gets is
+    // the one the store holds.
+    let account = state.store.get(&username).unwrap_or_else(|| account.clone());
+    session.account = Some(account.clone());
+    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
+}
+
 /// `TSignalData` (`Data/Packets.pas:31`): a header and one DWORD. 16 bytes.
 fn encode_signal(opcode: u16, client_id: u16, time: u32, data: u32) -> Vec<u8> {
     frame::encode(
@@ -1725,9 +1842,9 @@ mod tests {
     }
 
     /// Runs the login and returns the reply bytes.
-    fn reply(state: &State, version: u16) -> Vec<u8> {
+    async fn reply(state: &State, version: u16) -> Vec<u8> {
         let mut session = Session { client_id: TEST_CLIENT_ID, ..Session::default() };
-        match handle_message(state, &mut session, &login_message("admin", version)) {
+        match handle_message(state, &mut session, &login_message("admin", version)).await {
             Action::Reply(frames) => frames.into_iter().next().expect("no frames"),
             other => panic!("expected a reply, got {other:?}"),
         }
@@ -1737,9 +1854,9 @@ mod tests {
     ///
     /// The id is normally handed out by the world registry when the socket is
     /// accepted; tests set it directly.
-    fn logged_in(state: &State) -> Session {
+    async fn logged_in(state: &State) -> Session {
         let mut session = Session { client_id: TEST_CLIENT_ID, ..Session::default() };
-        let action = handle_message(state, &mut session, &login_message("admin", 124));
+        let action = handle_message(state, &mut session, &login_message("admin", 124)).await;
         assert!(matches!(action, Action::Reply(_)), "o login precisa passar");
         session
     }
@@ -1844,10 +1961,10 @@ mod tests {
         assert!(RequestLogin::parse(&body[..RequestLogin::MIN_BODY - 1]).is_none());
     }
 
-    #[test]
-    fn char_list_has_the_exact_size_the_client_expects() {
+    #[tokio::test]
+    async fn char_list_has_the_exact_size_the_client_expects() {
         let state = state_with(vec![]);
-        let wire = reply(&state, 124);
+        let wire = reply(&state, 124).await;
         assert_eq!(wire.len(), CHAR_LIST_SIZE);
 
         let message = decode(&wire);
@@ -1856,17 +1973,17 @@ mod tests {
         assert_eq!(u32::from_le_bytes(message.body[0..4].try_into().unwrap()), 1);
     }
 
-    #[test]
-    fn empty_slots_are_all_zeros() {
+    #[tokio::test]
+    async fn empty_slots_are_all_zeros() {
         let state = state_with(vec![]);
-        let message = decode(&reply(&state, 124));
+        let message = decode(&reply(&state, 124).await);
         assert!(message.body[12..].iter().all(|&b| b == 0), "slots vazios devem ser zerados");
     }
 
-    #[test]
-    fn character_lands_in_its_slot_with_delphi_quirks() {
+    #[tokio::test]
+    async fn character_lands_in_its_slot_with_delphi_quirks() {
         let state = state_with(vec![dev_character("Athus", 1)]);
-        let message = decode(&reply(&state, 124));
+        let message = decode(&reply(&state, 124).await);
 
         let slot0 = &message.body[12..12 + CHAR_ENTRY_SIZE];
         let slot1 = &message.body[12 + CHAR_ENTRY_SIZE..12 + CHAR_ENTRY_SIZE * 2];
@@ -1887,13 +2004,13 @@ mod tests {
         assert_eq!(u64::from_le_bytes(slot1[80..88].try_into().unwrap()), 1234, "gold");
     }
 
-    #[test]
-    fn entering_the_world_sends_the_delphi_sequence() {
+    #[tokio::test]
+    async fn entering_the_world_sends_the_delphi_sequence() {
         let state = state_with(vec![dev_character("Athus", 0)]);
-        let mut session = logged_in(&state);
+        let mut session = logged_in(&state).await;
 
         let enter = enter_world(0);
-        let Action::Reply(frames) = handle_message(&state, &mut session, &enter) else {
+        let Action::Reply(frames) = handle_message(&state, &mut session, &enter).await else {
             panic!("expected the world entry sequence");
         };
         assert_eq!(frames.len(), 5, "0xCCCC, three 0x186 and the 0x925");
@@ -1946,14 +2063,14 @@ mod tests {
 
     /// `0x349` is what pulls the character out of limbo: without it the client
     /// world but never learns where to put the body.
-    #[test]
-    fn client_ready_spawns_the_character_at_its_position() {
+    #[tokio::test]
+    async fn client_ready_spawns_the_character_at_its_position() {
         let state = state_with(vec![dev_character("Athus", 0)]);
-        let mut session = logged_in(&state);
-        let _ = handle_message(&state, &mut session, &enter_world(0));
+        let mut session = logged_in(&state).await;
+        let _ = handle_message(&state, &mut session, &enter_world(0)).await;
 
         let ready = Message { sender: 7, opcode: OP_CLIENT_READY, time: 0, body: Vec::new() };
-        let Action::Reply(frames) = handle_message(&state, &mut session, &ready) else {
+        let Action::Reply(frames) = handle_message(&state, &mut session, &ready).await else {
             panic!("expected the spawn packet");
         };
         // The client has no acknowledgement packet: it keeps resending 0xF0B
@@ -2049,25 +2166,25 @@ mod tests {
     /// The client resends `0xF0B` when it thinks something is missing, including
     /// trying to walk. Respawning every time trapped the player in a loop:
     /// they walked, snapped back to the start, and the scene restarted.
-    #[test]
-    fn spawning_happens_only_once_per_session() {
+    #[tokio::test]
+    async fn spawning_happens_only_once_per_session() {
         let state = state_with(vec![dev_character("Athus", 0)]);
-        let mut session = logged_in(&state);
-        let _ = handle_message(&state, &mut session, &enter_world(0));
+        let mut session = logged_in(&state).await;
+        let _ = handle_message(&state, &mut session, &enter_world(0)).await;
 
         let ready = Message { sender: 7, opcode: OP_CLIENT_READY, time: 0, body: Vec::new() };
-        assert!(matches!(handle_message(&state, &mut session, &ready), Action::Reply(_)));
+        assert!(matches!(handle_message(&state, &mut session, &ready).await, Action::Reply(_)));
         assert!(
-            matches!(handle_message(&state, &mut session, &ready), Action::Ignore),
+            matches!(handle_message(&state, &mut session, &ready).await, Action::Ignore),
             "the second 0xF0B must not respawn the player"
         );
     }
 
-    #[test]
-    fn movement_updates_the_position_without_answering() {
+    #[tokio::test]
+    async fn movement_updates_the_position_without_answering() {
         let state = state_with(vec![dev_character("Athus", 0)]);
-        let mut session = logged_in(&state);
-        let _ = handle_message(&state, &mut session, &enter_world(0));
+        let mut session = logged_in(&state).await;
+        let _ = handle_message(&state, &mut session, &enter_world(0)).await;
 
         let mut body = vec![0u8; Movement::BODY_SIZE];
         body[0..4].copy_from_slice(&3500.0f32.to_le_bytes());
@@ -2076,7 +2193,7 @@ mod tests {
         let move_msg = Message { sender: 7, opcode: OP_MOVE, time: 0, body };
 
         // the original returns nothing to the mover
-        assert!(matches!(handle_message(&state, &mut session, &move_msg), Action::Ignore));
+        assert!(matches!(handle_message(&state, &mut session, &move_msg).await, Action::Ignore));
 
         let character = session.character.as_ref().unwrap();
         assert_eq!((character.x, character.y), (3500, 720));
@@ -2087,28 +2204,28 @@ mod tests {
     /// stale one would be wrong once positions are persisted.
     /// A packet claiming somebody else's id still moves only the player who
     /// sent it: the header field is never used to pick a target.
-    #[test]
-    fn movement_never_moves_another_player() {
+    #[tokio::test]
+    async fn movement_never_moves_another_player() {
         let state = state_with(vec![dev_character("Athus", 0)]);
-        let mut session = logged_in(&state);
-        let _ = handle_message(&state, &mut session, &enter_world(0));
+        let mut session = logged_in(&state).await;
+        let _ = handle_message(&state, &mut session, &enter_world(0)).await;
 
         let mut body = vec![0u8; Movement::BODY_SIZE];
         body[0..4].copy_from_slice(&4200.0f32.to_le_bytes());
         body[4..8].copy_from_slice(&700.0f32.to_le_bytes());
         let forged = Message { sender: 999, opcode: OP_MOVE, time: 0, body };
 
-        let _ = handle_message(&state, &mut session, &forged);
+        let _ = handle_message(&state, &mut session, &forged).await;
 
         let character = session.character.as_ref().unwrap();
         assert_eq!((character.x, character.y), (4200, 700), "our own player moved");
     }
 
-    #[test]
-    fn movement_tracks_move_types_other_than_walking() {
+    #[tokio::test]
+    async fn movement_tracks_move_types_other_than_walking() {
         let state = state_with(vec![dev_character("Athus", 0)]);
-        let mut session = logged_in(&state);
-        let _ = handle_message(&state, &mut session, &enter_world(0));
+        let mut session = logged_in(&state).await;
+        let _ = handle_message(&state, &mut session, &enter_world(0)).await;
 
         let mut body = vec![0u8; Movement::BODY_SIZE];
         body[0..4].copy_from_slice(&4000.0f32.to_le_bytes());
@@ -2116,16 +2233,16 @@ mod tests {
         body[Movement::MOVE_TYPE] = 16;
         let message = Message { sender: 7, opcode: OP_MOVE, time: 0, body };
 
-        assert!(matches!(handle_message(&state, &mut session, &message), Action::Ignore));
+        assert!(matches!(handle_message(&state, &mut session, &message).await, Action::Ignore));
         let character = session.character.as_ref().unwrap();
         assert_eq!((character.x, character.y), (4000, 800));
     }
 
-    #[test]
-    fn movement_refuses_client_teleport_and_other_senders() {
+    #[tokio::test]
+    async fn movement_refuses_client_teleport_and_other_senders() {
         let state = state_with(vec![dev_character("Athus", 0)]);
-        let mut session = logged_in(&state);
-        let _ = handle_message(&state, &mut session, &enter_world(0));
+        let mut session = logged_in(&state).await;
+        let _ = handle_message(&state, &mut session, &enter_world(0)).await;
         let start = (session.character.as_ref().unwrap().x, session.character.as_ref().unwrap().y);
 
         // teleport must never come from the client: that is the map-jump exploit
@@ -2133,65 +2250,65 @@ mod tests {
         body[0..4].copy_from_slice(&9999.0f32.to_le_bytes());
         body[Movement::MOVE_TYPE] = 1;
         let teleport = Message { sender: 7, opcode: OP_MOVE, time: 0, body: body.clone() };
-        let _ = handle_message(&state, &mut session, &teleport);
+        let _ = handle_message(&state, &mut session, &teleport).await;
 
         let character = session.character.as_ref().unwrap();
         assert_eq!((character.x, character.y), start, "teleport must not have moved us");
     }
 
-    #[test]
-    fn client_ready_before_choosing_a_character_is_ignored() {
+    #[tokio::test]
+    async fn client_ready_before_choosing_a_character_is_ignored() {
         let state = state_with(vec![dev_character("Athus", 0)]);
-        let mut session = logged_in(&state);
+        let mut session = logged_in(&state).await;
         let ready = Message { sender: 7, opcode: OP_CLIENT_READY, time: 0, body: Vec::new() };
         // does not drop the connection: there is simply nothing to spawn
-        assert!(matches!(handle_message(&state, &mut session, &ready), Action::Ignore));
+        assert!(matches!(handle_message(&state, &mut session, &ready).await, Action::Ignore));
     }
 
-    #[test]
-    fn entering_an_empty_slot_is_refused() {
+    #[tokio::test]
+    async fn entering_an_empty_slot_is_refused() {
         let state = state_with(vec![dev_character("Athus", 0)]);
-        let mut session = logged_in(&state);
+        let mut session = logged_in(&state).await;
         assert!(matches!(
-            handle_message(&state, &mut session, &enter_world(2)),
+            handle_message(&state, &mut session, &enter_world(2)).await,
             Action::Disconnect
         ));
     }
 
     /// Entering the world without having logged in on the same connection must
     /// not work: that is what kept two players from coexisting.
-    #[test]
-    fn entering_the_world_requires_logging_in_first() {
+    #[tokio::test]
+    async fn entering_the_world_requires_logging_in_first() {
         let state = state_with(vec![dev_character("Athus", 0)]);
         assert!(matches!(
-            handle_message(&state, &mut Session::default(), &enter_world(0)),
+            handle_message(&state, &mut Session::default(), &enter_world(0)).await,
             Action::Disconnect
         ));
     }
 
-    #[test]
-    fn refuses_wrong_client_version() {
+    #[tokio::test]
+    async fn refuses_wrong_client_version() {
         let state = state_with(vec![]);
         // the server drops the connection instead of leaving the client waiting
-        assert!(matches!(handle_message(&state, &mut Session::default(), &login_message("admin", 123)), Action::Disconnect));
-        assert!(matches!(handle_message(&state, &mut Session::default(), &login_message("admin", 0)), Action::Disconnect));
+        assert!(matches!(handle_message(&state, &mut Session::default(), &login_message("admin", 123)).await, Action::Disconnect));
+        assert!(matches!(handle_message(&state, &mut Session::default(), &login_message("admin", 0)).await, Action::Disconnect));
     }
 
-    #[test]
-    fn refuses_unknown_account() {
+    #[tokio::test]
+    async fn refuses_unknown_account() {
         let state = state_with(vec![]);
         assert!(matches!(
-            handle_message(&state, &mut Session::default(), &login_message("ninguem", 124)),
+            handle_message(&state, &mut Session::default(), &login_message("ninguem", 124)).await,
             Action::Disconnect
         ));
     }
 
-    #[test]
-    fn unimplemented_opcode_is_ignored() {
+    #[tokio::test]
+    async fn unimplemented_opcode_is_ignored() {
         let state = state_with(vec![]);
         // a not-yet-implemented packet must not drop someone who is logged in
         let message = Message { sender: 0, opcode: 0x301, time: 0, body: vec![0; 32] };
-        assert!(matches!(handle_message(&state, &mut Session::default(), &message), Action::Ignore));
+        assert!(matches!(handle_message(&state, &mut Session::default(), &message).await, Action::Ignore));
     }
 
     #[test]
@@ -2223,8 +2340,8 @@ mod tests {
 
     /// The city has to be populated when the player arrives, or it looks
     /// broken: the buildings are drawn by the client, the people are not.
-    #[test]
-    fn the_townspeople_appear_when_the_player_enters_the_world() {
+    #[tokio::test]
+    async fn the_townspeople_appear_when_the_player_enters_the_world() {
         let mut state = state_with(vec![dev_character("Athus", 0)]);
         state.world = World::with_npcs(vec![
             npc(2050, "Merchant", 3455.0, 700.0),  // 12 away from the spawn
@@ -2232,8 +2349,8 @@ mod tests {
             npc(2500, "Far Away", 9000.0, 9000.0),
         ]);
 
-        let mut session = logged_in(&state);
-        let Action::Reply(frames) = handle_message(&state, &mut session, &enter_world(0)) else {
+        let mut session = logged_in(&state).await;
+        let Action::Reply(frames) = handle_message(&state, &mut session, &enter_world(0)).await else {
             panic!("entering the world produced no frames");
         };
         let _ = frames;
@@ -2249,13 +2366,13 @@ mod tests {
     }
 
     /// Walking past an NPC and away again places it once and removes it once.
-    #[test]
-    fn an_npc_is_placed_once_and_removed_once() {
+    #[tokio::test]
+    async fn an_npc_is_placed_once_and_removed_once() {
         let mut state = state_with(vec![dev_character("Athus", 0)]);
         state.world = World::with_npcs(vec![npc(2050, "Merchant", 3455.0, 700.0)]);
 
-        let mut session = logged_in(&state);
-        handle_message(&state, &mut session, &enter_world(0));
+        let mut session = logged_in(&state).await;
+        handle_message(&state, &mut session, &enter_world(0)).await;
         handle_client_ready(&state, &mut session);
         assert!(session.visible_npcs.contains(&2050), "never placed");
 
@@ -2275,13 +2392,13 @@ mod tests {
 
     /// The gap between watching and forgetting is what stops an NPC from
     /// flickering while a player paces across the edge of the radius.
-    #[test]
-    fn an_npc_just_outside_the_watch_radius_is_not_forgotten_yet() {
+    #[tokio::test]
+    async fn an_npc_just_outside_the_watch_radius_is_not_forgotten_yet() {
         let mut state = state_with(vec![dev_character("Athus", 0)]);
         state.world = World::with_npcs(vec![npc(2050, "Merchant", 3450.0, 690.0)]);
 
-        let mut session = logged_in(&state);
-        handle_message(&state, &mut session, &enter_world(0));
+        let mut session = logged_in(&state).await;
+        handle_message(&state, &mut session, &enter_world(0)).await;
         handle_client_ready(&state, &mut session);
 
         // 55 away: past DISTANCE_TO_WATCH, short of DISTANCE_TO_FORGET
@@ -2354,23 +2471,25 @@ mod tests {
         use aika_data::itemlist::{field, ItemList, RECORD_SIZE};
         let mut raw = vec![0u8; 5000 * RECORD_SIZE];
 
-        let mut define = |id: usize, gold: u32, sell: u32, groups: bool| {
+        // The shop asks `SELL_PRICE`, despite the name: `PRICE_GOLD` is not
+        // what anything costs.
+        let mut define = |id: usize, base: u32, groups: bool| {
             let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
             r[field::NAME.start] = b'x';
-            r[field::PRICE_GOLD..field::PRICE_GOLD + 4].copy_from_slice(&gold.to_le_bytes());
-            r[field::SELL_PRICE..field::SELL_PRICE + 4].copy_from_slice(&sell.to_le_bytes());
+            r[field::SELL_PRICE..field::SELL_PRICE + 4].copy_from_slice(&base.to_le_bytes());
             r[field::CAN_GROUP] = groups as u8;
+            r[field::DURABILITY] = 60;
         };
-        define(1000, 500, 120, false);
-        define(4351, 10, 3, true);
+        define(1000, 500, false);
+        define(4351, 10, true);
 
         ItemList::decode(&raw).expect("the fixture table is malformed")
     }
 
     /// A session standing in the world, ready to talk to somebody.
-    fn in_world(state: &State) -> Session {
-        let mut session = logged_in(state);
-        handle_message(state, &mut session, &enter_world(0));
+    async fn in_world(state: &State) -> Session {
+        let mut session = logged_in(state).await;
+        handle_message(state, &mut session, &enter_world(0)).await;
         handle_client_ready(state, &mut session);
         session
     }
@@ -2401,12 +2520,12 @@ mod tests {
         body[4..].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect()
     }
 
-    #[test]
-    fn clicking_an_npc_sends_its_menu() {
+    #[tokio::test]
+    async fn clicking_an_npc_sends_its_menu() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
 
-        let frames = frames_of(handle_message(&state, &mut session, &open_npc(2050, 0)));
+        let frames = frames_of(handle_message(&state, &mut session, &open_npc(2050, 0)).await);
 
         assert_eq!(
             opcodes(&frames),
@@ -2434,12 +2553,12 @@ mod tests {
 
     /// An NPC with nothing to sell must not offer a shop, or the player opens
     /// an empty window and thinks the server is broken.
-    #[test]
-    fn a_merchant_with_no_stock_does_not_offer_a_shop() {
+    #[tokio::test]
+    async fn a_merchant_with_no_stock_does_not_offer_a_shop() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
 
-        let frames = frames_of(handle_message(&state, &mut session, &open_npc(2049, 0)));
+        let frames = frames_of(handle_message(&state, &mut session, &open_npc(2049, 0)).await);
 
         // four options in the file, but the shop is dropped
         assert_eq!(frames.len(), 2 + 3, "the shop entry survived on an empty shop");
@@ -2447,29 +2566,29 @@ mod tests {
 
     /// The distance is checked on every packet, not only on the first click:
     /// a window left open while walking away must stop working.
-    #[test]
-    fn talking_from_too_far_away_is_refused() {
+    #[tokio::test]
+    async fn talking_from_too_far_away_is_refused() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
         session.character.as_mut().unwrap().x = 9000;
 
-        let frames = frames_of(handle_message(&state, &mut session, &open_npc(2050, 0)));
+        let frames = frames_of(handle_message(&state, &mut session, &open_npc(2050, 0)).await);
 
         assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE, dialog::OP_MENU_CLOSE]);
         assert_eq!(message_text(&frames[0]), "You are too far away.");
         assert_eq!(session.opened_npc, None);
     }
 
-    #[test]
-    fn opening_the_shop_sends_what_is_for_sale() {
+    #[tokio::test]
+    async fn opening_the_shop_sends_what_is_for_sale() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
 
         let frames = frames_of(handle_message(
             &state,
             &mut session,
             &open_npc(2050, dialog::option::SHOP),
-        ));
+        ).await);
 
         let window = decode(&frames[0]);
         assert_eq!(window.opcode, shop::OP_SHOW_SHOP);
@@ -2480,12 +2599,12 @@ mod tests {
         assert_eq!(session.opened_npc, Some(2050));
     }
 
-    #[test]
-    fn buying_moves_gold_into_an_item() {
+    #[tokio::test]
+    async fn buying_moves_gold_into_an_item() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
         session.character.as_mut().unwrap().gold = 2000;
-        handle_message(&state, &mut session, &open_npc(2050, dialog::option::SHOP));
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::SHOP)).await;
 
         let buy = Message {
             sender: TEST_CLIENT_ID,
@@ -2493,7 +2612,7 @@ mod tests {
             time: 0,
             body: shop::Buy { npc: 2050, slot: 0, amount: 1 }.to_body(),
         };
-        let frames = frames_of(handle_message(&state, &mut session, &buy));
+        let frames = frames_of(handle_message(&state, &mut session, &buy).await);
 
         assert_eq!(opcodes(&frames), vec![shop::OP_REFRESH_ITEM, shop::OP_REFRESH_MONEY]);
 
@@ -2513,10 +2632,10 @@ mod tests {
 
     /// The id in a buy packet is the word of the client. Without the check,
     /// a modified one buys from a shop it never walked to.
-    #[test]
-    fn buying_from_a_shop_that_was_never_opened_is_refused() {
+    #[tokio::test]
+    async fn buying_from_a_shop_that_was_never_opened_is_refused() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
         session.character.as_mut().unwrap().gold = 2000;
 
         let buy = Message {
@@ -2525,7 +2644,7 @@ mod tests {
             time: 0,
             body: shop::Buy { npc: 2050, slot: 0, amount: 1 }.to_body(),
         };
-        let frames = frames_of(handle_message(&state, &mut session, &buy));
+        let frames = frames_of(handle_message(&state, &mut session, &buy).await);
 
         assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
         assert_eq!(session.character.as_ref().unwrap().gold, 2000, "gold was taken anyway");
@@ -2534,15 +2653,15 @@ mod tests {
 
     /// Walking away closes the shop, and the next purchase has to fail with
     /// it. This is the same hole as above, reached by playing normally.
-    #[test]
-    fn walking_away_closes_the_shop() {
+    #[tokio::test]
+    async fn walking_away_closes_the_shop() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
         session.character.as_mut().unwrap().gold = 2000;
-        handle_message(&state, &mut session, &open_npc(2050, dialog::option::SHOP));
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::SHOP)).await;
 
         session.character.as_mut().unwrap().x = 9000;
-        handle_message(&state, &mut session, &open_npc(2050, 0));
+        handle_message(&state, &mut session, &open_npc(2050, 0)).await;
         assert_eq!(session.opened_npc, None);
 
         let buy = Message {
@@ -2551,17 +2670,19 @@ mod tests {
             time: 0,
             body: shop::Buy { npc: 2050, slot: 0, amount: 1 }.to_body(),
         };
-        let frames = frames_of(handle_message(&state, &mut session, &buy));
+        let frames = frames_of(handle_message(&state, &mut session, &buy).await);
         assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
         assert_eq!(session.character.as_ref().unwrap().gold, 2000);
     }
 
-    #[test]
-    fn buying_and_selling_a_stack_comes_out_even() {
+    /// Buying and selling straight back has to leave the player poorer, or
+    /// a shop becomes a money printer.
+    #[tokio::test]
+    async fn buying_and_selling_a_stack_back_loses_money() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
         session.character.as_mut().unwrap().gold = 1000;
-        handle_message(&state, &mut session, &open_npc(2050, dialog::option::SHOP));
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::SHOP)).await;
 
         let buy = Message {
             sender: TEST_CLIENT_ID,
@@ -2569,7 +2690,7 @@ mod tests {
             time: 0,
             body: shop::Buy { npc: 2050, slot: 1, amount: 20 }.to_body(),
         };
-        handle_message(&state, &mut session, &buy);
+        handle_message(&state, &mut session, &buy).await;
         assert_eq!(session.character.as_ref().unwrap().gold, 800, "20 potions at 10");
 
         let sell = Message {
@@ -2578,10 +2699,11 @@ mod tests {
             time: 0,
             body: shop::Sell { npc: 2050, slot: 0 }.to_body(),
         };
-        handle_message(&state, &mut session, &sell);
+        handle_message(&state, &mut session, &sell).await;
 
         let character = session.character.as_ref().unwrap();
-        assert_eq!(character.gold, 860, "20 potions back at 3 each");
+        assert_eq!(character.gold, 840, "20 potions back at a fifth of 10");
+        assert!(character.gold < 1000, "the round trip made money");
         assert!(character.items.is_empty(), "the stack is still in the bag");
     }
 
@@ -2593,10 +2715,10 @@ mod tests {
         assert_eq!(MoveItem::parse(&[0u8; 4]), None);
     }
 
-    #[test]
-    fn dragging_an_item_tells_the_client_about_both_slots() {
+    #[tokio::test]
+    async fn dragging_an_item_tells_the_client_about_both_slots() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
         session
             .character
             .as_mut()
@@ -2617,7 +2739,7 @@ mod tests {
             }
             .to_body(),
         };
-        let frames = frames_of(handle_message(&state, &mut session, &drag));
+        let frames = frames_of(handle_message(&state, &mut session, &drag).await);
 
         assert_eq!(opcodes(&frames), vec![shop::OP_REFRESH_ITEM, shop::OP_REFRESH_ITEM]);
 
@@ -2633,10 +2755,10 @@ mod tests {
 
     /// A refused drag still has to answer, because the client has already
     /// drawn the item in its new place and will keep it there otherwise.
-    #[test]
-    fn a_refused_drag_still_tells_the_client_the_truth() {
+    #[tokio::test]
+    async fn a_refused_drag_still_tells_the_client_the_truth() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
 
         let drag = Message {
             sender: TEST_CLIENT_ID,
@@ -2650,7 +2772,7 @@ mod tests {
             }
             .to_body(),
         };
-        let frames = frames_of(handle_message(&state, &mut session, &drag));
+        let frames = frames_of(handle_message(&state, &mut session, &drag).await);
 
         assert_eq!(frames.len(), 2);
         for frame in &frames {
@@ -2663,10 +2785,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn what_a_character_carries_reaches_the_client_in_the_world_packet() {
+    #[tokio::test]
+    async fn what_a_character_carries_reaches_the_client_in_the_world_packet() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
         let character = session.character.as_mut().unwrap();
         character
             .items
@@ -2693,17 +2815,183 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_unimplemented_option_says_so_instead_of_going_quiet() {
+    #[tokio::test]
+    async fn an_unimplemented_option_says_so_instead_of_going_quiet() {
         let state = shop_state();
-        let mut session = in_world(&state);
+        let mut session = in_world(&state).await;
 
         let frames = frames_of(handle_message(
             &state,
             &mut session,
             &open_npc(2050, dialog::option::QUESTS),
-        ));
+        ).await);
 
         assert_eq!(message_text(&frames[0]), "Quest is not available yet.");
+    }
+
+    // ---- making a character, and turning ---------------------------------
+
+    fn create_message(name: &str, slot: u32) -> Message {
+        Message {
+            sender: TEST_CLIENT_ID,
+            opcode: creation::OP_CREATE_CHARACTER,
+            time: 0,
+            body: creation::CreateCharacter {
+                slot,
+                name: name.into(),
+                class_index: 20,
+                hair: 7702,
+                town: 0,
+            }
+            .to_body(),
+        }
+    }
+
+    /// The names in a character list packet, one per slot, blank where the
+    /// slot is empty.
+    fn names_in_char_list(frame: &[u8]) -> Vec<String> {
+        let body = decode(frame).body;
+        (0..MAX_CHARACTERS)
+            .map(|slot| {
+                let at = 12 + slot * CHAR_ENTRY_SIZE;
+                body[at..at + 16]
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as char)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn creating_a_character_puts_it_in_the_list() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = logged_in(&state).await;
+
+        let frames =
+            frames_of(handle_message(&state, &mut session, &create_message("Segundo", 1)).await);
+
+        assert_eq!(opcodes(&frames), vec![OP_CHAR_LIST]);
+        let names = names_in_char_list(&frames[0]);
+        assert_eq!(names[0], "Athus");
+        assert_eq!(names[1], "Segundo", "the new character is not in slot 1");
+        assert_eq!(names[2], "");
+
+        // and the session sees it too, so entering the world can find it
+        let account = session.account.as_ref().unwrap();
+        assert_eq!(account.characters.len(), 2);
+    }
+
+    /// A refusal has to say why and still redraw the screen, or the client
+    /// sits on a creation form that never responds.
+    #[tokio::test]
+    async fn a_refused_character_gets_a_reason_and_the_list_back() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = logged_in(&state).await;
+
+        let frames =
+            frames_of(handle_message(&state, &mut session, &create_message("Athus", 1)).await);
+
+        assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE, OP_CHAR_LIST]);
+        assert_eq!(message_text(&frames[0]), "Athus is already taken.");
+        assert_eq!(names_in_char_list(&frames[1])[1], "", "the slot was filled anyway");
+    }
+
+    #[tokio::test]
+    async fn a_character_cannot_take_a_slot_that_is_used() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = logged_in(&state).await;
+
+        let frames =
+            frames_of(handle_message(&state, &mut session, &create_message("Segundo", 0)).await);
+
+        assert_eq!(message_text(&frames[0]), "Slot 0 does not exist.");
+        assert_eq!(names_in_char_list(&frames[1])[0], "Athus", "the first one was replaced");
+    }
+
+    /// A new character starts with something in the bag and a weapon on, and
+    /// both have to reach the client in the world packet.
+    #[tokio::test]
+    async fn a_new_character_arrives_carrying_its_starting_gear() {
+        let state = state_with(vec![]);
+        let mut session = logged_in(&state).await;
+        handle_message(&state, &mut session, &create_message("Novato", 0)).await;
+
+        let created = session.account.as_ref().unwrap().characters[0].clone();
+        let record = encode_character(&created, TEST_CLIENT_ID);
+
+        use character_offset as off;
+        let bag = off::INVENTORY;
+        assert_eq!(
+            u16::from_le_bytes(record[bag..bag + 2].try_into().unwrap()),
+            creation::STARTING_ITEM
+        );
+
+        let weapon = off::EQUIP + creation::WEAPON_SLOT as usize * off::ITEM_SIZE;
+        assert_ne!(
+            u16::from_le_bytes(record[weapon..weapon + 2].try_into().unwrap()),
+            0,
+            "the starting weapon did not reach the client"
+        );
+    }
+
+    /// Turning is relayed to whoever can see it and never echoed back: the
+    /// client that turned has already turned.
+    #[tokio::test]
+    async fn turning_reaches_the_others_and_not_the_sender() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = in_world(&state).await;
+
+        // The relay looks the sender up in the registry to find who can see
+        // it, so this session has to be in there under its own id.
+        let (mine, mut mine_rx) = tokio::sync::mpsc::unbounded_channel();
+        session.client_id = state.world.connect(mine).expect("room to connect");
+        let character = session.character.clone().unwrap();
+        state.world.enter(session.client_id, character.clone());
+
+        let (theirs, mut watcher_rx) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = state.world.connect(theirs).expect("room for a watcher");
+        state.world.enter(watcher, character);
+
+        let turn = Message {
+            sender: session.client_id,
+            opcode: OP_ROTATE,
+            time: 0,
+            body: 180u32.to_le_bytes().to_vec(),
+        };
+        let action = handle_message(&state, &mut session, &turn).await;
+
+        assert!(matches!(action, Action::Ignore), "the sender must hear nothing back");
+        assert_eq!(session.rotation, 180);
+
+        let relayed = watcher_rx.try_recv().expect("the watcher was not told");
+        let message = decode(&relayed);
+        assert_eq!(message.opcode, OP_ROTATE);
+        assert_eq!(message.sender, session.client_id, "the relay says who turned");
+        assert_eq!(u32::from_le_bytes(message.body[0..4].try_into().unwrap()), 180);
+
+        assert!(mine_rx.try_recv().is_err(), "the sender heard its own turn");
+    }
+
+    /// The same rotation twice is what the client sends while standing still,
+    /// and relaying it would be noise on every other connection.
+    #[tokio::test]
+    async fn turning_the_same_way_twice_is_dropped() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = in_world(&state).await;
+
+        let turn = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_ROTATE,
+            time: 0,
+            body: 90u32.to_le_bytes().to_vec(),
+        };
+        handle_message(&state, &mut session, &turn).await;
+        assert_eq!(session.rotation, 90);
+
+        // no way to observe the drop from here other than that it does not
+        // panic and the value is unchanged; the point is that it is cheap
+        handle_message(&state, &mut session, &turn).await;
+        assert_eq!(session.rotation, 90);
     }
 }

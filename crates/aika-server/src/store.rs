@@ -290,6 +290,30 @@ impl AccountStore {
         false
     }
 
+    /// Whether any account already has a character by this name. Names are
+    /// unique across the whole server, not per account, which is what the
+    /// database enforces too.
+    pub fn name_taken(&self, name: &str) -> bool {
+        let accounts = self.accounts.lock().unwrap();
+        accounts
+            .values()
+            .flat_map(|a| a.characters.iter())
+            .any(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Adds a freshly created character to the in-memory copy, so the list
+    /// the client is sent next shows it without a reload.
+    pub fn add_character(&self, username: &str, character: Character) -> bool {
+        let mut accounts = self.accounts.lock().unwrap();
+        let Some(account) = accounts.get_mut(&username.to_ascii_lowercase()) else {
+            return false;
+        };
+        account.characters.retain(|c| c.slot != character.slot);
+        account.characters.push(character);
+        account.characters.sort_by_key(|c| c.slot);
+        true
+    }
+
     pub fn get(&self, username: &str) -> Option<Account> {
         let key = username.to_ascii_lowercase();
         self.accounts.lock().unwrap().get(&key).cloned()

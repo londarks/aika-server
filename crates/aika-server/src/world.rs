@@ -46,6 +46,10 @@ pub struct Presence {
     /// Set once the player actually enters the world. Until then they are
     /// connected but invisible to everyone.
     pub character: Option<Character>,
+    /// Which way the player is facing. It lives here rather than on the
+    /// character because it is worth nothing after a logout: the client sends
+    /// it again as soon as the mouse moves.
+    pub rotation: u32,
     outbox: Outbox,
 }
 
@@ -104,7 +108,7 @@ impl World {
         let client_id = (1..=MAX_PLAYERS).find(|id| !players.contains_key(id))?;
         players.insert(
             client_id,
-            Presence { client_id, account_id: 0, character: None, outbox },
+            Presence { client_id, account_id: 0, character: None, rotation: 0, outbox },
         );
         Some(client_id)
     }
@@ -124,6 +128,12 @@ impl World {
     pub fn enter(&self, client_id: u16, character: Character) {
         if let Some(presence) = self.players.lock().unwrap().get_mut(&client_id) {
             presence.character = Some(character);
+        }
+    }
+
+    pub fn turn(&self, client_id: u16, rotation: u32) {
+        if let Some(presence) = self.players.lock().unwrap().get_mut(&client_id) {
+            presence.rotation = rotation;
         }
     }
 

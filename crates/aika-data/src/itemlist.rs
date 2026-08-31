@@ -60,6 +60,10 @@ pub mod field {
     pub const TYPE_TRADE: usize = 393;
     pub const DURABILITY: usize = 406;
     pub const MAX_LEVEL: usize = 432;
+    /// `TypePriceItem`: the id of an item this one is paid for with, instead
+    /// of any currency. Zero when it is bought with money.
+    pub const PRICE_ITEM: usize = 440;
+    pub const PRICE_ITEM_VALUE: usize = 442;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -127,6 +131,16 @@ impl ItemDef {
         u32le(&self.raw, field::PRICE_HONOR)
     }
 
+    /// The item this one is paid for with, instead of money, and how many.
+    /// Zero means it is bought with a currency.
+    pub fn price_item(&self) -> u16 {
+        u16le(&self.raw, field::PRICE_ITEM)
+    }
+
+    pub fn price_item_value(&self) -> u16 {
+        u16le(&self.raw, field::PRICE_ITEM_VALUE)
+    }
+
     pub fn price_medal(&self) -> u32 {
         u32le(&self.raw, field::PRICE_MEDAL)
     }
@@ -137,7 +151,15 @@ impl ItemDef {
 
     /// What a shop pays for it. The original divides this further depending on
     /// the item type before paying out.
-    pub fn sell_price(&self) -> u32 {
+    /// `SellPrince` in the original, and despite the name it is **the price
+    /// the shop asks**: `GetBuyItemPrice` sets a gold purchase to
+    /// `SellPrince * quantity` (`Functions/ItemFunctions.pas:243`). It is also
+    /// the base the sell-back is divided down from, which is why it is called
+    /// a base price here rather than either.
+    ///
+    /// The field actually named `PriceGold` is *not* what an item costs; it
+    /// only travels as a secondary value beside a price in medals.
+    pub fn base_price(&self) -> u32 {
         u32le(&self.raw, field::SELL_PRICE)
     }
 

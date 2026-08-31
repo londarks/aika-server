@@ -53,8 +53,8 @@ fn count(path: &str) -> Fallible {
     let defined = list.defined().count();
     println!("{} ids in the table, {defined} of them defined", list.len());
 
-    let sellable = list.defined().filter(|(_, i)| i.price_gold() > 0).count();
-    println!("{sellable} have a gold price");
+    let sellable = list.defined().filter(|(_, i)| i.base_price() > 0).count();
+    println!("{sellable} have a price");
     Ok(())
 }
 
@@ -73,11 +73,25 @@ fn show(path: &str, id: usize) -> Fallible {
     println!("  type {}  rarity {}  trade {}", item.item_type(), item.rarity(), item.trade_kind());
     println!("  level {}  max level {}", item.level(), item.max_level());
     println!(
-        "  price   gold {}  honor {}  medal {}  sells for {}",
-        item.price_gold(),
+        "  costs   {}",
+        match () {
+            _ if item.price_item() > 0 => format!(
+                "{} of item {}",
+                item.price_item_value(),
+                item.price_item()
+            ),
+            _ if item.price_honor() > 0 && item.base_price() == 0 =>
+                format!("{} honor", item.price_honor()),
+            _ if item.price_medal() > 0 => format!("{} medals", item.price_medal()),
+            _ => format!("{} gold", item.base_price()),
+        }
+    );
+    println!(
+        "  fields  base {}  honor {}  medal {}  price_gold {}",
+        item.base_price(),
         item.price_honor(),
         item.price_medal(),
-        item.sell_price()
+        item.price_gold()
     );
     println!(
         "  stats   atk {} def {} matk {} mdef {} hp {} mp {}",
@@ -102,7 +116,7 @@ fn find(path: &str, text: &str) -> Fallible {
         if name.to_lowercase().contains(&needle)
             || item.name_english().to_lowercase().contains(&needle)
         {
-            println!("[{id:>6}] {:<40} gold {}", name, item.price_gold());
+            println!("[{id:>6}] {:<40} {} gold", name, item.base_price());
             found += 1;
             if found == 40 {
                 println!("...");

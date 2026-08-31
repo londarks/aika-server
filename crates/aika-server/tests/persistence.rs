@@ -114,8 +114,9 @@ fn item_table() -> ItemList {
     let mut raw = vec![0u8; (SWORD as usize + 1) * RECORD_SIZE];
     let r = &mut raw[SWORD as usize * RECORD_SIZE..];
     r[field::NAME.start] = b'x';
-    r[field::PRICE_GOLD..field::PRICE_GOLD + 4].copy_from_slice(&SWORD_PRICE.to_le_bytes());
-    r[field::SELL_PRICE..field::SELL_PRICE + 4].copy_from_slice(&60u32.to_le_bytes());
+    // One field is both the asking price and the base for the resale.
+    r[field::SELL_PRICE..field::SELL_PRICE + 4].copy_from_slice(&SWORD_PRICE.to_le_bytes());
+    r[field::DURABILITY] = 60;
     ItemList::decode(&raw).expect("the fixture table is malformed")
 }
 
@@ -160,12 +161,19 @@ async fn token_for(web: SocketAddr) -> String {
 struct GameClient {
     stream: TcpStream,
     reader: FrameReader,
+    /// The selection screen the server sent on connecting. Kept because
+    /// asking for it a second time would wait forever: the server sends one
+    /// when it has something to say, not when it is asked.
+    char_list: Option<Message>,
 }
 
 impl GameClient {
     async fn join(addr: SocketAddr, token: &str) -> Self {
-        let mut client =
-            Self { stream: TcpStream::connect(addr).await.unwrap(), reader: FrameReader::new() };
+        let mut client = Self {
+            stream: TcpStream::connect(addr).await.unwrap(),
+            reader: FrameReader::new(),
+            char_list: None,
+        };
         let body = RequestLogin {
             account_id: 1,
             username: "admin".into(),
@@ -174,8 +182,13 @@ impl GameClient {
         }
         .to_body();
         client.send(OP_REQUEST_LOGIN, body).await;
-        client.expect(OP_CHAR_LIST).await;
+        client.char_list = Some(client.expect(OP_CHAR_LIST).await);
         client
+    }
+
+    /// The selection screen from connecting.
+    fn char_list(&self) -> &Message {
+        self.char_list.as_ref().expect("no character list was received")
     }
 
     /// Picks slot 0 and reports the scene as loaded, which is what makes the
@@ -433,4 +446,92 @@ async fn an_item_thrown_away_stays_thrown_away() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// A character made on the selection screen has to exist after a restart, or
+/// the player creates it again every session.
+#[tokio::test]
+async fn a_created_character_survives_a_restart() {
+    let path = fresh_database_path("created-character");
+
+    let first = spawn_servers(&path).await;
+    let token = token_for(first.web).await;
+    let mut client = GameClient::join(first.game, &token).await;
+
+    let request = aika_server::creation::CreateCharacter {
+        slot: 1,
+        name: "Segundo".into(),
+        class_index: 40,
+        hair: 7710,
+        town: 1,
+    };
+    client.send(aika_server::creation::OP_CREATE_CHARACTER, request.to_body()).await;
+    let list = client.expect(OP_CHAR_LIST).await;
+
+    // slot 1 of the list the client is sent back
+    let name = name_in_slot(&list.body, 1);
+    assert_eq!(name, "Segundo", "the new character is not on the selection screen");
+    drop(client);
+
+    // A different server, sharing nothing but the file.
+    let second = spawn_servers(&path).await;
+    let token = token_for(second.web).await;
+    let client = GameClient::join(second.game, &token).await;
+
+    assert_eq!(
+        name_in_slot(&client.char_list().body, 1),
+        "Segundo",
+        "the character did not come back"
+    );
+
+    // and it starts where the creation screen said, not at the default town
+    let db = Database::open(&path).await.unwrap();
+    let created = db.load_accounts().await.unwrap()[0]
+        .characters
+        .iter()
+        .find(|c| c.name == "Segundo")
+        .expect("not in the database")
+        .clone();
+
+    assert_eq!((created.x, created.y), aika_server::creation::TOWN_SECOND);
+    assert_eq!(created.class_index, 40);
+    assert!(created.id > 0, "the character has no database id");
+    assert!(!created.items.is_empty(), "it was created with nothing to carry");
+}
+
+/// A name already in use is refused, and the refusal must not leave a half
+/// made character behind.
+#[tokio::test]
+async fn a_duplicate_name_is_refused_and_leaves_nothing_behind() {
+    let path = fresh_database_path("duplicate-name");
+
+    let servers = spawn_servers(&path).await;
+    let token = token_for(servers.web).await;
+    let mut client = GameClient::join(servers.game, &token).await;
+
+    let request = aika_server::creation::CreateCharacter {
+        slot: 1,
+        name: "Athus".into(),
+        class_index: 20,
+        hair: 7702,
+        town: 0,
+    };
+    client.send(aika_server::creation::OP_CREATE_CHARACTER, request.to_body()).await;
+    let list = client.expect(OP_CHAR_LIST).await;
+
+    assert_eq!(name_in_slot(&list.body, 1), "", "the slot was filled with a duplicate");
+
+    let db = Database::open(&path).await.unwrap();
+    assert_eq!(
+        db.load_accounts().await.unwrap()[0].characters.len(),
+        1,
+        "a second character reached the database"
+    );
+}
+
+/// The name in one slot of a character list packet.
+fn name_in_slot(body: &[u8], slot: usize) -> String {
+    const ENTRY: usize = 104;
+    let at = 12 + slot * ENTRY;
+    body[at..at + 16].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect()
 }

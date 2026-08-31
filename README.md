@@ -20,11 +20,12 @@ GPL-3.0 as well.
 | Token server (HTTP) | done — issues and validates tokens, character count, channel status, launcher routes |
 | Login server (TCP) | done — validates the token and clears the account |
 | Game server (TCP) | character selection, world entry and spawn in the starting city |
-| Movement | the server tracks position; relaying it to other players is next |
+| Movement | tracked, relayed to everyone in range |
+| Online registry | players see each other arrive, walk and leave |
 | `SL.bin` (channel list) | read and write, byte-exact round trip |
 | Persistence | next up (SQLite in development, MySQL in production) |
 
-68 tests, including an end-to-end run of the whole chain: HTTP token, TCP login
+82 tests, including an end-to-end run of the whole chain: HTTP token, TCP login
 and game server through to the character list.
 
 **The original client logs in, enters the world and walks.**

@@ -9,6 +9,9 @@
 //!   token again and receives its account id;
 //! - [`game`]: the game server (port 8822), which answers with the character
 //!   list and from there on runs the world.
+//!
+//! [`world`] holds the registry of who is online, which is what lets two
+//! players see each other.
 
 pub mod config;
 pub mod game;
@@ -17,6 +20,7 @@ pub mod login;
 pub mod state;
 pub mod store;
 pub mod web;
+pub mod world;
 
 pub use config::Config;
 pub use state::State;

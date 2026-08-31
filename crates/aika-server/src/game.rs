@@ -11,10 +11,12 @@
 
 use crate::state::State;
 use crate::store::{Account, Character, MAX_CHARACTERS};
+use crate::world::Outbox;
 use aika_net::frame::{self, FrameError, FrameReader, Message, MIN_FRAME};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Client to server: enter the game server with an authenticated account.
@@ -44,6 +46,16 @@ const MOVE_TELEPORT: u8 = 1;
 const MOVES_TO_DUMP: u8 = 3;
 /// Server to client: create a creature on the map. This is the spawn.
 pub const OP_CREATE_MOB: u16 = 0x349;
+/// Server to client: take a creature off the map.
+pub const OP_REMOVE_MOB: u16 = 0x101;
+
+/// `TSendRemoveMobPacket`: the id leaving and why.
+const REMOVE_MOB_SIZE: usize = 20;
+/// `DELETE_DISCONNECT` in `Data/GlobalDefs.pas:216`. There is also 0 for a
+/// plain disappearance, 1 for death and 3 for an unspawn effect.
+const DELETE_DISCONNECT: u32 = 2;
+/// `DELETE_NORMAL`: the creature simply goes off screen, no effect.
+const DELETE_NORMAL: u32 = 0;
 
 // The burst the original sends after `0xF0B`, in order. There is no ack
 // packet: the client stops resending `0xF0B` once it has received enough of
@@ -195,6 +207,9 @@ struct Session {
     client_id: u16,
     /// How many movement packets were dumped in full so far.
     moves_logged: u8,
+    /// Players this connection has already been shown. Kept per connection so
+    /// that walking into and out of range spawns and removes them exactly once.
+    visible: std::collections::HashSet<u16>,
     /// The character already spawned. The client resends `0xF0B` whenever it
     /// thinks something is missing, and spawning again teleports the player to the
     /// starting point, which is the original's `if IsInstantiated then Exit`
@@ -202,14 +217,45 @@ struct Session {
     spawned: bool,
 }
 
-async fn handle_connection(state: Arc<State>, mut stream: TcpStream) -> anyhow::Result<()> {
+async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Result<()> {
+    let (mut incoming, mut outgoing) = stream.into_split();
+    let (outbox, mut queue) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    // The id is ours to hand out, not the client's to claim: the client learns
+    // it from the packets we send, and echoing back whatever it sent would give
+    // every player the same one.
+    let client_id = state.world.connect(outbox.clone());
+
+    // One task owns the write half, so a broadcast from another connection can
+    // reach this player without either side waiting on the other.
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = queue.recv().await {
+            if outgoing.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut session = Session { client_id, ..Session::default() };
+    let result = read_loop(&state, &mut session, &outbox, &mut incoming).await;
+
+    leave_world(&state, &session);
+    writer.abort();
+    result
+}
+
+async fn read_loop(
+    state: &State,
+    session: &mut Session,
+    outbox: &Outbox,
+    incoming: &mut tokio::net::tcp::OwnedReadHalf,
+) -> anyhow::Result<()> {
     let mut reader = FrameReader::new();
     let mut prefix = LeadingPrefix::default();
-    let mut session = Session::default();
     let mut buf = [0u8; 8192];
 
     loop {
-        let n = stream.read(&mut buf).await?;
+        let n = incoming.read(&mut buf).await?;
         if n == 0 {
             return Ok(());
         }
@@ -220,12 +266,11 @@ async fn handle_connection(state: Arc<State>, mut stream: TcpStream) -> anyhow::
 
         while let Some(message) = reader.next_message() {
             match message {
-                Ok(message) => match handle_message(&state, &mut session, &message) {
+                Ok(message) => match handle_message(state, session, &message) {
                     Action::Reply(frames) => {
                         for frame in frames {
-                            stream.write_all(&frame).await?;
+                            let _ = outbox.send(frame);
                         }
-                        stream.flush().await?;
                     }
                     Action::Ignore => {}
                     Action::Disconnect => return Ok(()),
@@ -241,6 +286,41 @@ async fn handle_connection(state: Arc<State>, mut stream: TcpStream) -> anyhow::
             }
         }
     }
+}
+
+/// Takes the player out of the registry and off everyone else's screen.
+///
+/// The watchers are collected before the removal, because once the player is
+/// gone from the registry there is no position left to search around.
+fn leave_world(state: &State, session: &Session) {
+    let watchers = state.world.visible_to(session.client_id);
+    let left = state.world.disconnect(session.client_id);
+
+    if let (Some(character), false) = (session.character.as_ref(), watchers.is_empty()) {
+        let frame = encode_remove_mob(session.client_id, DELETE_DISCONNECT);
+        for watcher in &watchers {
+            watcher.send(frame.clone());
+        }
+        info!(
+            character = %character.name,
+            watchers = watchers.len(),
+            "left the world"
+        );
+    }
+    let _ = left;
+}
+
+/// `TSendRemoveMobPacket` (`0x101`): who is leaving and why.
+fn encode_remove_mob(client_id: u16, delete_type: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&(client_id as u32).to_le_bytes());
+    body.extend_from_slice(&delete_type.to_le_bytes());
+
+    debug_assert_eq!(body.len() + MIN_FRAME, REMOVE_MOB_SIZE);
+    frame::encode(
+        &Message { sender: FIXED_INDEX, opcode: OP_REMOVE_MOB, time: 0, body },
+        rand::random(),
+    )
 }
 
 /// The first `recv` of a game connection carries 4 leading bytes that are
@@ -304,8 +384,8 @@ fn handle_message(state: &State, session: &mut Session, message: &Message) -> Ac
     match message.opcode {
         OP_REQUEST_LOGIN => handle_request_login(state, session, message),
         OP_ENTER_WORLD => handle_enter_world(session, message, state.uptime_ms()),
-        OP_CLIENT_READY => handle_client_ready(session),
-        OP_MOVE => handle_move(session, message),
+        OP_CLIENT_READY => handle_client_ready(state, session),
+        OP_MOVE => handle_move(state, session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
@@ -368,8 +448,18 @@ fn handle_request_login(state: &State, session: &mut Session, message: &Message)
         "entered the game server"
     );
 
-    let frame = encode_char_list(&account, message.sender, state.uptime_ms());
-    session.client_id = message.sender;
+    // The client sends an id of its own in the header; ours is the one that
+    // counts, and logging both is how a disagreement would surface.
+    if message.sender != session.client_id {
+        debug!(
+            claimed = message.sender,
+            assigned = session.client_id,
+            "client claimed a different id"
+        );
+    }
+
+    let frame = encode_char_list(&account, session.client_id, state.uptime_ms());
+    state.world.set_account(session.client_id, account.id);
     session.account = Some(account);
     Action::Reply(vec![frame])
 }
@@ -418,7 +508,7 @@ fn handle_enter_world(session: &mut Session, message: &Message, time: u32) -> Ac
 /// This is where the character finally gets a position on the map. `0x925`
 /// says *who* the character is, not *where*. Without this packet the client
 /// enters the world and floats in the middle of nowhere.
-fn handle_client_ready(session: &mut Session) -> Action {
+fn handle_client_ready(state: &State, session: &mut Session) -> Action {
     let Some(character) = session.character.clone() else {
         warn!("0xF0B before a character was chosen");
         return Action::Ignore;
@@ -433,14 +523,31 @@ fn handle_client_ready(session: &mut Session) -> Action {
         return Action::Ignore;
     }
 
+    session.spawned = true;
+    state.world.enter(session.client_id, character.clone());
+
+    let mut frames = world_burst(&character, session.client_id);
+
+    // Everyone already standing nearby has to appear on this player's screen,
+    // and this player on theirs. Both directions use the same spawn packet.
+    let neighbours = state.world.visible_to(session.client_id);
+    let mine = encode_spawn(&character, session.client_id);
+    for other in &neighbours {
+        if let Some(their_character) = &other.character {
+            frames.push(encode_spawn(their_character, other.client_id));
+        }
+        other.send(mine.clone());
+        session.visible.insert(other.client_id);
+    }
+
     info!(
         character = %character.name,
         x = character.x,
         y = character.y,
+        neighbours = neighbours.len(),
         "spawning on the map"
     );
-    session.spawned = true;
-    Action::Reply(world_burst(&character, session.client_id))
+    Action::Reply(frames)
 }
 
 /// Everything the server sends once the client reports it has loaded.
@@ -572,16 +679,11 @@ fn encode_hp_mp(character: &Character, client_id: u16, hp: u32, mp: u32) -> Vec<
 /// on its own and the server only relays the same packet to whoever can see
 /// the player (`SendToVisible(..., false)` in `PacketHandlers.pas:892`).
 /// While there is no registry of online players, storing the position does.
-fn handle_move(session: &mut Session, message: &Message) -> Action {
+fn handle_move(state: &State, session: &mut Session, message: &Message) -> Action {
     let Some(movement) = Movement::parse(&message.body) else {
         warn!(size = message.body.len(), "0x301 packet too short");
         return Action::Ignore;
     };
-
-    if message.sender != session.client_id {
-        warn!(from = message.sender, expected = session.client_id, "0x301 from another client");
-        return Action::Ignore;
-    }
 
     // The first few movements of a session are dumped in full: the layout of
     // this packet is only confirmed against the real client, and a wrong
@@ -603,6 +705,18 @@ fn handle_move(session: &mut Session, message: &Message) -> Action {
         return Action::Ignore;
     }
 
+    // The original compares the header id against the player's and drops the
+    // packet when they disagree. We go further and simply never read it: the
+    // movement is applied to whoever owns this connection, so a client cannot
+    // move somebody else no matter what it puts in the field.
+    if message.sender != session.client_id {
+        debug!(
+            claimed = message.sender,
+            assigned = session.client_id,
+            "0x301 header carries another id; moving the connection's own player"
+        );
+    }
+
     // Teleport is server-originated. Honouring it from a client packet is
     // exactly the exploit that lets a modified client jump anywhere on the
     // map, so it is refused outright, as the original does.
@@ -619,14 +733,70 @@ fn handle_move(session: &mut Session, message: &Message) -> Action {
         debug!(move_type = movement.move_type, "move type other than walking");
     }
 
+    let (x, y) = (movement.x as u32, movement.y as u32);
     if let Some(character) = session.character.as_mut() {
-        character.x = movement.x as u32;
-        character.y = movement.y as u32;
+        character.x = x;
+        character.y = y;
+    }
+    state.world.move_to(session.client_id, x, y);
+
+    // The mover hears nothing back: the client moves itself and would fight
+    // its own echo. Everyone who can see it gets the same packet, carrying
+    // our id so they know who walked.
+    let relay = frame::encode(
+        &Message {
+            sender: session.client_id,
+            opcode: OP_MOVE,
+            time: message.time,
+            body: message.body.clone(),
+        },
+        rand::random(),
+    );
+    state.world.send_to_visible(session.client_id, relay);
+
+    refresh_visibility(state, session)
+}
+
+/// Spawns and removes players as they walk into and out of range.
+///
+/// Without this, two players who log in far apart never see each other no
+/// matter how close they walk. The set lives on the session so each side
+/// appears exactly once, and disappears exactly once.
+fn refresh_visibility(state: &State, session: &mut Session) -> Action {
+    let Some(character) = session.character.as_ref() else {
+        return Action::Ignore;
+    };
+
+    let neighbours = state.world.visible_to(session.client_id);
+    let now: std::collections::HashSet<u16> = neighbours.iter().map(|p| p.client_id).collect();
+
+    let mut frames = Vec::new();
+    let mine = encode_spawn(character, session.client_id);
+
+    for other in &neighbours {
+        if session.visible.insert(other.client_id) {
+            if let Some(their_character) = &other.character {
+                frames.push(encode_spawn(their_character, other.client_id));
+            }
+            other.send(mine.clone());
+        }
     }
 
-    // Nothing goes back to the mover: the client moves on its own. Relaying to
-    // the players who can see them lands with the online player registry.
-    Action::Ignore
+    // Anyone no longer in range leaves both screens.
+    let gone: Vec<u16> = session.visible.difference(&now).copied().collect();
+    for id in gone {
+        session.visible.remove(&id);
+        frames.push(encode_remove_mob(id, DELETE_NORMAL));
+        if let Some(other) = neighbours.iter().find(|p| p.client_id == id) {
+            other.send(encode_remove_mob(session.client_id, DELETE_NORMAL));
+        }
+    }
+
+    if frames.is_empty() {
+        Action::Ignore
+    } else {
+        Action::Reply(frames)
+    }
 }
 
 /// `0x301` body (`TMovementPacket`, `Data/Packets.pas`): destination as two
@@ -964,21 +1134,28 @@ mod tests {
         Message { sender: 7, opcode: OP_REQUEST_LOGIN, time: 0, body }
     }
 
-    /// Faz o login e devolve os bytes da resposta.
+    /// Runs the login and returns the reply bytes.
     fn reply(state: &State, version: u16) -> Vec<u8> {
-        match handle_message(state, &mut Session::default(), &login_message("admin", version)) {
-            Action::Reply(frames) => frames.into_iter().next().expect("sem frames"),
+        let mut session = Session { client_id: TEST_CLIENT_ID, ..Session::default() };
+        match handle_message(state, &mut session, &login_message("admin", version)) {
+            Action::Reply(frames) => frames.into_iter().next().expect("no frames"),
             other => panic!("expected a reply, got {other:?}"),
         }
     }
 
     /// A session that already went through `0x685`, as a real connection would.
+    ///
+    /// The id is normally handed out by the world registry when the socket is
+    /// accepted; tests set it directly.
     fn logged_in(state: &State) -> Session {
-        let mut session = Session::default();
+        let mut session = Session { client_id: TEST_CLIENT_ID, ..Session::default() };
         let action = handle_message(state, &mut session, &login_message("admin", 124));
         assert!(matches!(action, Action::Reply(_)), "o login precisa passar");
         session
     }
+
+    /// Whatever id the registry would have handed this connection.
+    const TEST_CLIENT_ID: u16 = 7;
 
     fn enter_world(slot: u32) -> Message {
         Message {
@@ -1041,7 +1218,7 @@ mod tests {
 
         let message = decode(&wire);
         assert_eq!(message.opcode, OP_CHAR_LIST);
-        assert_eq!(message.sender, 7, "the client expects its own id back");
+        assert_eq!(message.sender, TEST_CLIENT_ID, "addressed with the id we assigned");
         assert_eq!(u32::from_le_bytes(message.body[0..4].try_into().unwrap()), 1);
     }
 
@@ -1257,7 +1434,6 @@ mod tests {
         let state = state_with(vec![dev_character("Athus", 0)]);
         let mut session = logged_in(&state);
         let _ = handle_message(&state, &mut session, &enter_world(0));
-        session.client_id = 7;
 
         let mut body = vec![0u8; Movement::BODY_SIZE];
         body[0..4].copy_from_slice(&3500.0f32.to_le_bytes());
@@ -1275,12 +1451,30 @@ mod tests {
     /// The real client sends move types other than plain walking (16 has been
     /// seen). The original drops those; we still track the position, because a
     /// stale one would be wrong once positions are persisted.
+    /// A packet claiming somebody else's id still moves only the player who
+    /// sent it: the header field is never used to pick a target.
+    #[test]
+    fn movement_never_moves_another_player() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = logged_in(&state);
+        let _ = handle_message(&state, &mut session, &enter_world(0));
+
+        let mut body = vec![0u8; Movement::BODY_SIZE];
+        body[0..4].copy_from_slice(&4200.0f32.to_le_bytes());
+        body[4..8].copy_from_slice(&700.0f32.to_le_bytes());
+        let forged = Message { sender: 999, opcode: OP_MOVE, time: 0, body };
+
+        let _ = handle_message(&state, &mut session, &forged);
+
+        let character = session.character.as_ref().unwrap();
+        assert_eq!((character.x, character.y), (4200, 700), "our own player moved");
+    }
+
     #[test]
     fn movement_tracks_move_types_other_than_walking() {
         let state = state_with(vec![dev_character("Athus", 0)]);
         let mut session = logged_in(&state);
         let _ = handle_message(&state, &mut session, &enter_world(0));
-        session.client_id = 7;
 
         let mut body = vec![0u8; Movement::BODY_SIZE];
         body[0..4].copy_from_slice(&4000.0f32.to_le_bytes());
@@ -1298,7 +1492,6 @@ mod tests {
         let state = state_with(vec![dev_character("Athus", 0)]);
         let mut session = logged_in(&state);
         let _ = handle_message(&state, &mut session, &enter_world(0));
-        session.client_id = 7;
         let start = (session.character.as_ref().unwrap().x, session.character.as_ref().unwrap().y);
 
         // teleport must never come from the client: that is the map-jump exploit
@@ -1308,13 +1501,8 @@ mod tests {
         let teleport = Message { sender: 7, opcode: OP_MOVE, time: 0, body: body.clone() };
         let _ = handle_message(&state, &mut session, &teleport);
 
-        // and moving another client is not allowed either
-        body[Movement::MOVE_TYPE] = MOVE_NORMAL;
-        let outro = Message { sender: 99, opcode: OP_MOVE, time: 0, body };
-        let _ = handle_message(&state, &mut session, &outro);
-
         let character = session.character.as_ref().unwrap();
-        assert_eq!((character.x, character.y), start, "the position must not have changed");
+        assert_eq!((character.x, character.y), start, "teleport must not have moved us");
     }
 
     #[test]

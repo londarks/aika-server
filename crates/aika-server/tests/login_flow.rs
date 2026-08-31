@@ -3,7 +3,10 @@
 //! enter the game server, which answers with the character selection screen.
 
 use aika_server::config::{Config, DevAccount, DevCharacter, ServerEntry};
-use aika_server::game::{self, RequestLogin, OP_CHAR_LIST, OP_REQUEST_LOGIN};
+use aika_server::game::{
+    self, Movement, RequestLogin, OP_CHAR_LIST, OP_CLIENT_READY, OP_CREATE_MOB,
+    OP_ENTER_WORLD, OP_MOVE, OP_REMOVE_MOB, OP_REQUEST_LOGIN,
+};
 use aika_server::login::{self, CheckToken, OP_CHECK_TOKEN, OP_LOGIN_RESULT};
 use aika_server::{web, State};
 use aika_net::frame::{self, FrameReader, Message};
@@ -241,4 +244,168 @@ async fn web_reports_wrong_password() {
     let servers = spawn_servers().await;
     let response = post(servers.web, "/member/aika_get_token.asp", "id=admin&pw=errada").await;
     assert_eq!(response, "-1");
+}
+
+
+/// A connection to the game server that stays open, the way a real client's
+/// does, so packets pushed by other players can be observed arriving.
+struct GameClient {
+    stream: TcpStream,
+    reader: FrameReader,
+}
+
+impl GameClient {
+    async fn join(addr: SocketAddr, username: &str, token: &str) -> Self {
+        let mut client = Self {
+            stream: TcpStream::connect(addr).await.unwrap(),
+            reader: FrameReader::new(),
+        };
+        client
+            .send(OP_REQUEST_LOGIN, RequestLogin {
+                account_id: 1,
+                username: username.into(),
+                version: CLIENT_VERSION,
+                token: token.into(),
+            }
+            .to_body())
+            .await;
+        client.expect(OP_CHAR_LIST).await;
+        client
+    }
+
+    /// Picks the character and reports the scene as loaded, which is what
+    /// makes the player visible to everyone else.
+    async fn enter_world(&mut self) {
+        self.send(OP_ENTER_WORLD, 0u32.to_le_bytes().to_vec()).await;
+        self.send(OP_CLIENT_READY, Vec::new()).await;
+    }
+
+    async fn walk_to(&mut self, x: f32, y: f32) {
+        let mut body = vec![0u8; Movement::BODY_SIZE];
+        body[0..4].copy_from_slice(&x.to_le_bytes());
+        body[4..8].copy_from_slice(&y.to_le_bytes());
+        self.send(OP_MOVE, body).await;
+    }
+
+    async fn send(&mut self, opcode: u16, body: Vec<u8>) {
+        let wire = frame::encode(&Message { sender: 0, opcode, time: 0, body }, rand::random());
+        self.stream.write_all(&wire).await.unwrap();
+    }
+
+    /// Next packet, waiting for more bytes only when a frame is incomplete.
+    async fn next(&mut self) -> Option<Message> {
+        let mut buf = [0u8; 8192];
+        loop {
+            if let Some(message) = self.reader.next_message() {
+                return Some(message.expect("unreadable frame"));
+            }
+            let read = timeout(Duration::from_secs(2), self.stream.read(&mut buf)).await;
+            match read {
+                Ok(Ok(0)) | Err(_) => return None,
+                Ok(Ok(n)) => self.reader.push(&buf[..n]),
+                Ok(Err(e)) => panic!("error reading: {e}"),
+            }
+        }
+    }
+
+    /// Reads until the given opcode shows up, ignoring the rest.
+    async fn expect(&mut self, opcode: u16) -> Message {
+        while let Some(message) = self.next().await {
+            if message.opcode == opcode {
+                return message;
+            }
+        }
+        panic!("connection closed while waiting for 0x{opcode:X}");
+    }
+
+    /// Whether the opcode arrives before the connection goes quiet.
+    async fn sees(&mut self, opcode: u16) -> bool {
+        while let Some(message) = self.next().await {
+            if message.opcode == opcode {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+async fn token_for(web: SocketAddr) -> String {
+    post(web, "/member/aika_get_token.asp", "id=admin&pw=admin").await
+}
+
+/// The point of the whole registry: two players in the world at once, each
+/// appearing on the other's screen.
+#[tokio::test]
+async fn two_players_see_each_other() {
+    let servers = spawn_servers().await;
+
+    let token = token_for(servers.web).await;
+    let mut first = GameClient::join(servers.game, "admin", &token).await;
+    first.enter_world().await;
+    first.expect(OP_CREATE_MOB).await;
+
+    // the second player arrives next to the first
+    let mut second = GameClient::join(servers.game, "admin", &token).await;
+    second.enter_world().await;
+
+    // the newcomer is told about who was already there
+    let spawns = collect_spawns(&mut second).await;
+    assert!(spawns >= 2, "the newcomer sees itself and the player already there, got {spawns}");
+
+    // and the player already there is told about the newcomer
+    assert!(first.sees(OP_CREATE_MOB).await, "the first player never saw the second arrive");
+}
+
+/// Counts spawn packets until the connection goes quiet.
+async fn collect_spawns(client: &mut GameClient) -> usize {
+    let mut spawns = 0;
+    while let Some(message) = client.next().await {
+        if message.opcode == OP_CREATE_MOB {
+            spawns += 1;
+        }
+    }
+    spawns
+}
+
+/// Walking away from someone takes both players off each other's screen.
+#[tokio::test]
+async fn walking_out_of_range_removes_the_other_player() {
+    let servers = spawn_servers().await;
+
+    let token = token_for(servers.web).await;
+    let mut first = GameClient::join(servers.game, "admin", &token).await;
+    first.enter_world().await;
+    first.expect(OP_CREATE_MOB).await;
+
+    let mut second = GameClient::join(servers.game, "admin", &token).await;
+    second.enter_world().await;
+    second.expect(OP_CREATE_MOB).await;
+
+    // far beyond the watch radius
+    second.walk_to(9000.0, 9000.0).await;
+    assert!(
+        second.sees(OP_REMOVE_MOB).await,
+        "walking away must take the other player off the screen"
+    );
+}
+
+/// A player leaving is taken off the screens of everyone who could see them.
+#[tokio::test]
+async fn disconnecting_removes_the_player_from_the_others() {
+    let servers = spawn_servers().await;
+
+    let token = token_for(servers.web).await;
+    let mut watcher = GameClient::join(servers.game, "admin", &token).await;
+    watcher.enter_world().await;
+    watcher.expect(OP_CREATE_MOB).await;
+
+    let mut leaver = GameClient::join(servers.game, "admin", &token).await;
+    leaver.enter_world().await;
+    leaver.expect(OP_CREATE_MOB).await;
+
+    // the watcher has to have seen the arrival before it can see the exit
+    assert!(watcher.sees(OP_CREATE_MOB).await, "arrival was not seen");
+
+    drop(leaver);
+    assert!(watcher.sees(OP_REMOVE_MOB).await, "the leaver was never removed");
 }

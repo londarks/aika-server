@@ -2,11 +2,14 @@
 
 use crate::config::Config;
 use crate::store::AccountStore;
+use crate::world::World;
 use std::time::{Duration, Instant};
 
 pub struct State {
     pub cfg: Config,
     pub store: AccountStore,
+    /// Who is online and where, shared by every game connection.
+    pub world: World,
     started: Instant,
 }
 
@@ -17,7 +20,7 @@ impl State {
             cfg.login.max_attempts,
             Duration::from_secs(cfg.login.block_minutes * 60),
         )?;
-        Ok(Self { cfg, store, started: Instant::now() })
+        Ok(Self { cfg, store, world: World::new(), started: Instant::now() })
     }
 
     /// Equivalent of the `timeGetTime` the Delphi server stamps on packets:

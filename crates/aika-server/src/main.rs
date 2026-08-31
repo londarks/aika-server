@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("no address in [game].binds; the client would have nowhere to connect");
     }
 
-    let state = Arc::new(State::new(cfg)?);
+    let state = Arc::new(State::open(cfg).await?);
 
     let web_listener = bind(web_addr, "token server").await?;
     let login_listener = bind(login_addr, "login server").await?;

@@ -59,10 +59,16 @@ Reference sources live outside this repo, in sibling directories:
 
 ## Database
 
-SQLite during development, **MySQL in production**. The persistence layer must
-stay portable from day one: all queries in one module, only `INTEGER`/`TEXT`/
-`BLOB`/`REAL`, timestamps as integer unix seconds, no `INSERT OR REPLACE`
-(SQLite-only) and no `REPLACE INTO` (MySQL-only).
+SQLite during development, **MySQL in production**. The persistence layer stays
+portable: every query lives in `crates/aika-server/src/db.rs`, only
+`INTEGER`/`TEXT`/`BLOB`/`REAL`, timestamps as integer unix seconds, no
+`INSERT OR REPLACE` (SQLite-only) and no `REPLACE INTO` (MySQL-only).
+
+The database is the truth. `config.toml` seeds an *empty* one so a fresh
+checkout has somewhere to log in, and is ignored from then on: to seed again,
+delete `aika.db`. Positions are written as a player disconnects, so logging out
+somewhere means logging back in there; `tests/persistence.rs` proves it across
+two servers that share nothing but the file.
 
 ## Running
 
@@ -71,5 +77,5 @@ cargo run -p aika-server -- config.toml   # from the repo root
 RUST_LOG=aika_server=debug cargo run -p aika-server -- config.toml
 ```
 
-Accounts, characters and channels live in `config.toml`; no rebuild needed after
-editing it.
+Channels live in `config.toml`; accounts and characters live in `aika.db` after
+the first run. No rebuild is needed after editing either.

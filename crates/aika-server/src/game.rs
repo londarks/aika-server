@@ -239,6 +239,12 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Resu
     let mut session = Session { client_id, ..Session::default() };
     let result = read_loop(&state, &mut session, &outbox, &mut incoming).await;
 
+    // Saved before anything else in the teardown: whatever went wrong with
+    // the connection, where the player stood is still worth keeping.
+    if let Some(character) = session.character.as_ref() {
+        state.save_position(character).await;
+    }
+
     leave_world(&state, &session);
     writer.abort();
     result

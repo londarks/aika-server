@@ -28,9 +28,36 @@ pub struct Account {
     pub last_token_at: Option<Instant>,
 }
 
+/// One item, mirroring the 20-byte `TItem` the protocol carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Item {
+    /// Which container holds it: equipment, inventory or storage.
+    pub container: u8,
+    pub slot: u16,
+    /// Id into the item table. Zero means the slot is empty.
+    pub index: u16,
+    /// Appearance override, used when a look differs from the real item.
+    pub appearance: u16,
+    pub identific: i32,
+    pub effect_index: [u8; 3],
+    pub effect_value: [u8; 3],
+    pub durability_min: u8,
+    pub durability_max: u8,
+    pub refine: u16,
+    pub expires_at: u16,
+}
+
+impl Item {
+    pub fn is_empty(&self) -> bool {
+        self.index == 0
+    }
+}
+
 /// A character, holding what the selection screen needs to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Character {
+    /// Row id in the database, zero before it has been stored.
+    pub id: i64,
     /// Slot 0 to 2.
     pub slot: usize,
     pub name: String,
@@ -53,6 +80,8 @@ pub struct Character {
     /// creation with `Local = 0`).
     pub x: u32,
     pub y: u32,
+    /// Everything the character carries, across every container.
+    pub items: Vec<Item>,
 }
 
 /// Where a brand new character appears.
@@ -74,6 +103,7 @@ impl Character {
 impl From<&DevCharacter> for Character {
     fn from(dev: &DevCharacter) -> Self {
         Self {
+            id: 0,
             slot: dev.slot,
             name: dev.name.clone(),
             nation: dev.nation,
@@ -87,6 +117,7 @@ impl From<&DevCharacter> for Character {
             attributes: [10, 10, 10, 10, 10, 0],
             x: dev.x.unwrap_or(CITY_SPAWN.0),
             y: dev.y.unwrap_or(CITY_SPAWN.1),
+            items: Vec::new(),
         }
     }
 }
@@ -151,65 +182,112 @@ pub struct AccountStore {
     block_duration: Duration,
 }
 
-impl AccountStore {
-    pub fn from_dev_accounts(
-        entries: &[DevAccount],
-        max_attempts: u32,
-        block_duration: Duration,
-    ) -> anyhow::Result<Self> {
-        let mut accounts = HashMap::new();
-        for (i, entry) in entries.iter().enumerate() {
-            let password_hash = match (&entry.password, &entry.password_hash) {
-                (_, Some(hash)) => hash.to_ascii_lowercase(),
-                (Some(plain), None) => md5_hex(plain),
-                (None, None) => anyhow::bail!(
-                    "account '{}' needs either 'password' or 'password_hash'",
-                    entry.username
-                ),
-            };
-            if entry.characters.len() > MAX_CHARACTERS {
-                anyhow::bail!(
-                    "account '{}' has {} characters; the client shows only {}",
-                    entry.username,
-                    entry.characters.len(),
-                    MAX_CHARACTERS
-                );
-            }
-            for character in &entry.characters {
-                if character.slot >= MAX_CHARACTERS {
-                    anyhow::bail!(
-                        "character '{}' is in slot {}; slots run from 0 to {}",
-                        character.name,
-                        character.slot,
-                        MAX_CHARACTERS - 1
-                    );
-                }
-            }
+impl Account {
+    /// Builds an account from a configuration entry, validating what the
+    /// client cannot cope with. Shared by the in-memory store and the
+    /// database seeding, so both reject the same things.
+    pub fn from_dev(entry: &DevAccount, id: u32) -> anyhow::Result<Self> {
+        let password_hash = match (&entry.password, &entry.password_hash) {
+            (_, Some(hash)) => hash.to_ascii_lowercase(),
+            (Some(plain), None) => md5_hex(plain),
+            (None, None) => anyhow::bail!(
+                "account '{}' needs either 'password' or 'password_hash'",
+                entry.username
+            ),
+        };
 
-            let username = entry.username.to_ascii_lowercase();
-            let account = Account {
-                id: i as u32 + 1,
-                username: username.clone(),
-                password_hash,
-                nation: entry.nation,
-                account_status: entry.account_status,
-                ban_days: entry.ban_days,
-                characters: entry.characters.iter().map(Character::from).collect(),
-                last_token: None,
-                last_token_at: None,
-            };
-            if accounts.insert(username, account).is_some() {
-                anyhow::bail!("account '{}' declared twice", entry.username);
+        if entry.characters.len() > MAX_CHARACTERS {
+            anyhow::bail!(
+                "account '{}' has {} characters; the client shows only {}",
+                entry.username,
+                entry.characters.len(),
+                MAX_CHARACTERS
+            );
+        }
+        for character in &entry.characters {
+            if character.slot >= MAX_CHARACTERS {
+                anyhow::bail!(
+                    "character '{}' is in slot {}; slots run from 0 to {}",
+                    character.name,
+                    character.slot,
+                    MAX_CHARACTERS - 1
+                );
             }
         }
 
         Ok(Self {
-            accounts: Mutex::new(accounts),
+            id,
+            username: entry.username.to_ascii_lowercase(),
+            password_hash,
+            nation: entry.nation,
+            account_status: entry.account_status,
+            ban_days: entry.ban_days,
+            characters: entry.characters.iter().map(Character::from).collect(),
+            last_token: None,
+            last_token_at: None,
+        })
+    }
+}
+
+impl AccountStore {
+    /// Builds a store from already loaded accounts, which is how the database
+    /// hands its contents over.
+    pub fn from_accounts(
+        accounts: Vec<Account>,
+        max_attempts: u32,
+        block_duration: Duration,
+    ) -> anyhow::Result<Self> {
+        let mut map = HashMap::new();
+        for account in accounts {
+            let key = account.username.to_ascii_lowercase();
+            if map.insert(key, account).is_some() {
+                anyhow::bail!("two accounts share a username");
+            }
+        }
+        Ok(Self {
+            accounts: Mutex::new(map),
             attempts: Mutex::new(HashMap::new()),
             blocked: Mutex::new(HashMap::new()),
             max_attempts,
             block_duration,
         })
+    }
+
+    pub fn from_dev_accounts(
+        entries: &[DevAccount],
+        max_attempts: u32,
+        block_duration: Duration,
+    ) -> anyhow::Result<Self> {
+        let accounts = entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| Account::from_dev(entry, i as u32 + 1))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Self::from_accounts(accounts, max_attempts, block_duration)
+    }
+
+
+    /// Moves a character in the in-memory copy. The database holds the
+    /// durable version of the same fact; this keeps a second login in the
+    /// same run from reading a stale position.
+    ///
+    /// Returns whether the character was found, which is false for the id 0
+    /// a character has before it reaches the database.
+    pub fn update_position(&self, character_id: i64, x: u32, y: u32) -> bool {
+        if character_id == 0 {
+            return false;
+        }
+        let mut accounts = self.accounts.lock().unwrap();
+        for account in accounts.values_mut() {
+            for character in &mut account.characters {
+                if character.id == character_id {
+                    character.x = x;
+                    character.y = y;
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn get(&self, username: &str) -> Option<Account> {

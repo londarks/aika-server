@@ -5,6 +5,8 @@
 # Local database file (development uses SQLite)
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 
 # Local overrides
 config.local.toml

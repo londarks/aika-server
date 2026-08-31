@@ -15,6 +15,16 @@ bind = "127.0.0.1:8090"
 # and the list below decides.
 pad_status_to = 0
 
+# Where the world is kept. SQLite while developing, so a checkout runs with
+# nothing to install; production changes this into a MySQL URL and the queries
+# stay the same, since they are written for the subset both dialects share.
+#
+# The accounts at the bottom of this file only fill an *empty* database. Once
+# it has accounts, this file is ignored and the database is the truth: editing
+# a level here will not raise a character that has been played.
+[database]
+path = "aika.db"
+
 [login]
 bind = "127.0.0.1:8831"
 token_ttl_secs = 300
@@ -66,16 +76,17 @@ online = 1
 name = "Delta"
 online = 1
 
-# Development accounts, kept in memory for now.
-# `password` is plaintext and becomes an MD5 at startup; use `password_hash`
+# Accounts written into a database that has none, so a fresh checkout has
+# somewhere to log in. Delete `aika.db` to seed again from here.
+# `password` is plaintext and becomes an MD5 on the way in; use `password_hash`
 # to paste a hash straight from the `password_hash` column of the MySQL dump.
 [[accounts]]
 username = "admin"
 password = "admin"
 nation = 2
 
-# Characters on the account, one per slot (0 to 2). For testing only, until
-# character creation and a database exist.
+# Characters on the account, one per slot (0 to 2). Seeded once; from then on
+# they live in the database, and their position follows them between logins.
 [[accounts.characters]]
 name = "Athus"
 slot = 0

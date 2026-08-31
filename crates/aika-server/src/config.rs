@@ -16,6 +16,8 @@ pub struct Config {
     pub game: GameConfig,
     #[serde(default)]
     pub patch: PatchConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
     /// Channels reported by `/servers/servXX.asp`, in order.
     #[serde(default)]
     pub servers: Vec<ServerEntry>,
@@ -136,6 +138,29 @@ pub struct DevCharacter {
     /// Movement speed; falls back to the default.
     #[serde(default)]
     pub speed_move: Option<u8>,
+}
+
+/// Where the world is stored.
+///
+/// SQLite while developing, so a checkout runs with no service to install.
+/// The queries are written for both, so production only changes this path
+/// into a MySQL URL.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseConfig {
+    /// A file path, or `:memory:` for a database that dies with the process.
+    #[serde(default = "default_database_path")]
+    pub path: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self { path: default_database_path() }
+    }
+}
+
+fn default_database_path() -> String {
+    "aika.db".to_string()
 }
 
 fn default_token_ttl() -> u64 {

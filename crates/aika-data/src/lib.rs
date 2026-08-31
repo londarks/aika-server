@@ -5,5 +5,6 @@
 
 pub mod itemlist;
 pub mod jit;
+pub mod npc;
 pub mod sl;
 pub mod strdef;

@@ -129,9 +129,11 @@ pub enum ShopError {
     /// item table, so it shows a name and a description for something our
     /// table has never heard of. The two files are out of step in the data
     /// they were taken from, and the server cannot price, level-gate or even
-    /// name what it does not have. The original would have sold it for
-    /// nothing, since a missing record reads as a row of zeros and its price
-    /// chain ends at "gold, zero". Refusing is the better answer.
+    /// name what it does not have.
+    ///
+    /// The original refuses these too, though not on purpose: a missing
+    /// record reads as a row of zeros, its price chain ends at "gold, zero",
+    /// and the gold branch exits on any price of one or less.
     UnknownItem(u16),
     /// The item has no price at all, which is how the shipped tables mark
     /// something that is not really on sale.
@@ -258,9 +260,12 @@ pub fn stock(npc: &Npc) -> [u16; SHOP_SLOTS] {
 
 /// Buys one slot's worth from an NPC.
 ///
-/// The amount lands in the item's `refine` field, which is where the original
-/// puts a stack count for things that stack — the same field means different
-/// things for different items, and the item table decides which.
+/// The amount lands in the item's `refine` field, and it lands there for
+/// *everything*, not only for things that stack: the original writes
+/// `BuyItem.Refi := Packet.Quantidade` before it looks at what the item is
+/// (`PacketHandlers.pas:5048`). It matters. A card or a scroll that arrives
+/// with a count of zero is a stack of none, and the client refuses to use it
+/// — which looks exactly like the item being broken.
 pub fn buy(
     npc: &Npc,
     request: Buy,
@@ -281,7 +286,11 @@ pub fn buy(
     let amount = if def.can_group() { request.amount.max(1) } else { 1 };
 
     let price = match price_of(def, amount) {
-        Price::Gold(0) => return Err(ShopError::NotForSale),
+        // The original refuses a gold price of one or less, not just of zero
+        // (`PacketHandlers.pas:5042`). An undefined item reads as a row of
+        // zeros and lands here, which is how that check keeps items the
+        // server does not know about out of the game.
+        Price::Gold(price) if price <= 1 => return Err(ShopError::NotForSale),
         Price::Gold(price) => price,
         Price::Honor(_) => return Err(ShopError::PaidInSomethingElse("honor")),
         Price::Medal(_) => return Err(ShopError::PaidInSomethingElse("medals")),
@@ -298,7 +307,7 @@ pub fn buy(
     let bought = Item {
         index: id,
         appearance: id,
-        refine: if def.can_group() { amount as u16 } else { 0 },
+        refine: amount as u16,
         durability_min: def.durability(),
         durability_max: def.durability(),
         ..Item::default()
@@ -375,6 +384,7 @@ mod tests {
         define(4351, 10, true, 2); // a potion, stacks
         define(4616, 2, true, 1); // ammunition, too cheap to divide
         define(4204, 0, false, 1); // no price at all
+        define(5000, 1, false, 1); // a price of one, which the original refuses
         define(9000, 100, false, UNSELLABLE_RARITY); // the rarest, unsellable
 
         // priced in something other than gold
@@ -461,6 +471,44 @@ mod tests {
     }
 
     /// The count only means something for items the table says group.
+    /// Everything bought carries a count, stackable or not. A card that
+    /// arrives with a count of zero is a stack of none, and the client will
+    /// not use it.
+    #[test]
+    fn everything_bought_carries_a_count() {
+        let table = item_table();
+        let npc = merchant(&[1000, 4351]);
+
+        let mut inv = Inventory::new();
+        let sword = buy(&npc, buy_request(0, 1), &mut inv, 100_000, &table).unwrap();
+        assert_eq!(sword.item.refine, 1, "a sword arrived as a stack of none");
+
+        let mut inv = Inventory::new();
+        let potions = buy(&npc, buy_request(1, 20), &mut inv, 100_000, &table).unwrap();
+        assert_eq!(potions.item.refine, 20);
+    }
+
+    /// The original exits on a gold price of one or less, which is what keeps
+    /// an item the table does not define out of the game: a missing record is
+    /// a row of zeros.
+    #[test]
+    fn something_priced_at_a_penny_or_nothing_is_not_for_sale() {
+        let table = item_table();
+        let npc = merchant(&[4204, 5000]);
+        let mut inv = Inventory::new();
+
+        assert_eq!(
+            buy(&npc, buy_request(0, 1), &mut inv, 100_000, &table),
+            Err(ShopError::NotForSale),
+            "a price of zero"
+        );
+        assert_eq!(
+            buy(&npc, buy_request(1, 1), &mut inv, 100_000, &table),
+            Err(ShopError::NotForSale),
+            "a price of one"
+        );
+    }
+
     #[test]
     fn a_stack_costs_per_unit_and_a_sword_does_not() {
         let table = item_table();
@@ -474,7 +522,7 @@ mod tests {
         let mut inv = Inventory::new();
         let sword = buy(&npc, buy_request(1, 20), &mut inv, 1000, &table).unwrap();
         assert_eq!(sword.gold, 500, "a sword is one sword however many were asked for");
-        assert_eq!(sword.item.refine, 0);
+        assert_eq!(sword.item.refine, 1, "and it arrives as one of them, not none");
     }
 
     #[test]

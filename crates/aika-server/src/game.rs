@@ -429,17 +429,26 @@ pub fn spawn_world_tick(state: Arc<State>) -> tokio::task::JoinHandle<()> {
                 continue;
             }
 
-            for (mob, attack) in state.world.think_mobs(&players, now) {
-                debug!(mob, target = attack.target, damage = attack.damage, "a monster swung");
-                state.world.deal_to_player(attack.target, attack);
-            }
+            for (mob, turn) in state.world.think_mobs(&players, now) {
+                if let Some(attack) = turn.attack {
+                    debug!(
+                        mob = mob.id,
+                        target = attack.target,
+                        damage = attack.damage,
+                        skill = attack.skill,
+                        "a monster swung"
+                    );
+                    state.world.deal_to_player(attack.target, attack);
+                }
 
-            // Whoever can see a monster that moved is told where it is now.
-            for mob in state.world.mobs_moved(&players) {
-                let frame = encode_mob_move(&mob);
-                for (id, at) in &players {
-                    if within(*at, mob.position(), DISTANCE_TO_WATCH) {
-                        state.world.send_to(*id, frame.clone());
+                // A walk is told to everyone who can see it, once, with the
+                // destination. The client animates the way there itself.
+                if let Some(to) = turn.walk {
+                    let frame = encode_mob_walk(&mob, to);
+                    for (id, at) in &players {
+                        if within(*at, mob.position(), DISTANCE_TO_WATCH) {
+                            state.world.send_to(*id, frame.clone());
+                        }
                     }
                 }
             }
@@ -447,13 +456,18 @@ pub fn spawn_world_tick(state: Arc<State>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// `0x301` for a monster: the same movement packet a player sends, with the
-/// monster as the sender, which is how everyone else learns it walked.
-fn encode_mob_move(mob: &crate::mob::Mob) -> Vec<u8> {
+/// `0x301` for a monster: `TBaseMob.WalkTo`.
+///
+/// It carries where the monster is *going*, not where it is, and the speed to
+/// get there at. The client walks it the whole way on its own — which is why
+/// sending a short step every tick instead made monsters jump: they arrived
+/// early and stood still until the next packet.
+fn encode_mob_walk(mob: &crate::mob::Mob, to: (f32, f32)) -> Vec<u8> {
     let mut body = vec![0u8; Movement::BODY_SIZE];
-    body[0..4].copy_from_slice(&mob.x.to_le_bytes());
-    body[4..8].copy_from_slice(&mob.y.to_le_bytes());
-    body[Movement::SPEED] = MOB_SPEED_MOVE;
+    body[0..4].copy_from_slice(&to.0.to_le_bytes());
+    body[4..8].copy_from_slice(&to.1.to_le_bytes());
+    body[Movement::MOVE_TYPE] = MOVE_NORMAL;
+    body[Movement::SPEED] = crate::mob::WALK_SPEED;
 
     frame::encode(
         &Message { sender: mob.id, opcode: OP_MOVE, time: 0, body },
@@ -2277,12 +2291,14 @@ fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> 
         return Action::Reply(frames);
     };
 
+    let (_, flinch) = animations_of(state, cast.skill as u16);
     let report = combat::Damage {
         skill: cast.skill as u16,
         attacker: client_id,
         attacker_at: at,
         attacker_hp: session.cur_hp.min(max_hp),
         animation: cast.animation as u16,
+        target_animation: flinch,
         target: target.id,
         target_hp: target.hp,
         blow,
@@ -2323,12 +2339,20 @@ fn collect_blows(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
         let damage = stats::base_damage(blow.damage, stats.defence);
         session.cur_hp = session.cur_hp.saturating_sub(damage);
 
+        let (swing, flinch) = animations_of(state, blow.skill);
+        let attacker_at = state
+            .world
+            .mob(blow.attacker)
+            .map(|m| m.position())
+            .unwrap_or_default();
+
         let report = combat::Damage {
-            skill: 0,
+            skill: blow.skill,
             attacker: blow.attacker,
-            attacker_at: (0.0, 0.0),
-            attacker_hp: 0,
-            animation: 0,
+            attacker_at,
+            attacker_hp: state.world.mob(blow.attacker).map(|m| m.hp).unwrap_or_default(),
+            animation: swing,
+            target_animation: flinch,
             target: client_id,
             target_hp: session.cur_hp,
             blow: combat::Blow { damage, kind: combat::DAMAGE_NORMAL },
@@ -2469,12 +2493,14 @@ fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Act
     };
 
     let (max_hp, _) = vitals(session.character.as_ref().expect("checked above"));
+    let (_, flinch) = animations_of(state, request.skill);
     let report = combat::Damage {
         skill: request.skill,
         attacker: session.client_id,
         attacker_at: at,
         attacker_hp: session.cur_hp.min(max_hp),
         animation: request.animation,
+        target_animation: flinch,
         target: target.id,
         target_hp: target.hp,
         blow,
@@ -2586,6 +2612,18 @@ fn loot_from(state: &State, session: &mut Session, target: &crate::mob::Mob) -> 
             "Your bag is full, so the drop was lost.",
         )],
     }
+}
+
+/// The two animations a blow plays: the swing and the flinch, both from the
+/// skill it was made with (`Mob/BaseMob.pas:9842`).
+///
+/// A blow with no skill behind it plays nothing, which is what the original
+/// does for a monster whose kind lists none.
+fn animations_of(state: &State, skill: u16) -> (u16, u8) {
+    let Some(def) = state.skills.get(skill as usize) else {
+        return (0, 0);
+    };
+    (def.animation() as u16, def.target_animation() as u8)
 }
 
 /// `TRecvDamagePacket` (`0x102`): who hit what, for how much, and what is
@@ -4933,7 +4971,7 @@ mod tests {
 
         state.world.deal_to_player(
             session.client_id,
-            crate::mob::Attack { attacker: RAT, target: session.client_id, damage: 40 },
+            crate::mob::Attack { attacker: RAT, target: session.client_id, damage: 40, skill: 0 },
         );
 
         let ready = Message {
@@ -4964,6 +5002,7 @@ mod tests {
                     attacker: RAT,
                     target: session.client_id,
                     damage: 10_000,
+                    skill: 0,
                 },
             );
             let ready = Message {
@@ -4996,7 +5035,7 @@ mod tests {
 
         state.world.deal_to_player(
             session.client_id,
-            crate::mob::Attack { attacker: RAT, target: session.client_id, damage: 40 },
+            crate::mob::Attack { attacker: RAT, target: session.client_id, damage: 40, skill: 0 },
         );
         assert!(collect_blows(&state, &mut session).is_empty(), "a corpse was hit again");
     }

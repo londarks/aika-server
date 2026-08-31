@@ -20,10 +20,28 @@ pub const CHASE_RANGE: f32 = 60.0;
 pub const REACH: f32 = 12.0;
 /// How often it swings.
 pub const ATTACK_EVERY: Duration = Duration::from_millis(1500);
-/// How far it moves per tick, in map units. The original gives every monster
-/// a move speed of 22 (`ServerSocket.pas:655`); this is that as a distance
-/// per second, which is what a tick can act on.
-pub const STEP: f32 = 22.0;
+/// The speed the client is told to walk a monster at.
+///
+/// `TBaseMob.WalkTo` defaults to 70 (`Mob/BaseMob.pas:331`), and the number
+/// is not decoration: the client walks the monster from where it is to where
+/// it is told at this speed, and the server sends the *destination* rather
+/// than a step. Sending a short step every second instead makes the monster
+/// arrive early and stand still until the next one, which reads as
+/// teleporting.
+pub const WALK_SPEED: u8 = 70;
+
+/// How far a monster will commit to in one go.
+///
+/// `WalkAvanced` refuses to send a walk longer than 18 (`BaseMob.pas:1985`).
+/// Chasing keeps to that so the monster keeps up with a player who turns,
+/// rather than committing to where they were.
+pub const MAX_WALK: f32 = 18.0;
+
+/// How long a walk of a given distance takes, which is how long the monster
+/// has nothing to decide.
+pub fn walk_time(distance: f32) -> Duration {
+    Duration::from_secs_f32((distance / WALK_SPEED as f32).clamp(0.05, 4.0))
+}
 
 /// What a monster is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +95,9 @@ pub struct Mob {
     pub attack: u32,
     /// What it has taken off players, so a kill can be credited.
     pub last_hurt_by: Option<u16>,
+    /// The skills the kind knows, for the animation a blow plays. Most kinds
+    /// have none, and swing with an empty one.
+    pub skills: [u16; 5],
     /// Which band its drops come from.
     pub drop_index: u16,
 }
@@ -110,6 +131,7 @@ impl Mob {
             // off a player rather than none or all of them.
             attack: 5 + kind.level as u32 * 3,
             last_hurt_by: None,
+            skills: kind.skills,
             drop_index: kind.drop_index,
         }
     }
@@ -133,18 +155,34 @@ impl Mob {
         }
     }
 
-    /// Moves it towards a point, at most one step. Says whether it arrived.
-    pub fn step_towards(&mut self, to: (f32, f32), step: f32) -> bool {
+    /// The skill it swings with, or zero when it has none.
+    pub fn attack_skill(&self) -> u16 {
+        self.skills.iter().copied().find(|&s| s != 0).unwrap_or(0)
+    }
+
+    /// Commits to walking somewhere, at most `MAX_WALK` of the way.
+    ///
+    /// The position moves to the destination straight away and the client is
+    /// told to walk there, which is what the original does: the server keeps
+    /// where the monster *will be* and the client animates getting there.
+    /// Returns where it committed to, and how long the walk takes.
+    fn walk_towards(&mut self, to: (f32, f32), now: Instant) -> ((f32, f32), Duration) {
         let (dx, dy) = (to.0 - self.x, to.1 - self.y);
         let distance = (dx * dx + dy * dy).sqrt();
-        if distance <= step || distance == 0.0 {
-            self.x = to.0;
-            self.y = to.1;
-            return true;
-        }
-        self.x += dx / distance * step;
-        self.y += dy / distance * step;
-        false
+
+        let target = if distance <= MAX_WALK || distance == 0.0 {
+            to
+        } else {
+            (self.x + dx / distance * MAX_WALK, self.y + dy / distance * MAX_WALK)
+        };
+
+        let travelled = self.distance_to(target);
+        self.x = target.0;
+        self.y = target.1;
+
+        let time = walk_time(travelled);
+        self.ready_at = Some(now + time);
+        (target, time)
     }
 
     /// How far it is from a point.
@@ -212,9 +250,9 @@ impl Mob {
     /// give up when they get too far from where you started, walk home, then
     /// go back to pacing. Keeping it in one function keeps the whole
     /// behaviour readable in one place.
-    pub fn think(&mut self, nearest: Option<(u16, (f32, f32))>, now: Instant) -> Option<Attack> {
+    pub fn think(&mut self, nearest: Option<(u16, (f32, f32))>, now: Instant) -> Turn {
         if !self.is_alive() {
-            return None;
+            return Turn::default();
         }
 
         // Somebody close enough is worth minding, unless we are already on
@@ -230,16 +268,17 @@ impl Mob {
         match self.doing {
             Doing::Chasing(who) => self.chase(who, nearest, now),
             Doing::GoingHome => {
-                if self.take_turn(now, TICK) && self.step_towards(self.home, STEP) {
+                if self.ready_at.is_some_and(|at| now < at) {
+                    return Turn::default();
+                }
+                let (to, _) = self.walk_towards(self.home, now);
+                if to == self.home {
                     self.doing = Doing::Waiting;
                     self.heading_away = true;
                 }
-                None
+                Turn { walk: Some(to), attack: None }
             }
-            Doing::Waiting | Doing::Patrolling => {
-                self.patrol(now);
-                None
-            }
+            Doing::Waiting | Doing::Patrolling => self.patrol(now),
         }
     }
 
@@ -248,11 +287,11 @@ impl Mob {
         who: u16,
         nearest: Option<(u16, (f32, f32))>,
         now: Instant,
-    ) -> Option<Attack> {
+    ) -> Turn {
         // Whoever it was chasing is gone, or somebody else is now the nearest.
         let Some((_, at)) = nearest.filter(|(id, _)| *id == who) else {
             self.doing = Doing::GoingHome;
-            return None;
+            return Turn::default();
         };
 
         // Chased too far from home. A monster that follows forever ends up
@@ -263,33 +302,54 @@ impl Mob {
         };
         if from_home > CHASE_RANGE {
             self.doing = Doing::GoingHome;
-            return None;
+            return Turn::default();
+        }
+
+        if self.ready_at.is_some_and(|now_at| now < now_at) {
+            return Turn::default();
         }
 
         if self.distance_to(at) > REACH {
-            if self.take_turn(now, TICK) {
-                self.step_towards(at, STEP);
-            }
-            return None;
+            let (to, _) = self.walk_towards(at, now);
+            return Turn { walk: Some(to), attack: None };
         }
 
         // In reach. Swinging is on its own, slower clock than walking.
-        if !self.take_turn(now, ATTACK_EVERY) {
-            return None;
+        self.ready_at = Some(now + ATTACK_EVERY);
+        Turn {
+            walk: None,
+            attack: Some(Attack {
+                attacker: self.id,
+                target: who,
+                damage: self.attack,
+                skill: self.attack_skill(),
+            }),
         }
-        Some(Attack { attacker: self.id, target: who, damage: self.attack })
     }
 
-    fn patrol(&mut self, now: Instant) {
-        if self.is_rooted() || !self.take_turn(now, TICK) {
-            return;
+    fn patrol(&mut self, now: Instant) -> Turn {
+        if self.is_rooted() || self.ready_at.is_some_and(|at| now < at) {
+            return Turn::default();
         }
         self.doing = Doing::Patrolling;
-        if self.step_towards(self.destination(), STEP) {
+
+        let destination = self.destination();
+        let (to, _) = self.walk_towards(destination, now);
+        if to == destination {
             self.heading_away = !self.heading_away;
             self.doing = Doing::Waiting;
         }
+        Turn { walk: Some(to), attack: None }
     }
+}
+
+/// What a monster decided to do this turn.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Turn {
+    /// Where it set off for, if it moved. The client is told this and walks
+    /// it there itself.
+    pub walk: Option<(f32, f32)>,
+    pub attack: Option<Attack>,
 }
 
 /// How often the world thinks, which is what a step and a wait are measured
@@ -303,6 +363,9 @@ pub struct Attack {
     pub attacker: u16,
     pub target: u16,
     pub damage: u32,
+    /// Which of its skills it swung with, which is where the animation the
+    /// client plays comes from. Zero for a kind that has none.
+    pub skill: u16,
 }
 
 /// Every monster the table places, in id order.
@@ -484,8 +547,8 @@ mod tests {
         let player = (130.0, 100.0);
 
         let mut swung = None;
-        for _ in 0..10 {
-            if let Some(attack) = mob.think(Some((7, player)), now) {
+        for _ in 0..20 {
+            if let Some(attack) = mob.think(Some((7, player)), now).attack {
                 swung = Some(attack);
                 break;
             }
@@ -539,7 +602,7 @@ mod tests {
         let now = Instant::now();
         mob.wound(9999, now);
 
-        assert_eq!(mob.think(Some((7, (100.0, 100.0))), now), None);
+        assert_eq!(mob.think(Some((7, (100.0, 100.0))), now), Turn::default());
         assert_eq!(mob.position(), mob.home, "a corpse moved");
     }
 
@@ -567,14 +630,77 @@ mod tests {
         let now = Instant::now();
         let player = (105.0, 100.0);
 
-        assert!(mob.think(Some((7, player)), now).is_some(), "the first swing");
+        assert!(mob.think(Some((7, player)), now).attack.is_some(), "the first swing");
         assert!(
-            mob.think(Some((7, player)), now).is_none(),
+            mob.think(Some((7, player)), now).attack.is_none(),
             "it swung twice in the same instant"
         );
         assert!(
-            mob.think(Some((7, player)), now + ATTACK_EVERY).is_some(),
+            mob.think(Some((7, player)), now + ATTACK_EVERY).attack.is_some(),
             "it never swung again"
         );
+    }
+
+    /// A walk goes out as a destination, not as a step, and the server puts
+    /// the monster there straight away. Sending short steps every tick is
+    /// what made monsters look like they were teleporting: the client walked
+    /// them there, then they stood still until the next packet.
+    #[test]
+    fn a_walk_commits_to_a_destination_and_takes_time() {
+        let mut mob = walker();
+        let now = Instant::now();
+
+        let turn = mob.think(None, now);
+        let to = turn.walk.expect("it did not set off");
+
+        assert_eq!(mob.position(), to, "the server did not move it to where it is going");
+        assert!(mob.ready_at.is_some_and(|at| at > now), "it can decide again immediately");
+
+        // and it decides nothing more until it would have arrived
+        assert_eq!(mob.think(None, now), Turn::default(), "it decided again mid-walk");
+    }
+
+    /// A chase never commits further than the original allows, so a monster
+    /// keeps up with somebody who turns rather than running to where they
+    /// used to be.
+    #[test]
+    fn a_chase_never_commits_further_than_the_original_allows() {
+        let mut mob = walker();
+        let now = Instant::now();
+
+        let turn = mob.think(Some((7, (400.0, 100.0))), now);
+        let to = turn.walk.expect("it did not give chase");
+
+        let committed = ((to.0 - 100.0f32).powi(2) + (to.1 - 100.0f32).powi(2)).sqrt();
+        assert!(committed <= MAX_WALK + 0.01, "it committed {committed} in one go");
+    }
+
+    /// A longer walk takes longer, which is what stops a monster deciding
+    /// again before it has got anywhere.
+    #[test]
+    fn a_walk_takes_as_long_as_it_is_far() {
+        assert!(walk_time(70.0) > walk_time(10.0));
+        assert!(walk_time(0.0) >= Duration::from_millis(50), "a walk is never instant");
+        assert!(walk_time(100_000.0) <= Duration::from_secs(4), "and never forever");
+    }
+
+    /// A monster swings with one of its own skills, which is where the
+    /// animation the client plays comes from.
+    #[test]
+    fn a_blow_carries_the_skill_it_was_made_with() {
+        let mut mob = walker();
+        mob.skills = [0, 8216, 0, 0, 0];
+        let now = Instant::now();
+
+        let attack = mob
+            .think(Some((7, (105.0, 100.0))), now)
+            .attack
+            .expect("it did not swing");
+        assert_eq!(attack.skill, 8216, "the blow forgot which skill it was");
+
+        mob.skills = [0; 5];
+        mob.ready_at = None;
+        let attack = mob.think(Some((7, (105.0, 100.0))), now).attack.unwrap();
+        assert_eq!(attack.skill, 0, "a kind with no skills swings with none");
     }
 }

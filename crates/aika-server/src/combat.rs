@@ -162,7 +162,12 @@ pub struct Damage {
     pub attacker: u16,
     pub attacker_at: (f32, f32),
     pub attacker_hp: u32,
+    /// What the attacker plays, from the skill's `Anim`.
     pub animation: u16,
+    /// What the target plays — the flinch — from the skill's
+    /// `TargetAnimation`. Leaving this at zero is why a blow used to land in
+    /// silence with nobody reacting.
+    pub target_animation: u8,
     pub target: u16,
     pub target_hp: u32,
     pub blow: Blow,
@@ -190,6 +195,7 @@ impl Damage {
         put32(&mut body, off::ATTACKER_HP, self.attacker_hp);
         body[off::TARGET..off::TARGET + 2].copy_from_slice(&self.target.to_le_bytes());
         body[off::DAMAGE_KIND] = self.blow.kind;
+        body[off::TARGET_ANIMATION] = self.target_animation;
 
         // The damage field is 64 bits wide in the record.
         body[off::DAMAGE..off::DAMAGE + 8].copy_from_slice(&(self.blow.damage as u64).to_le_bytes());
@@ -232,6 +238,7 @@ mod tests {
             attacker_at: (0.0, 0.0),
             attacker_hp: 100,
             animation: 2,
+            target_animation: 26,
             target: 3048,
             target_hp: 50,
             blow: Blow { damage: 42, kind: DAMAGE_NORMAL },
@@ -249,6 +256,7 @@ mod tests {
             attacker_at: (3450.0, 690.0),
             attacker_hp: 520,
             animation: 2,
+            target_animation: 26,
             target: 3048,
             target_hp: 158,
             blow: Blow { damage: 42, kind: DAMAGE_CRITICAL },
@@ -267,6 +275,11 @@ mod tests {
             158
         );
         assert_eq!(body[off::DAMAGE_KIND], DAMAGE_CRITICAL);
+        assert_eq!(
+            body[off::TARGET_ANIMATION],
+            26,
+            "the flinch is what makes a blow look like it landed"
+        );
         assert_eq!(
             f32::from_le_bytes(body[off::ATTACKER_X..off::ATTACKER_X + 4].try_into().unwrap()),
             3450.0

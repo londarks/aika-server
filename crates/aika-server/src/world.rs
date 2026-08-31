@@ -12,7 +12,7 @@
 //! the shape of the answer is the same. A spatial grid belongs here later,
 //! behind the same methods.
 
-use crate::mob::{Attack, Mob};
+use crate::mob::{Attack, Mob, Turn};
 use crate::store::Character;
 use aika_data::npc::Npc;
 use std::collections::HashMap;
@@ -146,8 +146,8 @@ impl World {
     /// The positions of the players are passed in rather than read under the
     /// same lock: taking both locks in one place is how two of them end up
     /// taken in the other order somewhere else.
-    pub fn think_mobs(&self, players: &[(u16, (f32, f32))], now: Instant) -> Vec<(u16, Attack)> {
-        let mut swings = Vec::new();
+    pub fn think_mobs(&self, players: &[(u16, (f32, f32))], now: Instant) -> Vec<(Mob, Turn)> {
+        let mut turns = Vec::new();
         let mut mobs = self.mobs.lock().unwrap();
 
         for mob in mobs.iter_mut().filter(|m| m.is_alive()) {
@@ -158,12 +158,15 @@ impl World {
                 .min_by(|a, b| a.2.total_cmp(&b.2))
                 .map(|(id, at, _)| (id, at));
 
-            if let Some(attack) = mob.think(nearest, now) {
+            let turn = mob.think(nearest, now);
+            if let Some(attack) = turn.attack {
                 mob.last_hurt_by = Some(attack.target);
-                swings.push((mob.id, attack));
+            }
+            if turn != Turn::default() {
+                turns.push((mob.clone(), turn));
             }
         }
-        swings
+        turns
     }
 
     /// Leaves a blow for a player to find on its next packet.

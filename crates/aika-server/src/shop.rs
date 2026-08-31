@@ -119,7 +119,7 @@ pub fn resale_value(def: &aika_data::itemlist::ItemDef, item: &Item, stacks: boo
 /// that says no.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShopError {
-    /// The client asked a different NPC than the one it has open.
+    /// No such NPC, or the player is not standing near enough to trade.
     WrongNpc,
     /// The slot the client named holds nothing.
     EmptySlot,
@@ -140,7 +140,7 @@ impl ShopError {
     /// What the player is told.
     pub fn message(&self) -> String {
         match self {
-            ShopError::WrongNpc => "That shop is not open.".into(),
+            ShopError::WrongNpc => "You are too far from the shop.".into(),
             ShopError::EmptySlot => "There is nothing there.".into(),
             ShopError::UnknownItem(id) => format!("Item {id} does not exist."),
             ShopError::NotForSale => "That is not for sale.".into(),

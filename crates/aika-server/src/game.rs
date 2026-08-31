@@ -39,6 +39,16 @@ pub const OP_CLIENT_READY: u16 = 0xF0B;
 /// Client to server: walked to a point. The server returns nothing to the
 /// mover, it only relays to the others who can see them.
 pub const OP_MOVE: u16 = 0x301;
+/// `TSendClientIndexPacket`: which mob on screen is the player's own.
+/// Without it the client has a world it cannot attach its camera to.
+pub const OP_CLIENT_INDEX: u16 = 0x117;
+/// Three more the original sends around the world packet. Their contents are
+/// zero and their meaning is unknown; what is known is the order.
+pub const OP_ENTER_3A2: u16 = 0x3A2;
+pub const OP_ENTER_131: u16 = 0x131;
+pub const OP_ENTER_12C: u16 = 0x12C;
+pub const OP_ENTER_94C: u16 = 0x94C;
+
 /// `TSignalData`: which way the player is facing.
 pub const OP_ROTATE: u16 = 0x305;
 /// `TMoveItemPacket`: drag an item from one slot to another.
@@ -115,6 +125,19 @@ const HP_MP_SIZE: usize = 32;
 /// (`Mob/BaseMob.pas:2434`), so the field reads `CC 00`.
 const LEVEL_UNK: u16 = 0x00CC;
 
+/// Sizes of the world-entry packets, from their records in `Data/Packets.pas`.
+const CLIENT_INDEX_SIZE: usize = 20;
+const ENTER_3A2_SIZE: usize = 20;
+const ENTER_131_SIZE: usize = 20;
+const ENTER_12C_SIZE: usize = 96;
+const ENTER_94C_SIZE: usize = 164;
+/// The one value in any of them that is not zero (`Tp131.Unk_1`).
+const ENTER_131_MARKER: u32 = 0xFFFF_FFFF;
+/// The two storage slots the original refreshes on the way in. Storage is not
+/// modelled yet, so they go out empty, which is what an untouched account
+/// would have sent anyway.
+const ENTER_STORAGE_SLOTS: [u16; 2] = [54, 55];
+
 /// `TClientMessagePacket`, 144 bytes in total.
 const CLIENT_MESSAGE_SIZE: usize = 144;
 /// The text field inside it: 128 bytes, NUL terminated. The original walks it
@@ -177,6 +200,11 @@ const NPC_EFFECT_TYPE: u16 = 1;
 const SPAWN_UNK0: u8 = 0x0A;
 const SPAWN_EFFECT_1: u16 = 0x1D;
 const SPAWN_ARMA_REFINE: u8 = 15;
+/// Spawn types (`Data/GlobalDefs.pas:211`): 0 is somebody who was already
+/// there coming into view, 1 is somebody arriving or teleporting in. The
+/// client draws them differently, so a player logging in next to you should
+/// not look like one who was standing there all along.
+const SPAWN_TELEPORT_IN: u8 = 1;
 /// `SPAWN_NORMAL` in `Data/GlobalDefs.pas:211`. There is also 1 (teleport)
 /// and 2 (offspring birth); bit 0x80 is added when the player is in PK.
 const SPAWN_NORMAL: u8 = 0;
@@ -574,15 +602,31 @@ fn handle_enter_world(session: &mut Session, message: &Message, time: u32) -> Ac
     info!(user = %account.username, character = %character.name, slot, "entering the world");
 
     let client_id = session.client_id;
-    let mut frames = Vec::with_capacity(5);
 
-    // The order is the original's (`Mob/Player.pas:3409-3443`): one 0xCCCC
-    // signal, three 0x186 and then the character.
-    frames.push(encode_signal(OP_SIGNAL_READY, client_id, time, 1));
-    for _ in 0..3 {
-        frames.push(encode_signal(OP_SIGNAL_LOAD, client_id, time, 1));
+    // The exact order the original sends (`Mob/Player.pas:3642-3657`). It is
+    // not decoration: the client will not finish arriving until it has all of
+    // it, and the one that matters most is `0x117`, which says which mob on
+    // screen is the player's own. Without that the client has a world and
+    // nothing to put its camera on, so it keeps the arrival camera up and
+    // asks again with `0xF0B` twice a second.
+    let mut frames = vec![
+        encode_signal(OP_SIGNAL_READY, client_id, time, 1),
+        zeroed(OP_ENTER_3A2, client_id, ENTER_3A2_SIZE),
+        encode_signal(OP_SIGNAL_LOAD, client_id, time, 1),
+        encode_signal(OP_SIGNAL_LOAD, client_id, time, 1),
+        encode_signal(OP_SIGNAL_LOAD, client_id, time, 1),
+        encode_enter_131(),
+        encode_send_to_world(&account, &character, client_id, time),
+        zeroed(OP_ENTER_12C, 0, ENTER_12C_SIZE),
+    ];
+
+    // Two storage slots and the client index, interleaved exactly as the
+    // original interleaves them.
+    for slot in ENTER_STORAGE_SLOTS {
+        frames.push(encode_refresh_item(inventory::STORAGE, slot, &Item::default(), false));
+        frames.push(encode_client_index(client_id));
     }
-    frames.push(encode_send_to_world(&account, &character, client_id, time));
+    frames.push(zeroed(OP_ENTER_94C, 0, ENTER_94C_SIZE));
 
     session.character = Some(character);
     Action::Reply(frames)
@@ -620,7 +664,10 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
     // Everyone already standing nearby has to appear on this player's screen,
     // and this player on theirs. Both directions use the same spawn packet.
     let neighbours = state.world.visible_to(session.client_id);
-    let mine = encode_spawn(&character, session.client_id);
+
+    // Everyone nearby sees an arrival, not somebody who was always there.
+    // The original makes the same distinction (`Mob/Player.pas:5185`).
+    let mine = encode_spawn_as(&character, session.client_id, SPAWN_TELEPORT_IN);
     for other in &neighbours {
         if let Some(their_character) = &other.character {
             frames.push(encode_spawn(their_character, other.client_id));
@@ -1043,6 +1090,11 @@ impl Movement {
 /// player's own; the neighbour one lands once there is a registry of
 /// online players exists.
 fn encode_spawn(character: &Character, client_id: u16) -> Vec<u8> {
+    encode_spawn_as(character, client_id, SPAWN_NORMAL)
+}
+
+/// The same, saying how the creature is appearing.
+fn encode_spawn_as(character: &Character, client_id: u16, spawn_type: u8) -> Vec<u8> {
     use spawn_offset as off;
     let mut body = vec![0u8; off::BODY_SIZE];
 
@@ -1078,7 +1130,7 @@ fn encode_spawn(character: &Character, client_id: u16) -> Vec<u8> {
 
     body[off::UNK0] = SPAWN_UNK0;
     body[off::SPEED_MOVE] = character.speed_move;
-    body[off::SPAWN_TYPE] = SPAWN_NORMAL;
+    body[off::SPAWN_TYPE] = spawn_type;
     body[off::SIZES..off::SIZES + 4].copy_from_slice(&character.sizes);
 
     // Without a guild, the field carries only the nation shifted 12 bits.
@@ -1278,17 +1330,29 @@ fn handle_sell(state: &State, session: &mut Session, message: &Message) -> Actio
     }
 }
 
-/// The NPC whose shop this session has open, if the client named the same one.
+/// The NPC the client says it is trading with, if it may.
 ///
-/// Checked on every purchase rather than once on opening: the id in the packet
-/// is the word of the client, and a modified one would otherwise buy from a
-/// shop it never walked to.
+/// The gate is distance, not a flag saying the window is open. Two reasons.
+/// The flag was wrong: the client closes the option menu the moment the shop
+/// window replaces it, and pressing escape closes it too, so a real player
+/// buying normally would be refused. And the flag was never the security
+/// property — standing next to the NPC is. A client that sends a purchase
+/// without opening a window first has done nothing it could not have done by
+/// clicking, since the stock and the prices are ours.
+///
+/// The original checks a flag it only ever sets when the player picks *talk*
+/// or *quest*, which means buying from a merchant with neither of those on
+/// its menu — Roze, for one — could never have worked there either.
 fn open_shop<'a>(state: &'a State, session: &Session, claimed: u16) -> Option<&'a Npc> {
-    if session.opened_npc != Some(claimed) {
-        debug!(claimed, open = ?session.opened_npc, "shop packet for an npc that is not open");
+    let npc = state.world.npcs().iter().find(|n| n.id == claimed)?;
+
+    let character = session.character.as_ref()?;
+    let at = (character.x as f32, character.y as f32);
+    if !within(at, (npc.x, npc.y), dialog::TALK_RANGE) {
+        debug!(claimed, "shop packet from too far away");
         return None;
     }
-    state.world.npcs().iter().find(|n| n.id == claimed)
+    Some(npc)
 }
 
 /// `0x70F`: an item dragged from one slot to another.
@@ -1578,6 +1642,29 @@ async fn handle_create_character(
     let account = state.store.get(&username).unwrap_or_else(|| account.clone());
     session.account = Some(account.clone());
     Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
+}
+
+/// `TSendClientIndexPacket` (`0x117`): the id of the mob the player is.
+fn encode_client_index(client_id: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(CLIENT_INDEX_SIZE - MIN_FRAME);
+    body.extend_from_slice(&(client_id as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+
+    debug_assert_eq!(body.len() + MIN_FRAME, CLIENT_INDEX_SIZE);
+    frame::encode(
+        &Message { sender: 0, opcode: OP_CLIENT_INDEX, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `Tp131` (`0x131`): zero except for one field of all ones.
+fn encode_enter_131() -> Vec<u8> {
+    let mut body = Vec::with_capacity(ENTER_131_SIZE - MIN_FRAME);
+    body.extend_from_slice(&ENTER_131_MARKER.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+
+    debug_assert_eq!(body.len() + MIN_FRAME, ENTER_131_SIZE);
+    frame::encode(&Message { sender: 0, opcode: OP_ENTER_131, time: 0, body }, rand::random())
 }
 
 /// `TSignalData` (`Data/Packets.pas:31`): a header and one DWORD. 16 bytes.
@@ -2004,6 +2091,12 @@ mod tests {
         assert_eq!(u64::from_le_bytes(slot1[80..88].try_into().unwrap()), 1234, "gold");
     }
 
+    /// The whole arrival sequence, in order.
+    ///
+    /// Order and completeness both matter here: the client will not finish
+    /// arriving until it has all of it, and it was three packets short of
+    /// this for a while, which left the arrival camera up and the client
+    /// asking again twice a second.
     #[tokio::test]
     async fn entering_the_world_sends_the_delphi_sequence() {
         let state = state_with(vec![dev_character("Athus", 0)]);
@@ -2013,52 +2106,54 @@ mod tests {
         let Action::Reply(frames) = handle_message(&state, &mut session, &enter).await else {
             panic!("expected the world entry sequence");
         };
-        assert_eq!(frames.len(), 5, "0xCCCC, three 0x186 and the 0x925");
 
-        let opcodes: Vec<u16> = frames.iter().map(|f| decode(f).opcode).collect();
         assert_eq!(
-            opcodes,
-            vec![OP_SIGNAL_READY, OP_SIGNAL_LOAD, OP_SIGNAL_LOAD, OP_SIGNAL_LOAD, OP_SEND_TO_WORLD]
+            opcodes(&frames),
+            vec![
+                OP_SIGNAL_READY,
+                OP_ENTER_3A2,
+                OP_SIGNAL_LOAD,
+                OP_SIGNAL_LOAD,
+                OP_SIGNAL_LOAD,
+                OP_ENTER_131,
+                OP_SEND_TO_WORLD,
+                OP_ENTER_12C,
+                shop::OP_REFRESH_ITEM,
+                OP_CLIENT_INDEX,
+                shop::OP_REFRESH_ITEM,
+                OP_CLIENT_INDEX,
+                OP_ENTER_94C,
+            ],
+            "the arrival sequence is not the one the original sends"
         );
 
-        // the signals are TSignalData: header plus one DWORD
-        assert_eq!(frames[0].len(), 16);
-        assert_eq!(decode(&frames[0]).body, 1u32.to_le_bytes());
-
-        // and the character is exactly the size the client expects
-        let world = &frames[4];
-        assert_eq!(world.len(), SEND_TO_WORLD_SIZE, "0x925 must be 6400 bytes");
-
-        let message = decode(world);
-        assert_eq!(message.sender, SEND_TO_WORLD_INDEX, "the Index is fixed in this packet");
-        assert_eq!(u32::from_le_bytes(message.body[0..4].try_into().unwrap()), 1, "serial");
-
-        use character_offset as off;
-        let ch = &message.body[4..];
-        assert_eq!(ch.len(), CHARACTER_SIZE);
-        assert_eq!(read_fixed_str(&ch[off::NAME..off::NAME + 16]), "Athus");
-        assert_eq!(ch[off::NATION], 2);
-        assert_eq!(ch[off::CLASS_INFO], 1, "base class derived from index 20");
+        // The one packet in there the client cannot do without: which mob on
+        // screen is its own.
+        let index = decode(&frames[9]);
         assert_eq!(
-            u16::from_le_bytes(ch[off::LEVEL..off::LEVEL + 2].try_into().unwrap()),
-            29,
-            "level 30 travels as 29"
+            u32::from_le_bytes(index.body[0..4].try_into().unwrap()),
+            TEST_CLIENT_ID as u32,
+            "the client is told the wrong id for itself"
         );
-        assert_eq!(
-            u16::from_le_bytes(ch[off::EQUIP..off::EQUIP + 2].try_into().unwrap()),
-            20,
-            "Equip[0] is the class"
-        );
-        assert_eq!(
-            u16::from_le_bytes(ch[off::EQUIP + 20..off::EQUIP + 22].try_into().unwrap()),
-            7702,
-            "Equip[1] is the hair"
-        );
-        assert_eq!(u64::from_le_bytes(ch[off::GOLD..off::GOLD + 8].try_into().unwrap()), 1234);
-        assert!(
-            u32::from_le_bytes(ch[off::MAX_HP..off::MAX_HP + 4].try_into().unwrap()) > 0,
-            "without health the character is born dead"
-        );
+
+        // and each one is the size its record declares
+        for (frame, size) in frames.iter().zip([
+            SIGNAL_SIZE,
+            ENTER_3A2_SIZE,
+            SIGNAL_SIZE,
+            SIGNAL_SIZE,
+            SIGNAL_SIZE,
+            ENTER_131_SIZE,
+            SEND_TO_WORLD_SIZE,
+            ENTER_12C_SIZE,
+            shop::REFRESH_ITEM_SIZE,
+            CLIENT_INDEX_SIZE,
+            shop::REFRESH_ITEM_SIZE,
+            CLIENT_INDEX_SIZE,
+            ENTER_94C_SIZE,
+        ]) {
+            assert_eq!(frame.len(), size, "wrong size for 0x{:X}", decode(frame).opcode);
+        }
     }
 
     /// `0x349` is what pulls the character out of limbo: without it the client
@@ -2630,10 +2725,11 @@ mod tests {
         assert_eq!(u64::from_le_bytes(money.body[4..12].try_into().unwrap()), 1500);
     }
 
-    /// The id in a buy packet is the word of the client. Without the check,
-    /// a modified one buys from a shop it never walked to.
+    /// Standing next to the merchant is what allows a purchase, not having
+    /// clicked a window first: the client closes the option menu the moment
+    /// the shop replaces it, and escape closes it too.
     #[tokio::test]
-    async fn buying_from_a_shop_that_was_never_opened_is_refused() {
+    async fn buying_without_opening_the_window_works_when_standing_there() {
         let state = shop_state();
         let mut session = in_world(&state).await;
         session.character.as_mut().unwrap().gold = 2000;
@@ -2646,15 +2742,58 @@ mod tests {
         };
         let frames = frames_of(handle_message(&state, &mut session, &buy).await);
 
+        assert_eq!(opcodes(&frames), vec![shop::OP_REFRESH_ITEM, shop::OP_REFRESH_MONEY]);
+        assert_eq!(session.character.as_ref().unwrap().gold, 1500);
+    }
+
+    /// Buying from across the map is what a modified client would try, and
+    /// distance is the thing it cannot lie about: the server owns the
+    /// position.
+    #[tokio::test]
+    async fn buying_from_across_the_map_is_refused() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session.character.as_mut().unwrap().gold = 2000;
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::SHOP)).await;
+
+        session.character.as_mut().unwrap().x = 9000;
+
+        let buy = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: shop::OP_BUY,
+            time: 0,
+            body: shop::Buy { npc: 2050, slot: 0, amount: 1 }.to_body(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &buy).await);
+
         assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
+        assert_eq!(message_text(&frames[0]), "You are too far from the shop.");
         assert_eq!(session.character.as_ref().unwrap().gold, 2000, "gold was taken anyway");
         assert!(session.character.as_ref().unwrap().items.is_empty());
     }
 
-    /// Walking away closes the shop, and the next purchase has to fail with
-    /// it. This is the same hole as above, reached by playing normally.
+    /// An npc id nobody has is refused rather than crashing a lookup.
     #[tokio::test]
-    async fn walking_away_closes_the_shop() {
+    async fn buying_from_an_npc_that_does_not_exist_is_refused() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+
+        let buy = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: shop::OP_BUY,
+            time: 0,
+            body: shop::Buy { npc: 9999, slot: 0, amount: 1 }.to_body(),
+        };
+        assert_eq!(
+            opcodes(&frames_of(handle_message(&state, &mut session, &buy).await)),
+            vec![OP_CLIENT_MESSAGE]
+        );
+    }
+
+    /// Walking away with the window still open stops the purchases too,
+    /// which is the same rule reached by playing normally.
+    #[tokio::test]
+    async fn walking_away_stops_the_shop_working() {
         let state = shop_state();
         let mut session = in_world(&state).await;
         session.character.as_mut().unwrap().gold = 2000;
@@ -2993,5 +3132,42 @@ mod tests {
         // panic and the value is unchanged; the point is that it is cheap
         handle_message(&state, &mut session, &turn).await;
         assert_eq!(session.rotation, 90);
+    }
+
+    /// A player arriving is drawn differently from one walking into view, and
+    /// the difference is one byte the client reads.
+    #[tokio::test]
+    async fn a_player_arriving_is_announced_as_an_arrival() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = logged_in(&state).await;
+        handle_message(&state, &mut session, &enter_world(0)).await;
+
+        // the arriving player and a watcher already standing there
+        session.client_id =
+            state.world.connect(tokio::sync::mpsc::unbounded_channel().0).unwrap();
+        let (tx, mut watcher_rx) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = state.world.connect(tx).expect("room for a watcher");
+        let character = session.character.clone().unwrap();
+        state.world.enter(watcher, character.clone());
+
+        handle_client_ready(&state, &mut session);
+
+        let mut seen = None;
+        while let Ok(frame) = watcher_rx.try_recv() {
+            let message = decode(&frame);
+            if message.opcode == OP_CREATE_MOB {
+                seen = Some(message);
+            }
+        }
+        let arrival = seen.expect("the watcher never saw the arrival");
+        assert_eq!(
+            arrival.body[spawn_offset::SPAWN_TYPE],
+            SPAWN_TELEPORT_IN,
+            "an arrival was drawn as somebody who was already there"
+        );
+
+        // the copy the player gets of itself is the ordinary kind
+        let own = decode(&world_burst(&character, session.client_id)[0]);
+        assert_eq!(own.body[spawn_offset::SPAWN_TYPE], SPAWN_NORMAL);
     }
 }

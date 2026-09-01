@@ -51,7 +51,10 @@ pub struct Item {
     pub durability_min: u8,
     pub durability_max: u8,
     pub refine: u16,
-    pub expires_at: u16,
+    /// When the item runs out, as the record carries it: whole days since a
+    /// base date for a mount, three bytes of shifted unix time for anything
+    /// else. Zero for an item that does not run out. See [`crate::expiry`].
+    pub expires_at: u32,
 }
 
 impl Item {

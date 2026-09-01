@@ -46,6 +46,10 @@ pub mod field {
     pub const PRICE_GOLD: usize = 288;
     pub const SELL_PRICE: usize = 292;
     pub const CLASS: usize = 300;
+    /// Whether the item runs out, which is not the same as how long it
+    /// lasts: `Expires: Boolean` in `TItemFromList`, the byte before
+    /// `Unk_Bool` and two words before the level.
+    pub const EXPIRES: usize = 328;
     pub const LEVEL: usize = 330;
     pub const DURATION: usize = 336;
     pub const ATTACK: usize = 358;
@@ -171,6 +175,15 @@ impl ItemDef {
         u16le(&self.raw, field::LEVEL)
     }
 
+    /// Whether this item runs out. The duration below only says how long
+    /// it lasts once it has been given; this is what decides whether it is
+    /// stamped with an expiry at all (`PutItem` calls `SetItemDuration`
+    /// only for these).
+    pub fn expires(&self) -> bool {
+        self.raw[field::EXPIRES] != 0
+    }
+
+    /// How long it lasts once given, in hours.
     pub fn duration(&self) -> u32 {
         u32le(&self.raw, field::DURATION)
     }

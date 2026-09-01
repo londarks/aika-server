@@ -323,7 +323,7 @@ pub fn buy(
         return Err(ShopError::BagFull);
     }
 
-    let bought = Item {
+    let mut bought = Item {
         index: id,
         appearance: id,
         refine: amount as u16,
@@ -331,6 +331,11 @@ pub fn buy(
         durability_max: def.durability(),
         ..Item::default()
     };
+    // An item that is lent rather than sold starts its clock here, which is
+    // where the original starts it too (`PutItem` calls `SetItemDuration`).
+    // Without it a thirty-day saddle arrives already expired and the client
+    // will not so much as let it be clicked.
+    crate::expiry::stamp(&mut bought, items, crate::expiry::now());
     let slot = inventory.add(bought.clone())?;
 
     let item = inventory.get(crate::inventory::BAG, slot).cloned().unwrap_or(bought);
@@ -455,6 +460,17 @@ mod tests {
         define(4204, 0, false, 1); // no price at all
         define(5000, 1, false, 1); // a price of one, which the original refuses
         define(9000, 100, false, UNSELLABLE_RARITY); // the rarest, unsellable
+
+        // A saddle, lent for thirty days rather than sold outright.
+        {
+            use aika_data::itemlist::{field, RECORD_SIZE};
+            let r = &mut raw[SADDLE as usize * RECORD_SIZE..(SADDLE as usize + 1) * RECORD_SIZE];
+            r[field::NAME.start] = b'x';
+            r[field::SELL_PRICE..field::SELL_PRICE + 4].copy_from_slice(&50u32.to_le_bytes());
+            r[field::ITEM_TYPE..field::ITEM_TYPE + 2].copy_from_slice(&715u16.to_le_bytes());
+            r[field::DURATION..field::DURATION + 4].copy_from_slice(&720u32.to_le_bytes());
+            r[field::EXPIRES] = 1;
+        }
 
         // priced in something other than gold
         let mut currency = |id: usize, honor: u32, medal: u32, base: u32| {
@@ -592,6 +608,32 @@ mod tests {
         let sword = buy(&npc, buy_request(1, 20), &mut inv, 1000, &table).unwrap();
         assert_eq!(sword.gold, 500, "a sword is one sword however many were asked for");
         assert_eq!(sword.item.refine, 1, "and it arrives as one of them, not none");
+    }
+
+    /// An item that is lent rather than sold leaves the shop with its clock
+    /// already running. Without that the client sees a thirty-day saddle whose
+    /// time is zero, treats it as spent, and will not let it be used at all —
+    /// which is exactly how the mount looked broken.
+    const SADDLE: u16 = 4503;
+
+    #[test]
+    fn a_timed_item_leaves_the_shop_with_its_clock_running() {
+        let items = item_table();
+        let mut inv = Inventory::new();
+        let npc = merchant(&[SADDLE]);
+
+        let change = buy(&npc, Buy { npc: 1, slot: 0, amount: 1 }, &mut inv, 1000, &items)
+            .expect("the saddle is for sale");
+
+        assert_ne!(change.item.expires_at, 0, "the saddle arrived already expired");
+
+        // And it is the unix encoding, not the mount one: a saddle is type 715.
+        let expected = crate::expiry::encode(
+            715,
+            crate::expiry::expiry_of(crate::expiry::now(), 720),
+        );
+        let apart = change.item.expires_at.abs_diff(expected);
+        assert!(apart <= 1, "the expiry is {apart} steps from thirty days away");
     }
 
     /// Item 6003 is priced in two of item 4204, the way the "moeda da

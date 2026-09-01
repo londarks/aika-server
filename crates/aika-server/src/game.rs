@@ -12,7 +12,7 @@
 use crate::state::State;
 use crate::inventory::{self, Inventory};
 use crate::store::{Account, Character, Item, MAX_CHARACTERS};
-use crate::{ability, combat, creation, dialog, shop, stats};
+use crate::{ability, combat, creation, dialog, expiry, shop, stats};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
 use aika_data::itemlist::ItemList;
 use aika_data::npc::Npc;
@@ -1672,7 +1672,9 @@ fn write_item(out: &mut [u8], item: &Item) {
     out[14] = item.durability_min;
     out[15] = item.durability_max;
     out[16..18].copy_from_slice(&item.refine.to_le_bytes());
-    out[18..20].copy_from_slice(&item.expires_at.to_le_bytes());
+    // Last, because for everything but a mount the expiry overlaps the top
+    // byte of the count above and is the one that wins.
+    expiry::write_into(out, item);
 }
 
 
@@ -3586,7 +3588,7 @@ fn loot_from(state: &State, session: &mut Session, target: &crate::mob::Mob) -> 
         return Vec::new();
     };
 
-    let dropped = Item {
+    let mut dropped = Item {
         index: id,
         appearance: id,
         refine: 1,
@@ -3594,6 +3596,9 @@ fn loot_from(state: &State, session: &mut Session, target: &crate::mob::Mob) -> 
         durability_max: def.durability(),
         ..Item::default()
     };
+    // Same clock as a purchase: what a monster leaves behind can be a timed
+    // item too, and it starts running when it is picked up.
+    expiry::stamp(&mut dropped, &state.items, expiry::now());
 
     let Some(character) = session.character.as_mut() else {
         return Vec::new();

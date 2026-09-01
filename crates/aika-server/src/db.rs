@@ -403,7 +403,7 @@ impl Database {
                     durability_min: row.try_get::<i64, _>("durability_min")? as u8,
                     durability_max: row.try_get::<i64, _>("durability_max")? as u8,
                     refine: row.try_get::<i64, _>("refine")? as u16,
-                    expires_at: row.try_get::<i64, _>("expires_at")? as u16,
+                    expires_at: row.try_get::<i64, _>("expires_at")? as u32,
                 })
             })
             .collect()
@@ -450,7 +450,7 @@ impl Database {
                     durability_min: row.try_get::<i64, _>("durability_min")? as u8,
                     durability_max: row.try_get::<i64, _>("durability_max")? as u8,
                     refine: row.try_get::<i64, _>("refine")? as u16,
-                    expires_at: row.try_get::<i64, _>("expires_at")? as u16,
+                    expires_at: row.try_get::<i64, _>("expires_at")? as u32,
                 })
             })
             .collect()

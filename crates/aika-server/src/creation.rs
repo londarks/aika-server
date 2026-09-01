@@ -691,6 +691,6 @@ fn from_template(item: aika_data::template::Item, container: u8) -> Item {
         durability_min: item.durability_min,
         durability_max: item.durability_max,
         refine: item.refine,
-        expires_at: item.expires_at,
+        expires_at: item.expires_at as u32,
     }
 }

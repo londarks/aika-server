@@ -106,6 +106,9 @@ pub const OP_ADD_BUFF: u16 = 0x16F;
 /// `TUseMountSkill` (`Data/Packets.pas:140`): one of the mount's own two
 /// skills (`UseMountSkill`, `$218`).
 pub const OP_MOUNT_SKILL: u16 = 0x218;
+/// `TRemoveBuffPacket`: the player clicked a buff away (`RemoveBuff`,
+/// `$329`). The body is the skill that started it.
+pub const OP_REMOVE_BUFF: u16 = 0x329;
 /// `TGetStatusPointPacket` (`Data/Packets.pas:2150`): the player spent free
 /// points on an attribute (`GetStatusPoint`, `$213`).
 pub const OP_STATUS_POINT: u16 = 0x213;
@@ -900,6 +903,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         OP_USE_BUFF_ITEM => handle_use_buff_item(state, session, message),
         OP_MOUNT_SKILL => handle_mount_skill(state, session, message),
         OP_STATUS_POINT => handle_status_point(state, session, message),
+        OP_REMOVE_BUFF => handle_remove_buff(state, session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
@@ -1294,11 +1298,21 @@ fn encode_level(character: &Character, client_id: u16) -> Vec<u8> {
 
 /// `0x103` `TSendCurrentHPMPPacket`: maximum and current HP and MP.
 fn encode_hp_mp(character: &Character, client_id: u16, hp: u32, mp: u32) -> Vec<u8> {
-    let _ = character;
+    // `MaxHP, CurHP, MaxMP, CurMP` in that order
+    // (`TSendCurrentHPMPPacket`, `Data/Packets.pas:478`). The two arguments are
+    // what the character has *now*; the ceilings are worked out here.
+    //
+    // Writing the current value into both fields is what made the client say
+    // there was no mana while the bar still looked full: every spell cast
+    // lowered the maximum along with the amount, so after a few the client
+    // believed the pool itself had shrunk to nothing.
+    let (max_hp, max_mp) = vitals(character);
+    let (hp, mp) = (hp.min(max_hp), mp.min(max_mp));
+
     let mut body = vec![0u8; HP_MP_SIZE - MIN_FRAME];
-    body[0..4].copy_from_slice(&hp.to_le_bytes());
+    body[0..4].copy_from_slice(&max_hp.to_le_bytes());
     body[4..8].copy_from_slice(&hp.to_le_bytes());
-    body[8..12].copy_from_slice(&mp.to_le_bytes());
+    body[8..12].copy_from_slice(&max_mp.to_le_bytes());
     body[12..16].copy_from_slice(&mp.to_le_bytes());
     // The last field marks an update rather than a login; 0 on this path.
     frame::encode(
@@ -3083,11 +3097,13 @@ fn handle_chest_gold(session: &mut Session, message: &Message) -> Action {
 /// original packs them from the front and leaves the rest zero, which is what
 /// tells the client the row is empty.
 fn encode_buffs(client_id: u16, buffs: &crate::buffs::Buffs, skills: &SkillTable) -> Vec<u8> {
+    let now = std::time::SystemTime::now();
     let mut body = vec![0u8; BUFFS_SIZE - MIN_FRAME];
     for (i, (skill, ends_at)) in buffs.running(skills).into_iter().enumerate() {
         body[i * 2..i * 2 + 2].copy_from_slice(&(skill as u16).to_le_bytes());
         let at = BUFFS_TIMES_AT + i * 4;
-        body[at..at + 4].copy_from_slice(&crate::buffs::unix(ends_at).to_le_bytes());
+        let left = crate::buffs::remaining(ends_at, now);
+        body[at..at + 4].copy_from_slice(&left.to_le_bytes());
     }
 
     debug_assert_eq!(body.len() + MIN_FRAME, BUFFS_SIZE);
@@ -3105,7 +3121,8 @@ fn encode_add_buff(
 ) -> Vec<u8> {
     let mut body = vec![0u8; ADD_BUFF_SIZE - MIN_FRAME];
     body[0..4].copy_from_slice(&(skill as u32).to_le_bytes());
-    body[4..8].copy_from_slice(&crate::buffs::unix(ends_at).to_le_bytes());
+    let left = crate::buffs::remaining(ends_at, std::time::SystemTime::now());
+    body[4..8].copy_from_slice(&left.to_le_bytes());
 
     debug_assert_eq!(body.len() + MIN_FRAME, ADD_BUFF_SIZE);
     frame::encode(
@@ -3237,6 +3254,41 @@ fn handle_mount_skill(state: &State, session: &mut Session, message: &Message) -
 /// something to spend points on.
 const ATTRIBUTE_COUNT: u32 = 5;
 const FREE_POINTS: usize = 5;
+
+/// `0x329`: the player clicked a buff off (`RemoveBuff`).
+///
+/// The body names the skill that started it. Without this a buff that does
+/// not run out on its own -- a mount's -- can never be got rid of, and the
+/// player stays mounted with nothing to ride.
+///
+/// The original answers with the fresh list, the vitals, the sheet and the
+/// points, because taking an effect off changes all four.
+fn handle_remove_buff(state: &State, session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < 4 {
+        warn!(size = message.body.len(), "0x329 packet too short");
+        return Action::Ignore;
+    }
+    let skill = u32::from_le_bytes(message.body[0..4].try_into().unwrap()) as usize;
+    if !session.buffs.remove(skill) {
+        debug!(skill, "0x329 for a buff that is not running");
+        return Action::Ignore;
+    }
+    info!(skill, "buff taken off");
+
+    let client_id = session.client_id;
+    let effects = session.effects(state);
+    let mut frames = vec![encode_buffs(client_id, &session.buffs, &state.skills)];
+    if let Some(character) = session.character.as_ref() {
+        let (max_hp, max_mp) = vitals(character);
+        session.cur_hp = session.cur_hp.min(max_hp);
+        session.cur_mp = session.cur_mp.min(max_mp);
+        let character = session.character.as_ref().expect("checked above");
+        frames.push(encode_hp_mp(character, client_id, session.cur_hp, session.cur_mp));
+        frames.push(encode_refresh_status(character, &state.items, &effects));
+        frames.push(encode_refresh_point(character));
+    }
+    Action::Reply(frames)
+}
 
 /// `0x213`: spend free points on an attribute (`GetStatusPoint`).
 ///
@@ -6042,10 +6094,11 @@ mod tests {
         );
     }
 
-    /// The list the client draws its icons from has to name the buff and say
-    /// when it ends.
+    /// The list names the buff and says **how long is left**, not when it
+    /// ends. Sending the moment instead is what put "689 Mês" on the screen
+    /// for a buff of one hour: the client draws the number as a duration.
     #[tokio::test]
-    async fn the_buff_list_says_what_is_running_and_until_when() {
+    async fn the_buff_list_counts_down_rather_than_naming_a_moment() {
         let state = buff_state();
         let mut session = in_world(&state).await;
         carrying(&mut session, SADDLE, 7);
@@ -6057,10 +6110,67 @@ mod tests {
             SADDLE_SKILL as u16,
             "the first slot does not name the skill"
         );
-        let ends = u32::from_le_bytes(body[BUFFS_TIMES_AT..BUFFS_TIMES_AT + 4].try_into().unwrap());
-        let now = crate::buffs::unix(Some(std::time::SystemTime::now()));
-        assert!(ends > now, "the buff is already over");
-        assert!(ends - now <= 3600, "an hour's buff lasts longer than an hour");
+
+        // The fixture saddle lasts an hour, so the field is an hour and a
+        // little less — never a unix timestamp, which is a billion and a half.
+        let left = u32::from_le_bytes(body[BUFFS_TIMES_AT..BUFFS_TIMES_AT + 4].try_into().unwrap());
+        assert!(left > 3500, "the buff is nearly over already: {left}");
+        assert!(left <= 3600, "an hour's buff has more than an hour left: {left}");
+    }
+
+    /// The pool and what is left in it are two different fields, and putting
+    /// the second in both is what made the client say there was no mana while
+    /// the bar still looked full: every spell shrank the maximum too.
+    #[tokio::test]
+    async fn spending_mana_does_not_shrink_the_pool() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        let character = session.character.as_ref().unwrap();
+        let (max_hp, max_mp) = vitals(character);
+
+        let spent = max_mp / 4;
+        let frame = encode_hp_mp(character, session.client_id, max_hp, max_mp - spent);
+        let body = decode(&frame).body;
+        let at = |i: usize| u32::from_le_bytes(body[i..i + 4].try_into().unwrap());
+
+        // MaxHP, CurHP, MaxMP, CurMP, in that order.
+        assert_eq!(at(0), max_hp, "the health pool");
+        assert_eq!(at(4), max_hp, "health left");
+        assert_eq!(at(8), max_mp, "the mana pool must not follow what was spent");
+        assert_eq!(at(12), max_mp - spent, "mana left");
+        assert!(at(8) > at(12), "the pool is no bigger than what is in it");
+    }
+
+    /// A buff has to come off when the player clicks it off. A mount's does
+    /// not run out on its own, so without this it never goes at all — which
+    /// left a rider mounted with no horse and unable to equip another.
+    #[tokio::test]
+    async fn a_buff_can_be_clicked_off() {
+        let state = buff_state();
+        let mut session = in_world(&state).await;
+        carrying(&mut session, SADDLE, 7);
+        handle_message(&state, &mut session, &use_buff_item(7)).await;
+        assert!(session.buffs.has_family(&state.skills, crate::buffs::FAMILY_MOUNTED));
+
+        let off = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_REMOVE_BUFF,
+            time: 0,
+            body: (SADDLE_SKILL as u32).to_le_bytes().to_vec(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &off).await);
+
+        assert!(
+            !session.buffs.has_family(&state.skills, crate::buffs::FAMILY_MOUNTED),
+            "the rider is still mounted after getting off"
+        );
+        let sent = opcodes(&frames);
+        assert!(sent.contains(&OP_BUFFS), "the list was not sent again: {sent:?}");
+        assert!(sent.contains(&OP_REFRESH_STATUS), "the sheet still counts the buff");
+
+        // And the list really is empty now.
+        let body = decode(&encode_buffs(session.client_id, &session.buffs, &state.skills)).body;
+        assert_eq!(u16::from_le_bytes(body[0..2].try_into().unwrap()), 0);
     }
 
     fn spend_points(which: u32, amount: u32) -> Message {

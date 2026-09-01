@@ -127,6 +127,12 @@ impl Buffs {
         self.started.is_empty()
     }
 
+    /// Takes one off by the skill that started it, which is what `0x329`
+    /// names when the player clicks a buff away (`RemoveBuff`).
+    pub fn remove(&mut self, skill: usize) -> bool {
+        self.started.remove(&skill).is_some()
+    }
+
     /// Takes one off by family, which is how the original ends a mount: the
     /// player is dismounted, not the saddle unlearned.
     pub fn remove_family(&mut self, skills: &SkillTable, family: u32) -> bool {
@@ -144,13 +150,23 @@ fn ends_at(started: SystemTime, duration_secs: u32) -> Option<SystemTime> {
     Some(started + Duration::from_secs(duration_secs as u64))
 }
 
-/// Unix seconds, which is what the packet carries (`DateTimeToUnix`), with
-/// all ones for a buff that does not run out.
-pub fn unix(at: Option<SystemTime>) -> u32 {
+/// How many seconds a buff has left, which is what the packet carries and
+/// what the client draws.
+///
+/// The original computes `DateTimeToUnix(end)` and sends that -- an absolute
+/// moment. The client does not read it as one. Sent a unix time it drew the
+/// number straight, and a three-hour potion came out as "689 Mês": one and
+/// three quarter billion seconds is six hundred and eighty-nine thirty-day
+/// months, which is the field taken as a duration and nothing else. So it is
+/// a duration that goes out. The original is wrong here, or it is right for a
+/// client that is not ours; either way this is what makes the number on
+/// screen the number the item promises.
+///
+/// All ones for a buff that does not run out, since there is no duration to
+/// give for something that has no end.
+pub fn remaining(at: Option<SystemTime>, now: SystemTime) -> u32 {
     let Some(at) = at else { return FOREVER };
-    at.duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs().min(FOREVER as u64) as u32)
-        .unwrap_or(0)
+    at.duration_since(now).map(|d| d.as_secs().min(FOREVER as u64) as u32).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -236,7 +252,7 @@ mod tests {
 
         let running = buffs.running(&skills);
         assert_eq!(running[0].0, POTION_SKILL);
-        assert_eq!(unix(running[0].1), unix(Some(at(10_800))), "three hours, as the potion says");
+        assert_eq!(remaining(running[0].1, at(0)), 10_800, "three hours, as the potion says");
     }
 
     /// The real mount buff is written as lasting for ever, and this is the
@@ -259,7 +275,7 @@ mod tests {
 
         let running = buffs.running(&skills);
         assert_eq!(running[0].1, None, "it was given an end after all");
-        assert_eq!(unix(running[0].1), FOREVER, "the client would read a time in the past");
+        assert_eq!(remaining(running[0].1, at(0)), FOREVER, "a buff with no end has no countdown");
     }
 
     /// Getting off is by family too.

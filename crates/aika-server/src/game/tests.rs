@@ -874,7 +874,7 @@ fn the_record_carries_the_hotbar_and_known_skills() {
     character.item_bar[3] = 30994;
     character.skill_list[52] = 15378;
 
-    let record = encode_character(&character, 7);
+    let record = encode_character(&character, 7, 1);
 
     use character_offset as off;
     let bar3 = u32::from_le_bytes(
@@ -895,7 +895,7 @@ fn the_record_carries_the_skill_points() {
     let mut character = Character::from(&dev_character("Athus", 0));
     character.skill_points = 100;
 
-    let record = encode_character(&character, 7);
+    let record = encode_character(&character, 7, 1);
     let points = u16::from_le_bytes(
         record[character_offset::SKILL_POINT..character_offset::SKILL_POINT + 2]
             .try_into()
@@ -1412,7 +1412,7 @@ async fn what_a_character_carries_reaches_the_client_in_the_world_packet() {
     character.gold = 4242;
 
     let character = session.character.as_ref().unwrap().clone();
-    let record = encode_character(&character, TEST_CLIENT_ID);
+    let record = encode_character(&character, TEST_CLIENT_ID, 1);
 
     use character_offset as off;
     let at = off::INVENTORY + 2 * off::ITEM_SIZE;
@@ -1540,7 +1540,7 @@ async fn a_new_character_arrives_carrying_its_starting_gear() {
     handle_message(&state, &mut session, &create_message("Novato", 0)).await;
 
     let created = session.account.as_ref().unwrap().characters[0].clone();
-    let record = encode_character(&created, TEST_CLIENT_ID);
+    let record = encode_character(&created, TEST_CLIENT_ID, 1);
 
     use character_offset as off;
     let last_bag = off::INVENTORY + 125 * off::ITEM_SIZE;
@@ -3497,7 +3497,7 @@ async fn what_a_character_wears_reaches_the_spawn_and_the_selection_screen() {
     assert_eq!(worn(7), 0, "an empty slot stays empty");
 
     // and the selection screen dresses it the same way
-    let entry = encode_char_list_entry(Some(&character));
+    let entry = encode_char_list_entry(Some(&character), &SkillTable::default());
     let at = 24 + 2 * 2;
     assert_eq!(u16::from_le_bytes(entry[at..at + 2].try_into().unwrap()), 3314);
 }

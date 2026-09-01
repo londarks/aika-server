@@ -149,8 +149,12 @@ impl Character {
     /// Sending the position instead put a 6 in here for a Cleriga, which is
     /// not a code at all, and the client fell back to naming everybody a
     /// Fighter.
-    pub fn class_info(&self) -> u16 {
-        (self.class_number() - 1) * 10 + 1
+    ///
+    /// The tier is the second digit and comes from [`crate::ability::tier`],
+    /// which reads it off the skill table rather than storing it. It used to
+    /// be a hardcoded 1, which is what the original ships and never changes.
+    pub fn class_info(&self, tier: u16) -> u16 {
+        (self.class_number() - 1) * 10 + tier
     }
 
     /// The same class counted from zero, which is how the skill table groups
@@ -715,7 +719,7 @@ mod class_tests {
         for (index, code) in
             [(10, 1), (20, 11), (30, 21), (40, 31), (50, 41), (60, 51)]
         {
-            assert_eq!(with_index(index).class_info(), code, "class index {index}");
+            assert_eq!(with_index(index).class_info(1), code, "class index {index}");
         }
     }
 
@@ -725,7 +729,7 @@ mod class_tests {
     fn the_three_numbers_of_one_class_agree() {
         let atirador = with_index(30);
         assert_eq!(atirador.class_number(), 3);
-        assert_eq!(atirador.class_info(), 21);
+        assert_eq!(atirador.class_info(1), 21);
         assert_eq!(atirador.skill_class(), 2);
 
         assert_eq!(with_index(10).skill_class(), 0, "the first class is group zero");

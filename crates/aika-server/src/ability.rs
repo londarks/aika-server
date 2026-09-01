@@ -207,6 +207,47 @@ pub fn known_by(table: &SkillTable, class_number: u32, level: u32) -> Vec<usize>
         .collect()
 }
 
+/// How many tiers a class can be at. The table only ever uses the first
+/// three and the second digit has room for nine.
+pub const TIERS: u32 = 9;
+
+/// Which tier of its class a character of this level has reached.
+///
+/// `ClassInfo` is one byte holding two things: the class in the tens and
+/// the tier in the units, which is why `GetMobClass` is a `div 10`
+/// (`Mob/BaseMob.pas:2120`). A Guerreiro is 1, and 2 and 3 are the same
+/// class further along.
+///
+/// # This is ours, and the only thing here that is
+///
+/// The original never advances it. The six templates set 1, 11, 21, 31, 41
+/// and 51, the login loads the column, the save writes it back, and no
+/// handler, quest or operator command in the whole source assigns it — so a
+/// character on the original stayed at its first tier unless somebody edited
+/// the database by hand. That is not a rule to copy, it is a hole.
+///
+/// The level to fill it with is not invented either: it is read off the
+/// table, which lays every class out the same way. Slots one to twenty-four
+/// carry the tier-one skills and slot twenty-five is where the tier-two ones
+/// begin, at level 51 for five classes and 55 for the Guerreiro. So the tier
+/// is simply the highest one whose skills the character is already allowed
+/// to learn, which needs no threshold written down anywhere and cannot
+/// disagree with what the trainer offers.
+///
+/// Nothing is gated on the result. The original tests class ownership with
+/// `MatchClassInfo`, which compares tens digits, so a tier-one character can
+/// already learn a tier-two skill the moment the level allows; the tier is
+/// the name the client puts on the character, and it is left that way.
+pub fn tier(table: &SkillTable, class_number: u32, level: u32) -> u32 {
+    let group = (class_number.max(1) - 1) * 10;
+    (1..=SLOTS_PER_CLASS)
+        .filter_map(|slot| table.get(skill_index(class_number, slot, 1)))
+        .filter(|skill| skill.min_level() <= level)
+        .filter_map(|skill| skill.class().checked_sub(group))
+        .filter(|tier| (1..=TIERS).contains(tier))
+        .max()
+        .unwrap_or(1)
+}
 /// Just the forty the bar carries, which is what `0x106` sends.
 pub fn bar_of(table: &SkillTable, class_number: u32, level: u32) -> Vec<usize> {
     (BASIC_SLOTS + 1..=BASIC_SLOTS + SKILL_SLOTS)
@@ -404,6 +445,61 @@ mod tests {
         SkillTable::decode(&raw).expect("the fixture table is malformed")
     }
 
+    /// A table shaped like the real one where the tiers meet: slot 24 is the
+    /// last tier-one slot and slot 25 the first tier-two one, which is where
+    /// every one of the six classes changes over.
+    fn table_with_two_tiers(promotion_level: u32) -> SkillTable {
+        let mut raw = vec![0u8; 4000 * RECORD_SIZE];
+        let mut define = |slot: usize, min_level: u32, class: u32| {
+            let id = skill_index(CLASS, slot, 1);
+            let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
+            let put = |r: &mut [u8], at: usize, v: u32| {
+                r[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            };
+            put(r, field::FAMILY, slot as u32);
+            put(r, field::RANK, 1);
+            put(r, field::MIN_LEVEL, min_level);
+            put(r, field::CLASS, class);
+            r[field::NAME_ENGLISH.start] = b'x';
+        };
+        define(1, 1, 21);
+        define(24, 40, 21);
+        define(25, promotion_level, 22);
+        SkillTable::decode(&raw).expect("the fixture table is malformed")
+    }
+
+    /// The tier is the class code the client is sent, and it climbs when the
+    /// character can reach the next tier's skills. The original leaves this
+    /// at one forever; see `tier`.
+    #[test]
+    fn the_tier_climbs_when_the_next_tiers_skills_open() {
+        let table = table_with_two_tiers(51);
+
+        assert_eq!(tier(&table, CLASS, 1), 1, "a fresh character is at the first tier");
+        assert_eq!(tier(&table, CLASS, 50), 1, "one level short of the promotion");
+        assert_eq!(tier(&table, CLASS, 51), 2, "the level the tier-two slot opens at");
+        assert_eq!(tier(&table, CLASS, 99), 2, "and it stays there");
+    }
+
+    /// The level is read off the table rather than written down, so a class
+    /// whose file promotes later promotes later. The Guerreiro is that class:
+    /// its tier-two slot asks for 55 where the other five ask for 51.
+    #[test]
+    fn the_promotion_level_comes_from_the_table() {
+        let table = table_with_two_tiers(55);
+
+        assert_eq!(tier(&table, CLASS, 51), 1, "51 is not enough for this one");
+        assert_eq!(tier(&table, CLASS, 55), 2);
+    }
+
+    /// A class code the table does not use must not become a tier. Class zero
+    /// is the one that turns up in practice -- a mount's skills carry it --
+    /// and subtracting the group from it would underflow.
+    #[test]
+    fn a_skill_belonging_to_no_class_is_not_a_tier() {
+        assert_eq!(tier(&table(), CLASS, 99), 1, "the plain fixture is all tier one");
+        assert_eq!(tier(&SkillTable::default(), CLASS, 99), 1, "an empty table");
+    }
     fn caster(class_number: u32, level: u32, mana: u32) -> Caster {
         Caster { class_number, level, mana, at: (100.0, 100.0) }
     }

@@ -984,7 +984,7 @@ fn handle_request_login(state: &State, session: &mut Session, message: &Message)
         );
     }
 
-    let frame = encode_char_list(&account, session.client_id, state.uptime_ms());
+    let frame = encode_char_list(&account, session.client_id, state.uptime_ms(), &state.skills);
     state.world.set_account(session.client_id, account.id);
     session.account = Some(account);
     Action::Reply(vec![frame])
@@ -1052,7 +1052,7 @@ fn handle_enter_world(
         encode_signal(OP_SIGNAL_LOAD, client_id, time, 1),
         encode_signal(OP_SIGNAL_LOAD, client_id, time, 1),
         encode_enter_131(),
-        encode_send_to_world(&account, &character, client_id, time),
+        encode_send_to_world(&account, &character, client_id, time, &state.skills),
         zeroed(OP_ENTER_12C, 0, ENTER_12C_SIZE),
     ];
 
@@ -2584,7 +2584,7 @@ async fn handle_create_character(
             info!(user = %username, name = %request.name, error = %e, "character refused");
             return Action::Reply(vec![
                 encode_client_message(session.client_id, &e.message()),
-                encode_char_list(account, session.client_id, state.uptime_ms()),
+                encode_char_list(account, session.client_id, state.uptime_ms(), &state.skills),
             ]);
         }
     };
@@ -2607,7 +2607,7 @@ async fn handle_create_character(
                 );
                 return Action::Reply(vec![
                     encode_client_message(session.client_id, "The character could not be saved."),
-                    encode_char_list(account, session.client_id, state.uptime_ms()),
+                    encode_char_list(account, session.client_id, state.uptime_ms(), &state.skills),
                 ]);
             }
         }
@@ -2627,7 +2627,7 @@ async fn handle_create_character(
     // the one the store holds.
     let account = state.store.get(&username).unwrap_or_else(|| account.clone());
     session.account = Some(account.clone());
-    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
+    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms(), &state.skills)])
 }
 
 
@@ -2676,6 +2676,7 @@ async fn handle_delete_character(
             account,
             session.client_id,
             state.uptime_ms(),
+            &state.skills,
         )]);
     };
 
@@ -2683,7 +2684,7 @@ async fn handle_delete_character(
     if session.character.as_ref().is_some_and(|c| c.id == doomed.id) {
         return Action::Reply(vec![
             encode_client_message(session.client_id, "You cannot delete the character you are playing."),
-            encode_char_list(account, session.client_id, state.uptime_ms()),
+            encode_char_list(account, session.client_id, state.uptime_ms(), &state.skills),
         ]);
     }
 
@@ -2697,7 +2698,7 @@ async fn handle_delete_character(
             );
             return Action::Reply(vec![
                 encode_client_message(session.client_id, "The character could not be deleted."),
-                encode_char_list(account, session.client_id, state.uptime_ms()),
+                encode_char_list(account, session.client_id, state.uptime_ms(), &state.skills),
             ]);
         }
     }
@@ -2707,7 +2708,7 @@ async fn handle_delete_character(
 
     let account = state.store.get(&username).unwrap_or_else(|| account.clone());
     session.account = Some(account.clone());
-    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
+    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms(), &state.skills)])
 }
 
 
@@ -3505,10 +3506,12 @@ fn encode_send_to_world(
     character: &Character,
     client_id: u16,
     time: u32,
+    skills: &SkillTable,
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(4 + CHARACTER_SIZE);
     body.extend_from_slice(&account.id.to_le_bytes());
-    body.extend_from_slice(&encode_character(character, client_id));
+    let tier = crate::ability::tier(skills, character.class_number() as u32, character.level as u32);
+    body.extend_from_slice(&encode_character(character, client_id, tier as u16));
 
     debug_assert_eq!(body.len() + MIN_FRAME, SEND_TO_WORLD_SIZE);
     frame::encode(
@@ -3519,7 +3522,7 @@ fn encode_send_to_world(
 
 /// `TCharacter`. Only the fields the client needs to build the character;
 /// the rest (inventory, skills, quests, titles) stays zeroed for now.
-fn encode_character(character: &Character, client_id: u16) -> Vec<u8> {
+fn encode_character(character: &Character, client_id: u16, tier: u16) -> Vec<u8> {
     use character_offset as off;
     let mut out = vec![0u8; CHARACTER_SIZE];
 
@@ -3535,7 +3538,7 @@ fn encode_character(character: &Character, client_id: u16) -> Vec<u8> {
     put32(&mut out, off::CHAR_INDEX, character.slot as u32 + 1);
     write_fixed_str(&mut out[off::NAME..off::NAME + 16], &character.name);
     out[off::NATION] = character.nation as u8;
-    out[off::CLASS_INFO] = character.class_info() as u8;
+    out[off::CLASS_INFO] = character.class_info(tier) as u8;
 
     for (i, value) in character.attributes.iter().enumerate() {
         put16(&mut out, off::ATTRIBUTES + i * 2, *value);
@@ -3651,7 +3654,12 @@ impl RequestLogin {
 
 /// `TSendToCharListPacket` (`Data/Packets.pas:233`): account id, two zeroed
 /// two zeroed fields and three character entries.
-pub fn encode_char_list(account: &Account, client_id: u16, time: u32) -> Vec<u8> {
+pub fn encode_char_list(
+    account: &Account,
+    client_id: u16,
+    time: u32,
+    skills: &SkillTable,
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(CHAR_LIST_SIZE - MIN_FRAME);
     body.extend_from_slice(&account.id.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // Unk
@@ -3659,7 +3667,7 @@ pub fn encode_char_list(account: &Account, client_id: u16, time: u32) -> Vec<u8>
 
     for slot in 0..MAX_CHARACTERS {
         let character = account.characters.iter().find(|c| c.slot == slot);
-        body.extend_from_slice(&encode_char_list_entry(character));
+        body.extend_from_slice(&encode_char_list_entry(character, skills));
     }
 
     debug_assert_eq!(body.len() + MIN_FRAME, CHAR_LIST_SIZE);
@@ -3672,7 +3680,10 @@ pub fn encode_char_list(account: &Account, client_id: u16, time: u32) -> Vec<u8>
 /// `TCharacterListData` (`Data/Packets.pas:215`), 104 bytes: the entry on the
 /// selection screen, far smaller than the world's `TCharacter`. An empty
 /// entry is all zeroes.
-fn encode_char_list_entry(character: Option<&Character>) -> [u8; CHAR_ENTRY_SIZE] {
+fn encode_char_list_entry(
+    character: Option<&Character>,
+    skills: &SkillTable,
+) -> [u8; CHAR_ENTRY_SIZE] {
     let mut out = [0u8; CHAR_ENTRY_SIZE];
     let Some(character) = character else {
         return out;
@@ -3680,7 +3691,8 @@ fn encode_char_list_entry(character: Option<&Character>) -> [u8; CHAR_ENTRY_SIZE
 
     write_fixed_str(&mut out[0..16], &character.name);
     out[16..18].copy_from_slice(&character.nation.to_le_bytes());
-    out[18..20].copy_from_slice(&character.class_info().to_le_bytes());
+    let tier = crate::ability::tier(skills, character.class_number() as u32, character.level as u32);
+    out[18..20].copy_from_slice(&character.class_info(tier as u16).to_le_bytes());
     out[20..24].copy_from_slice(&character.sizes);
 
     // The selection screen dresses the character the same way the world

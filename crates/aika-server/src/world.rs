@@ -52,6 +52,11 @@ pub struct Presence {
     /// character because it is worth nothing after a logout: the client sends
     /// it again as soon as the mouse moves.
     pub rotation: u32,
+    /// What the player is doing that outlasts the packet that started it:
+    /// sitting, or dancing (`TBaseMob.CurrentAction`). Zero for standing.
+    /// Somebody walking into view has to be told, or they see a player
+    /// standing where everyone else sees one sitting down.
+    pub action: u32,
     outbox: Outbox,
 }
 
@@ -271,7 +276,14 @@ impl World {
         let client_id = (1..=MAX_PLAYERS).find(|id| !players.contains_key(id))?;
         players.insert(
             client_id,
-            Presence { client_id, account_id: 0, character: None, rotation: 0, outbox },
+            Presence {
+                client_id,
+                account_id: 0,
+                character: None,
+                rotation: 0,
+                action: 0,
+                outbox,
+            },
         );
         Some(client_id)
     }
@@ -298,6 +310,15 @@ impl World {
     pub fn turn(&self, client_id: u16, rotation: u32) {
         if let Some(presence) = self.players.lock().unwrap().get_mut(&client_id) {
             presence.rotation = rotation;
+        }
+    }
+
+    /// Remembers what the player is doing, so somebody arriving later is told
+    /// about it. Zero puts them back on their feet, which is what walking and
+    /// casting do (`CurrentAction := 0`).
+    pub fn act(&self, client_id: u16, action: u32) {
+        if let Some(presence) = self.players.lock().unwrap().get_mut(&client_id) {
+            presence.action = action;
         }
     }
 

@@ -77,6 +77,13 @@ pub const OP_GROUP_ITEM: u16 = 0x332;
 /// `TUngroupItemPacket` (`Data/Packets.pas:895`): split a pile in two
 /// (`UngroupItem`, `$333`).
 pub const OP_UNGROUP_ITEM: u16 = 0x333;
+/// `TSendActionPacket` (`Data/Packets.pas:441`): the player sat down, waved or
+/// danced. Read and echoed at `$304` (`UpdateAction`,
+/// `PacketHandlers.pas:1026`).
+pub const OP_ACTION: u16 = 0x304;
+/// `$202` (`RequestServerTime`, `PacketHandlers.pas:13038`): the player asked
+/// what time it is where the server is.
+pub const OP_SERVER_TIME: u16 = 0x202;
 /// Walking, the only move type the original relays to other players
 /// (`Data/GlobalDefs.pas:216`). The real client also sends other values.
 const MOVE_NORMAL: u8 = 0;
@@ -151,6 +158,10 @@ const HP_MP_SIZE: usize = 32;
 /// The original writes a single `0xCC` byte into a WORD field of `0x108`
 /// (`Mob/BaseMob.pas:2434`), so the field reads `CC 00`.
 const LEVEL_UNK: u16 = 0x00CC;
+
+/// `TSendActionPacket`: the header plus two dwords, the animation and whether
+/// it repeats (`Data/Packets.pas:441`).
+const ACTION_SIZE: usize = MIN_FRAME + 8;
 
 /// Sizes of the world-entry packets, from their records in `Data/Packets.pas`.
 const CLIENT_INDEX_SIZE: usize = 20;
@@ -371,6 +382,10 @@ struct Session {
     visible_npcs: HashSet<u16>,
     /// Which way the player is facing, so a repeat can be dropped.
     rotation: u32,
+    /// What the player is doing that outlives the packet: sitting, or the
+    /// dance it was given. Kept beside the world's copy for the same reason
+    /// the rotation is — it is what gets sent to somebody walking into view.
+    action: u32,
     /// Health and mana as they stand. Not on the character because nothing
     /// takes them down yet; they live here so a potion has somewhere to go.
     cur_hp: u32,
@@ -757,6 +772,8 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         OP_GROUP_ITEM => handle_group_item(state, session, message),
         OP_UNGROUP_ITEM => handle_ungroup_item(state, session, message),
         OP_LEARN_SKILL => handle_learn_skill(state, session, message),
+        OP_ACTION => handle_action(state, session, message),
+        OP_SERVER_TIME => handle_server_time(session),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
@@ -1179,6 +1196,12 @@ fn handle_move(state: &State, session: &mut Session, message: &Message) -> Actio
     }
     state.world.move_to(session.client_id, x, y);
 
+    // Standing up. A player who walks is no longer sitting or dancing, so the
+    // next person to come into view must not be told that they are — the
+    // original clears it at the end of `MovementCommand`.
+    session.action = 0;
+    state.world.act(session.client_id, 0);
+
     // The mover hears nothing back: the client moves itself and would fight
     // its own echo. Everyone who can see it gets the same packet, carrying
     // our id so they know who walked.
@@ -1220,6 +1243,16 @@ fn refresh_visibility(state: &State, session: &mut Session) -> Action {
                 frames.push(encode_spawn(their_character, other.client_id));
             }
             other.send(mine.clone());
+
+            // A spawn draws the character standing. Whoever is sitting or
+            // dancing needs the action sent after it, or each of the two sees
+            // the other on their feet (`SendSpawn`, `Mob/BaseMob.pas:2361`).
+            if other.action != 0 {
+                frames.push(encode_action(other.client_id, other.action, 1));
+            }
+            if session.action != 0 {
+                other.send(encode_action(session.client_id, session.action, 1));
+            }
         }
     }
 
@@ -2456,6 +2489,93 @@ fn handle_change_item_bar(session: &mut Session, message: &Message) -> Action {
     Action::Reply(vec![echo])
 }
 
+/// The two actions the original remembers past the packet that started them
+/// (`UpdateAction`): sitting down, and asking to dance. Everything else — a
+/// wave, a bow — plays once and is forgotten, so nobody arriving later is told
+/// about it.
+const ACTION_SIT: u32 = 40;
+const ACTION_DANCE: u32 = 0x41;
+
+/// What a request to dance actually becomes. The original never plays `$41`:
+/// it rolls one of these eleven and plays that instead, so the same key gives
+/// a different dance each time.
+const DANCES: [u32; 11] =
+    [0x43, 0x44, 0x45, 0x46, 0x4A, 0x4B, 0x47, 0x48, 0x49, 0x4C, 0x4D];
+
+/// `0x304`: the player sat down, waved or danced (`UpdateAction`).
+///
+/// Mostly a relay — the client that sent it is already playing the animation,
+/// and everyone who can see the player needs to play the same. Two of them
+/// stick, though: sitting and dancing outlast the packet, so they are kept on
+/// the presence and sent to anyone who walks up afterwards. Walking or casting
+/// clears it, which is the original setting `CurrentAction := 0` at the end of
+/// `MovementCommand` and `UseSkill`.
+fn handle_action(state: &State, session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < ACTION_SIZE - MIN_FRAME {
+        warn!(size = message.body.len(), "0x304 packet too short");
+        return Action::Ignore;
+    }
+    if session.character.is_none() {
+        return Action::Ignore;
+    }
+    let client_id = session.client_id;
+    let mut index = u32::from_le_bytes(message.body[0..4].try_into().unwrap());
+    let in_loop = u32::from_le_bytes(message.body[4..8].try_into().unwrap());
+
+    let mut frames = Vec::new();
+    if index == ACTION_DANCE {
+        index = DANCES[rand::random::<usize>() % DANCES.len()];
+        session.action = index;
+        state.world.act(client_id, index);
+        // `SendEffectOther`: to everyone who can see the player, this time
+        // including the player, and always looping.
+        let effect = encode_action(client_id, index, 1);
+        state.world.send_to_visible(client_id, effect.clone());
+        frames.push(effect);
+        debug!(dance = index, "danced");
+    } else if index == ACTION_SIT {
+        session.action = index;
+        state.world.act(client_id, index);
+    }
+
+    // And the packet itself, to everyone but the sender, carrying whichever
+    // index we ended up with. The original relays this even after the dance
+    // above has gone out, so a dance is sent twice; copying that is cheaper
+    // than guessing which of the two the client actually draws from.
+    state.world.send_to_visible(client_id, encode_action(client_id, index, in_loop));
+
+    if frames.is_empty() {
+        Action::Ignore
+    } else {
+        Action::Reply(frames)
+    }
+}
+
+/// `TSendActionPacket`: which animation, and whether it repeats.
+fn encode_action(client_id: u16, index: u32, in_loop: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(ACTION_SIZE - MIN_FRAME);
+    body.extend_from_slice(&index.to_le_bytes());
+    body.extend_from_slice(&in_loop.to_le_bytes());
+
+    debug_assert_eq!(body.len() + MIN_FRAME, ACTION_SIZE);
+    frame::encode(
+        &Message { sender: client_id, opcode: OP_ACTION, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `0x202`: what time is it on the server (`RequestServerTime`).
+///
+/// The whole of the original is one line: it answers `DateTimeToStr(Now)` as
+/// an ordinary client message, the yellow line across the top of the screen.
+/// The format is the one Delphi prints under the locale the server runs in,
+/// `dd/mm/yyyy hh:nn:ss`, and it is the machine's own clock rather than UTC —
+/// a player asking the time wants the time where the server is.
+fn handle_server_time(session: &Session) -> Action {
+    let now = chrono::Local::now().format("%d/%m/%Y %H:%M:%S").to_string();
+    Action::Reply(vec![encode_client_message(session.client_id, &now)])
+}
+
 /// `0x3E04`: make a character in one of the three slots.
 ///
 /// The reply is the whole character list either way, because that is what the
@@ -2727,6 +2847,11 @@ fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> 
 
     session.cur_mp = session.cur_mp.saturating_sub(cast.mana);
     session.cooldowns.start(cast.family, cast.cooldown, now);
+
+    // Casting stands the player up, the same way walking does (`UseSkill`
+    // clears `CurrentAction` too).
+    session.action = 0;
+    state.world.act(client_id, 0);
 
     // Everyone who can see the caster sees the cast, animation and all.
     let relay = frame::encode(
@@ -4990,6 +5115,176 @@ mod tests {
         assert_eq!(u32::from_le_bytes(message.body[0..4].try_into().unwrap()), 180);
 
         assert!(mine_rx.try_recv().is_err(), "the sender heard its own turn");
+    }
+
+    /// A `0x304` the way the client sends one.
+    fn action_message(index: u32, in_loop: u32) -> Message {
+        let mut body = index.to_le_bytes().to_vec();
+        body.extend_from_slice(&in_loop.to_le_bytes());
+        Message { sender: TEST_CLIENT_ID, opcode: OP_ACTION, time: 0, body }
+    }
+
+    /// Puts this session and a second player in the registry at the same spot,
+    /// and hands back the second one's id and its queue.
+    fn with_a_watcher(
+        state: &State,
+        session: &mut Session,
+    ) -> (u16, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (mine, _) = tokio::sync::mpsc::unbounded_channel();
+        session.client_id = state.world.connect(mine).expect("room to connect");
+        let character = session.character.clone().unwrap();
+        state.world.enter(session.client_id, character.clone());
+
+        let (theirs, watcher_rx) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = state.world.connect(theirs).expect("room for a watcher");
+        state.world.enter(watcher, character);
+        (watcher, watcher_rx)
+    }
+
+    /// Sitting down is relayed to everyone who can see it, and remembered, so
+    /// the player is still sitting to whoever turns up next.
+    #[tokio::test]
+    async fn sitting_down_is_relayed_and_remembered() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = in_world(&state).await;
+        let (_, mut watcher_rx) = with_a_watcher(&state, &mut session);
+
+        let action = handle_message(&state, &mut session, &action_message(ACTION_SIT, 1)).await;
+
+        assert!(matches!(action, Action::Ignore), "the sender is already sitting");
+        assert_eq!(session.action, ACTION_SIT, "the session forgot the player sat down");
+
+        let relayed = decode(&watcher_rx.try_recv().expect("the watcher was not told"));
+        assert_eq!(relayed.opcode, OP_ACTION);
+        assert_eq!(relayed.sender, session.client_id, "the relay says who sat down");
+        assert_eq!(u32::from_le_bytes(relayed.body[0..4].try_into().unwrap()), ACTION_SIT);
+    }
+
+    /// A wave plays once and is gone: remembering it would have the player
+    /// waving for as long as they stood there.
+    #[tokio::test]
+    async fn a_one_off_action_is_relayed_but_not_remembered() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = in_world(&state).await;
+        let (_, mut watcher_rx) = with_a_watcher(&state, &mut session);
+
+        const WAVE: u32 = 0x30;
+        handle_message(&state, &mut session, &action_message(WAVE, 0)).await;
+
+        assert_eq!(session.action, 0, "a one-off action stuck to the player");
+        let relayed = decode(&watcher_rx.try_recv().expect("the watcher was not told"));
+        assert_eq!(u32::from_le_bytes(relayed.body[0..4].try_into().unwrap()), WAVE);
+    }
+
+    /// The original never plays the dance that was asked for: `$41` is rolled
+    /// into one of eleven others, and that is what everyone sees.
+    #[tokio::test]
+    async fn a_dance_is_never_the_one_asked_for() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = in_world(&state).await;
+        let (_, mut watcher_rx) = with_a_watcher(&state, &mut session);
+
+        let frames = frames_of(
+            handle_message(&state, &mut session, &action_message(ACTION_DANCE, 0)).await,
+        );
+
+        // Unlike sitting, the dancer is told: `SendEffectOther` sends to
+        // everyone who can see the player, that player included.
+        let mine = decode(&frames[0]);
+        assert_eq!(mine.opcode, OP_ACTION);
+        let danced = u32::from_le_bytes(mine.body[0..4].try_into().unwrap());
+        assert_ne!(danced, ACTION_DANCE, "the request was played as it arrived");
+        assert!(DANCES.contains(&danced), "danced something that is not a dance: {danced}");
+        assert_eq!(u32::from_le_bytes(mine.body[4..8].try_into().unwrap()), 1, "a dance loops");
+        assert_eq!(session.action, danced, "the dance was not remembered");
+
+        let relayed = decode(&watcher_rx.try_recv().expect("the watcher was not told"));
+        assert_eq!(
+            u32::from_le_bytes(relayed.body[0..4].try_into().unwrap()),
+            danced,
+            "the watcher saw a different dance from the dancer"
+        );
+    }
+
+    /// Walking stands the player up. Without this a player who sat down once
+    /// is drawn sitting to everyone who meets them, wherever they walked to.
+    #[tokio::test]
+    async fn walking_stands_the_player_back_up() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = in_world(&state).await;
+        let (_, _watcher_rx) = with_a_watcher(&state, &mut session);
+
+        handle_message(&state, &mut session, &action_message(ACTION_SIT, 1)).await;
+        assert_eq!(session.action, ACTION_SIT);
+
+        let character = session.character.as_ref().unwrap();
+        let mut body = vec![0u8; Movement::BODY_SIZE];
+        body[0..4].copy_from_slice(&(character.x as f32 + 1.0).to_le_bytes());
+        body[4..8].copy_from_slice(&(character.y as f32).to_le_bytes());
+        body[Movement::SPEED] = 50;
+        let step = Message { sender: session.client_id, opcode: OP_MOVE, time: 0, body };
+        handle_message(&state, &mut session, &step).await;
+
+        assert_eq!(session.action, 0, "the player walked off still sitting down");
+    }
+
+    /// Someone coming into view is told what the player is doing. A spawn
+    /// draws them standing, so without this the two see different things.
+    #[tokio::test]
+    async fn walking_up_to_a_sitting_player_shows_them_sitting() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+
+        // The one who sits down, in the registry under its own id.
+        let mut sitter = in_world(&state).await;
+        let (mine, _mine_rx) = tokio::sync::mpsc::unbounded_channel();
+        sitter.client_id = state.world.connect(mine).expect("room to connect");
+        let character = sitter.character.clone().unwrap();
+        state.world.enter(sitter.client_id, character.clone());
+        handle_message(&state, &mut sitter, &action_message(ACTION_SIT, 1)).await;
+
+        // And the one who walks up, who has never seen them before.
+        let mut walker = in_world(&state).await;
+        let (theirs, _theirs_rx) = tokio::sync::mpsc::unbounded_channel();
+        walker.client_id = state.world.connect(theirs).expect("room for a second");
+        state.world.enter(walker.client_id, character);
+
+        let frames = frames_of(refresh_visibility(&state, &mut walker));
+        let actions: Vec<_> = frames
+            .iter()
+            .map(|f| decode(f))
+            .filter(|m| m.opcode == OP_ACTION)
+            .collect();
+
+        assert_eq!(actions.len(), 1, "the sitting player was drawn standing up");
+        assert_eq!(actions[0].sender, sitter.client_id, "the wrong player was said to be sitting");
+        assert_eq!(
+            u32::from_le_bytes(actions[0].body[0..4].try_into().unwrap()),
+            ACTION_SIT
+        );
+    }
+
+    /// `0x202` answers with the server's own wall clock, formatted the way the
+    /// original's `DateTimeToStr` formats it.
+    #[tokio::test]
+    async fn asking_the_time_answers_with_the_server_clock() {
+        let state = state_with(vec![dev_character("Athus", 0)]);
+        let mut session = in_world(&state).await;
+
+        let frames = frames_of(
+            handle_message(
+                &state,
+                &mut session,
+                &Message { sender: TEST_CLIENT_ID, opcode: OP_SERVER_TIME, time: 0, body: vec![] },
+            )
+            .await,
+        );
+
+        assert_eq!(decode(&frames[0]).opcode, OP_CLIENT_MESSAGE);
+        let text = message_text(&frames[0]);
+        let digits: Vec<char> = text.chars().filter(|c| c.is_ascii_digit()).collect();
+        assert_eq!(digits.len(), 14, "not a dd/mm/yyyy hh:mm:ss clock: {text}");
+        assert_eq!(text.matches('/').count(), 2, "no date in {text}");
+        assert_eq!(text.matches(':').count(), 2, "no time in {text}");
     }
 
     /// The same rotation twice is what the client sends while standing still,

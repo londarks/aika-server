@@ -264,13 +264,59 @@ pub fn check(
     target: Option<(f32, f32)>,
     now: Instant,
 ) -> Result<Cast, CastError> {
+    check_cast(table, caster, cooldowns, id, target, now, Named::ByTheClient)
+}
+
+/// Who chose the skill being cast.
+///
+/// It decides one thing: whether the id has to be one of the caster's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Named {
+    /// The client asked for this id, so it has to be one it could have.
+    ByTheClient,
+    /// The server picked it. A mount's two skills are the case: the client
+    /// asks for "the first" or "the second" and the server turns that into an
+    /// id, so there is nothing a client could have forged.
+    ByTheServer,
+}
+
+/// The same as [`check`], for a skill the server chose rather than the client.
+///
+/// Skills that belong to no class at all -- a mount's are class zero and sit
+/// outside every class block -- fail the ownership test by construction. They
+/// are not the client's to name, so nothing is lost by not testing it.
+pub fn check_chosen(
+    table: &SkillTable,
+    caster: &Caster,
+    cooldowns: &Cooldowns,
+    id: u32,
+    target: Option<(f32, f32)>,
+    now: Instant,
+) -> Result<Cast, CastError> {
+    check_cast(table, caster, cooldowns, id, target, now, Named::ByTheServer)
+}
+
+fn check_cast(
+    table: &SkillTable,
+    caster: &Caster,
+    cooldowns: &Cooldowns,
+    id: u32,
+    target: Option<(f32, f32)>,
+    now: Instant,
+    named: Named,
+) -> Result<Cast, CastError> {
     let skill = table.get(id as usize).ok_or(CastError::NoSuchSkill(id))?;
 
     // The id has to be one of this class's sixty slots. Checking the block
     // rather than the skill's own class column is what the grid makes
     // possible, and it is stricter: the column would let a client ask for a
     // higher tier of its own class that it has not earned.
-    if !belongs_to(caster.class_number, id as usize) || skill.min_level() > caster.level {
+    //
+    // It only applies to an id the client named. One the server picked cannot
+    // be forged, and a mount's skills would fail it outright: they belong to
+    // no class and land in nobody's block.
+    let owned = named == Named::ByTheServer || belongs_to(caster.class_number, id as usize);
+    if !owned || skill.min_level() > caster.level {
         return Err(CastError::NotLearned(id));
     }
 

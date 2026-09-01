@@ -3187,7 +3187,7 @@ fn handle_mount_skill(state: &State, session: &mut Session, message: &Message) -
         body: ability::UseSkill { skill: skill as u32, target: client_id as u32, at: (0.0, 0.0) }
             .to_body(),
     };
-    handle_use_skill(state, session, &cast)
+    cast_skill(state, session, &cast, ability::Named::ByTheServer)
 }
 
 /// `0x202`: what time is it on the server (`RequestServerTime`).
@@ -3432,6 +3432,20 @@ fn encode_skills_level(character: &Character, client_id: u16) -> Vec<u8> {
 /// then works out what it did (`PacketHandlers.pas:7550`). Same order here:
 /// the relay is what makes a spell look like it happened.
 fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> Action {
+    cast_skill(state, session, message, ability::Named::ByTheClient)
+}
+
+/// The casting itself, told who chose the skill.
+///
+/// A mount's skills come through here with the server as the one that named
+/// them, because they belong to no class and would fail an ownership test
+/// that exists to stop a client asking for a skill it never learned.
+fn cast_skill(
+    state: &State,
+    session: &mut Session,
+    message: &Message,
+    named: ability::Named,
+) -> Action {
     let Some(request) = ability::UseSkill::parse(&message.body) else {
         warn!(size = message.body.len(), "0x320 packet too short");
         return Action::Ignore;
@@ -3456,7 +3470,11 @@ fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> 
     };
 
     let now = std::time::Instant::now();
-    let cast = match ability::check(
+    let checked = match named {
+        ability::Named::ByTheClient => ability::check,
+        ability::Named::ByTheServer => ability::check_chosen,
+    };
+    let cast = match checked(
         &state.skills,
         &caster,
         &session.cooldowns,
@@ -5932,6 +5950,60 @@ mod tests {
         let now = crate::buffs::unix(Some(std::time::SystemTime::now()));
         assert!(ends > now, "the buff is already over");
         assert!(ends - now <= 3600, "an hour's buff lasts longer than an hour");
+    }
+
+    /// A mount's skills belong to no class, so the ownership test that stops a
+    /// client asking for a skill it never learned would refuse them outright.
+    /// The server is the one that names them, so there is nothing to own.
+    #[tokio::test]
+    async fn a_mount_skill_is_cast_even_though_it_is_nobody_class() {
+        let mut state = buff_state();
+        state.skills = {
+            use aika_data::skills::{field, SkillTable, RECORD_SIZE, SLOTS};
+            let mut raw = vec![0u8; SLOTS * RECORD_SIZE + 4];
+            let mut define = |id: usize, family: u32, seconds: u32, class: u32| {
+                let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
+                r[field::FAMILY..field::FAMILY + 4].copy_from_slice(&family.to_le_bytes());
+                r[field::DURATION..field::DURATION + 4].copy_from_slice(&seconds.to_le_bytes());
+                r[field::CLASS..field::CLASS + 4].copy_from_slice(&class.to_le_bytes());
+                r[field::NAME_ENGLISH.start] = b'x';
+            };
+            define(SADDLE_SKILL, crate::buffs::FAMILY_MOUNTED, 3600, 0);
+            // The mount's own skill: class nought, in nobody's block.
+            define(MOUNT_SKILLS[0], 164, 10, 0);
+            SkillTable::decode(&raw).expect("the fixture table is malformed")
+        };
+
+        let mut session = in_world(&state).await;
+        carrying(&mut session, SADDLE, 7);
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                index: HORSE,
+                container: inventory::EQUIP,
+                slot: MOUNT_SLOT,
+                ..Item::default()
+            })
+            .unwrap();
+        handle_message(&state, &mut session, &use_buff_item(7)).await;
+        assert!(session.buffs.has_family(&state.skills, crate::buffs::FAMILY_MOUNTED));
+
+        let ask = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_MOUNT_SKILL,
+            time: 0,
+            body: vec![0, 0],
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &ask).await);
+
+        let sent = opcodes(&frames);
+        assert!(
+            sent.contains(&ability::OP_USE_SKILL),
+            "the mount skill was refused as one the class does not own: {sent:?}"
+        );
     }
 
     /// A mount's own skills need a mount. The original says so in as many

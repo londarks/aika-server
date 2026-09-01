@@ -75,6 +75,18 @@ The reference source lives outside this repo, in a sibling directory:
   client actually speaks to. Other emulators exist and describe a different
   build of the game with different tables; nothing here comes from one, and
   nothing should.
+- **A skill with a cast time arrives twice.** `0x320` when the bar starts and
+  `0x302` when it fills, and **the effect belongs to the second**. The first is
+  only the announcement; `AttackTarget` is where the original applies it, told
+  by `ByUseSkill` which of the two it came from. A self-cast — a blessing, a
+  mount — names the caster's own client id as the target, so a server looking
+  for a monster there finds nothing and drops the cast. That is what made every
+  skill with a bar do nothing at all, and the giveaway sat in the log for a
+  whole session looking like noise: `0x302 at something that is not a monster
+  target=1`.
+- **A log line that repeats and explains itself is worth reading twice.** The
+  one above was dismissed as a mis-aimed click on a hundred occasions before
+  anybody asked which id `1` was.
 - **The packet checksum does not protect the payload.** The cipher is linear, so
   the sum difference depends only on seed and length. Not an integrity check.
 - **Coordinates are always `f32` pairs, and there is no Z.** Height comes from

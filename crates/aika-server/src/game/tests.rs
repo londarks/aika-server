@@ -1915,6 +1915,74 @@ async fn something_that_is_not_a_stone_hatches_nothing() {
     assert!(session.account.as_ref().unwrap().prans.is_empty());
 }
 
+/// The Pran station is the chest with a different face on it.
+///
+/// `OpenNPC` answers option 7 and option 13 with the same `SendStorage` and
+/// only the type differs (`$7` player, `$D` prans). Neither was wired at all,
+/// which is why a pran sitting in the chest could not be reached from the one
+/// NPC whose whole job is prans.
+#[tokio::test]
+async fn the_pran_station_opens_the_chest_on_its_pran_side() {
+    let state = shop_state();
+    let mut session = in_world(&state).await;
+
+    for (option, expected) in [
+        (dialog::option::STORAGE, STORAGE_TYPE_PLAYER),
+        (dialog::option::PRAN_STATION, STORAGE_TYPE_PRANS),
+    ] {
+        let frames =
+            frames_of(handle_message(&state, &mut session, &open_npc(2050, option)).await);
+        let sent = opcodes(&frames);
+
+        assert!(sent.contains(&OP_STORAGE), "option {option} did not send the chest");
+        let opened = frames
+            .iter()
+            .map(|frame| decode(frame))
+            .find(|m| m.opcode == OP_STORAGE_OPEN)
+            .expect("the window was never opened");
+        assert_eq!(
+            u32::from_le_bytes(opened.body[0..4].try_into().unwrap()),
+            expected,
+            "option {option} opened the wrong side of the chest"
+        );
+    }
+}
+
+/// And the two slots the chest packet does not carry go out on their own.
+///
+/// `SendStorage` refreshes 84 and 85 separately, every time. They sit past
+/// what `TStoragePlayer` copies, so a pran in one of them is invisible without
+/// this -- which is exactly how it looked.
+#[tokio::test]
+async fn opening_the_chest_sends_the_two_pran_slots_on_their_own() {
+    let state = shop_state();
+    let mut session = in_world(&state).await;
+    session.account.as_mut().unwrap().storage.put(Item {
+        index: 104,
+        container: inventory::STORAGE,
+        slot: 84,
+        identific: 1,
+        ..Item::default()
+    })
+    .unwrap();
+
+    let frames = frames_of(
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::PRAN_STATION))
+            .await,
+    );
+
+    let refreshed: Vec<u16> = frames
+        .iter()
+        .map(|frame| decode(frame))
+        .filter(|m| m.opcode == shop::OP_REFRESH_ITEM && m.body.len() >= 6)
+        .map(|m| u16::from_le_bytes(m.body[2..4].try_into().unwrap()))
+        .collect();
+
+    for slot in inventory::STORAGE_PRAN_SLOTS {
+        assert!(refreshed.contains(&slot), "slot {slot} was never sent, so it draws empty");
+    }
+}
+
 /// A stone that identifies nothing hatches nothing.
 ///
 /// The binding runs both ways: a pran remembers its stone by `Identific`, and

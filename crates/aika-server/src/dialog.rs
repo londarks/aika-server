@@ -58,6 +58,10 @@ pub mod option {
     pub const SKILLS: u32 = 6;
     pub const STORAGE: u32 = 7;
     pub const CLOSE: u32 = 8;
+    /// The Pran station, which is the chest again in a different mode:
+    /// the original answers both with `SendStorage`, and only the type it
+    /// passes differs (`PacketHandlers.pas`, `OpenNPC` $7 and $D).
+    pub const PRAN_STATION: u32 = 13;
     pub const CREATE_GUILD: u32 = 10;
     pub const SIGN_IN_CASTLE: u32 = 12;
 }

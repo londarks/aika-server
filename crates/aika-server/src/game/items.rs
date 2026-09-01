@@ -104,9 +104,11 @@ pub(crate) fn check_move(
     // Putting something in needs the window open. Taking something out does
     // not: the original has that check commented out on the source side, and
     // a player pulling from their own chest robs nobody.
-    if to.0 == inventory::STORAGE
-        && (session.opened_option != OPTION_STORAGE || session.opened_npc.is_none())
-    {
+    // Either window is the chest open: the Pran station is the same
+    // eighty-six slots with a different face on them.
+    let chest_open = matches!(session.opened_option, OPTION_STORAGE | OPTION_PRAN_STATION)
+        && session.opened_npc.is_some();
+    if to.0 == inventory::STORAGE && !chest_open {
         return Err("the chest is not open");
     }
 
@@ -420,6 +422,7 @@ pub(crate) fn handle_use_item(state: &State, session: &mut Session, message: &Me
                 client_id,
                 account.storage_gold,
                 &account.storage,
+                STORAGE_TYPE_PLAYER,
             ));
         }
         other => {
@@ -559,10 +562,15 @@ pub(crate) fn encode_storage(client_id: u16, gold: u64, storage: &Inventory) -> 
 /// The two extra refreshes are the original's and look redundant until you
 /// notice which slots they name — 84 and 85 sit past the four pages, and the
 /// client draws the pran centre from a different part of its interface.
-pub(crate) fn open_storage(client_id: u16, gold: u64, storage: &Inventory) -> Vec<Vec<u8>> {
+pub(crate) fn open_storage(
+    client_id: u16,
+    gold: u64,
+    storage: &Inventory,
+    storage_type: u32,
+) -> Vec<Vec<u8>> {
     let mut frames = vec![
         encode_storage(client_id, gold, storage),
-        encode_signal(OP_STORAGE_OPEN, client_id, 0, STORAGE_TYPE_PLAYER),
+        encode_signal(OP_STORAGE_OPEN, client_id, 0, storage_type),
     ];
     for slot in inventory::STORAGE_PRAN_SLOTS {
         let item = slot_item(storage, inventory::STORAGE, slot);
@@ -617,7 +625,7 @@ pub(crate) fn handle_chest_gold(session: &mut Session, message: &Message) -> Act
     info!(value, gold, chest_gold, "gold moved to or from the chest");
 
     let mut frames = vec![encode_refresh_money(gold, chest_gold)];
-    frames.extend(open_storage(client_id, chest_gold, &storage));
+    frames.extend(open_storage(client_id, chest_gold, &storage, STORAGE_TYPE_PLAYER));
     Action::Reply(frames)
 }
 

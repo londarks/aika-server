@@ -248,11 +248,17 @@ const ITEM_TYPE_PRAN: u16 = 10;
 /// Which chest a packet is about (`Data/GlobalDefs.pas:363`). Two is the
 /// player's own; three is the guild's, which waits on guilds.
 const STORAGE_TYPE_PLAYER: u32 = 1;
+/// The same window told to open on the pran side of itself
+/// (`STORAGE_TYPE_PRANS`, `Data/GlobalDefs.pas:364`).
+const STORAGE_TYPE_PRANS: u32 = 2;
 const CHEST_TYPE_STORAGE: u32 = 2;
 
 /// What the original marks as the window being open: option seven is the
 /// chest (`ITEM_TYPE_STORAGE_OPEN` sets `OpennedOption := 7`).
 const OPTION_STORAGE: u32 = 7;
+/// The Pran station opens the same chest, so a move out of it has to be
+/// allowed on the same terms.
+const OPTION_PRAN_STATION: u32 = 13;
 
 /// The most gold either the purse or the chest will hold. The original
 /// refuses a transfer that would push past it rather than wrapping round.
@@ -1941,6 +1947,31 @@ fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> A
                     encode_client_message(session.client_id, &refusal.message()),
                 ]),
             }
+        }
+        dialog::option::STORAGE | dialog::option::PRAN_STATION => {
+            // One window, two sides. `OpenNPC` answers both with
+            // `SendStorage` and only the type differs: one draws the chest
+            // and the other the pran centre, which is the same eighty-six
+            // slots seen from the other end. The two the pran centre cares
+            // about are 84 and 85, and they are the two the chest packet
+            // does not carry -- `SendStorage` sends them on their own,
+            // every time, which is why a pran in one of them was invisible.
+            let for_prans = request.option == dialog::option::PRAN_STATION;
+            session.opened_option = request.option;
+            session.opened_npc = Some(npc_id);
+            let Some(account) = session.account.as_ref() else {
+                return Action::Ignore;
+            };
+            info!(npc = npc_id, name = %npc.label, for_prans, "chest opened");
+
+            let mut frames = vec![encode_menu_close()];
+            frames.extend(items::open_storage(
+                session.client_id,
+                account.storage_gold,
+                &account.storage,
+                if for_prans { STORAGE_TYPE_PRANS } else { STORAGE_TYPE_PLAYER },
+            ));
+            Action::Reply(frames)
         }
         dialog::option::CLOSE => {
             session.opened_npc = None;

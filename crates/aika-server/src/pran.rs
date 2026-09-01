@@ -19,15 +19,22 @@
 //! the first two tiers, 101 for the third and 102 for the fourth, and those are
 //! the numbers the stones carry in their own `Classe` field. See [`stone_tier`].
 //!
-//! # A young one has no body
+//! # The first form has no body
 //!
-//! `PranIsFairy` is true for classes 61, 71 and 81 -- the first tier of each
-//! element -- and a fairy is not drawn as a companion at all. It is an effect
-//! on the player: 2 for fire, 4 for water, 8 for air
-//! (`Mob/Player.pas:3730`). Only an evolved pran gets a body and its own client
-//! id, out of a range of its own: 44241 to 45240
-//! (`Connections/ServerSocket.pas:48`), a fourth id space beside players,
-//! NPCs and objects.
+//! A pran grows through forms: the first is only a glow, and the ones after it
+//! are a companion that walks beside its owner. Classes 61, 71 and 81 -- the
+//! first tier of each element -- are drawn as an effect on the player and
+//! nothing else: 2 for fire, 4 for water, 8 for air (`Mob/Player.pas:3730`).
+//! Every form after that gets a body and its own client id, out of a range of
+//! its own: 44241 to 45240 (`Connections/ServerSocket.pas:48`), a fourth id
+//! space beside players, NPCs and objects.
+//!
+//! The original calls the first form a fairy -- `PranIsFairy`, and the branch
+//! it guards is commented "pran modo elfa". That is worth knowing and not
+//! worth copying: to anyone who has played, the fairy is the *winged* form at
+//! the end, and a function called `is_fairy` returning true for a formless
+//! glow is a trap. See [`has_body`], which is the same test named for what it
+//! decides.
 //!
 //! # What is here and what is not
 //!
@@ -131,13 +138,19 @@ pub fn stone_tier(class: u8) -> Option<u16> {
     }
 }
 
-/// Whether a pran of this class is drawn as an effect rather than a body.
+/// Whether a pran of this class walks beside its owner, rather than being an
+/// effect on them.
 ///
-/// `PranIsFairy`: the first tier of each element. The original also returns
-/// true while the player is in `FaericForm`, which is a state we do not have
-/// yet, so this is the class half of the test.
-pub fn is_fairy(class: u8) -> bool {
-    matches!(class, 61 | 71 | 81)
+/// This is `not PranIsFairy` (`Mob/Player.pas`), inverted and renamed: the
+/// original is true for the first tier of each element, which is the form with
+/// no body. Its name points the other way from what it means -- the winged
+/// fairy is the form at the end of the line, not the start of it -- so the
+/// test is kept and the name is not.
+///
+/// The original also treats a pran as bodiless while its owner is in
+/// `FaericForm`, a player state we do not have. This is the class half.
+pub fn has_body(class: u8) -> bool {
+    !matches!(class, 61 | 71 | 81)
 }
 
 /// The six personalities, in the order the world packet numbers them.
@@ -276,9 +289,9 @@ impl Pran {
         Element::of(self.class)
     }
 
-    /// Whether it is drawn as an effect rather than a body.
-    pub fn is_fairy(&self) -> bool {
-        is_fairy(self.class)
+    /// Whether it walks beside its owner or is only a glow on them.
+    pub fn has_body(&self) -> bool {
+        has_body(self.class)
     }
 
     /// How many of its ten skills it has learned. A hatchling knows three.
@@ -465,16 +478,17 @@ mod tests {
         assert_eq!(Element::of(51), None, "that is a Cleriga");
     }
 
-    /// The first tier of each element is a fairy and has no body. Drawing one
+    /// Only the first tier of each element is the bodiless glow. Drawing one
     /// as a companion would put a second character on the field that the
-    /// client has no model for.
+    /// client has no model for; not drawing the others leaves the player with
+    /// a pran that shows as nothing at all.
     #[test]
-    fn only_the_first_tier_of_each_element_is_a_fairy() {
+    fn only_the_first_form_of_each_element_lacks_a_body() {
         for class in [61u8, 71, 81] {
-            assert!(is_fairy(class), "class {class} should be a fairy");
+            assert!(!has_body(class), "class {class} is the glow");
         }
         for class in [62u8, 63, 64, 72, 73, 74, 82, 83, 84] {
-            assert!(!is_fairy(class), "class {class} has a body");
+            assert!(has_body(class), "class {class} walks beside its owner");
         }
     }
 
@@ -517,7 +531,7 @@ mod tests {
             assert_eq!(pran.hp, pran.max_hp, "it should not hatch wounded");
             assert_eq!(pran.mp, pran.max_mp);
             assert_eq!(pran.level, 1);
-            assert!(pran.is_fairy(), "a hatchling has no body yet");
+            assert!(!pran.has_body(), "a hatchling is only a glow");
         }
     }
 

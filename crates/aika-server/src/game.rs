@@ -3679,7 +3679,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     // the player, one per element, and that is the whole of how it shows.
     // Every form after it is a companion of its own, standing beside the
     // player under an id from the pran range.
-    if pran.is_fairy() {
+    if !pran.has_body() {
         session.pran_body = None;
         if let Some(element) = pran.element() {
             frames.push(encode_effect(client_id, element.fairy_effect()));

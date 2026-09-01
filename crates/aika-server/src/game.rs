@@ -3386,19 +3386,12 @@ fn loot_from(state: &State, session: &mut Session, target: &crate::mob::Mob) -> 
         return Vec::new();
     };
 
-    let Some(def) = state.items.get(id as usize) else {
+    if state.items.get(id as usize).is_none() {
         debug!(item = id, "a drop table names an item the item table does not");
         return Vec::new();
-    };
+    }
 
-    let mut dropped = Item {
-        index: id,
-        appearance: id,
-        refine: 1,
-        durability_min: def.durability(),
-        durability_max: def.durability(),
-        ..Item::default()
-    };
+    let mut dropped = Item { refine: 1, ..Item::from_table(id, &state.items) };
     // Same clock as a purchase: what a monster leaves behind can be a timed
     // item too, and it starts running when it is picked up.
     expiry::stamp(&mut dropped, &state.items, expiry::now());

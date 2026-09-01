@@ -61,6 +61,28 @@ impl Item {
     pub fn is_empty(&self) -> bool {
         self.index == 0
     }
+
+    /// One item, as the table defines it.
+    ///
+    /// The original builds every item it hands out this way:
+    /// `MIN := ItemList[Index].Durabilidade` and `MAX := MIN`
+    /// (`Functions/ItemFunctions.pas:414`, and again in `PutEquipament`).
+    ///
+    /// Skipping it stores a piece of armour as zero out of zero, which is
+    /// what the client draws as broken -- and a broken item is one it will
+    /// not equip. It refuses on its own, without sending anything, so there
+    /// is no packet to log and nothing for a server to explain. Twenty-one
+    /// items in the working database were sitting like that.
+    pub fn from_table(index: u16, table: &aika_data::itemlist::ItemList) -> Self {
+        let durability = table.get(index as usize).map_or(0, |def| def.durability());
+        Self {
+            index,
+            appearance: index,
+            durability_min: durability,
+            durability_max: durability,
+            ..Self::default()
+        }
+    }
 }
 
 /// A character, holding what the selection screen needs to show.

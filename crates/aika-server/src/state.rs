@@ -65,6 +65,16 @@ impl State {
         let templates = load_templates(&cfg.game.template_dir);
         let levels = load_levels(&cfg.game.exp_list);
         let drops = load_drops(&cfg.game.drop_dir);
+
+        // Needs both halves, which is why it is here and not in the
+        // migration: the fix for one row is in the item table, and the
+        // database does not have one.
+        match db.repair_durability(&items).await {
+            Ok(0) => {}
+            Ok(fixed) => info!(items = fixed, "items given the durability they were stored without"),
+            Err(e) => warn!(error = %e, "could not repair item durability"),
+        }
+
         Ok(Self {
             cfg, store, world, items, skills, templates, levels, drops,
             db: Some(db), started: Instant::now(),

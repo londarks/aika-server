@@ -215,6 +215,43 @@ impl Database {
         }
     }
 
+    /// Gives a durability to items stored without one.
+    ///
+    /// An item is created with the table's durability in both halves
+    /// (`Item::from_table`). Paths that predate that stored zero out of zero,
+    /// which the client reads as broken and silently refuses to equip -- no
+    /// packet, no refusal, nothing in a log to find it by.
+    ///
+    /// `durability_max = 0` is what makes those safe to tell apart from a
+    /// worn one: wear only ever lowers the first half, so an item that has
+    /// been used has a ceiling and an item that was never given one has not.
+    /// Runs on every start and is its own no-op once there is nothing left
+    /// to fix, so a database that has been through it does not need marking.
+    pub async fn repair_durability(&self, items: &aika_data::itemlist::ItemList) -> Result<usize> {
+        let rows = sqlx::query("SELECT id, item_index FROM items WHERE durability_max = 0")
+            .fetch_all(&self.pool)
+            .await
+            .context("looking for items with no durability")?;
+
+        let mut fixed = 0;
+        for row in rows {
+            let id = row.try_get::<i64, _>("id")?;
+            let index = row.try_get::<i64, _>("item_index")? as usize;
+            let Some(durability) = items.get(index).map(|def| def.durability()).filter(|d| *d > 0)
+            else {
+                continue;
+            };
+            sqlx::query("UPDATE items SET durability_min = ?, durability_max = ? WHERE id = ?")
+                .bind(durability as i64)
+                .bind(durability as i64)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .context("giving an item its durability")?;
+            fixed += 1;
+        }
+        Ok(fixed)
+    }
     pub async fn account_count(&self) -> Result<i64> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM accounts").fetch_one(&self.pool).await?;
         Ok(row.try_get::<i64, _>("n")?)
@@ -1136,6 +1173,60 @@ mod tests {
         assert!(row.try_get::<i64, _>("deleted_at").unwrap() > 0, "the row is still there");
     }
 
+    /// An item stored with no durability at all is a piece of armour the
+    /// client will not equip, and it says nothing when it refuses. A worn
+    /// one is left alone: it keeps its ceiling, and only the ceiling being
+    /// zero says the item was never given one.
+    #[tokio::test]
+    async fn items_stored_without_a_durability_are_given_one() {
+        let db = memory_db().await;
+        db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
+        let character_id = db.load_accounts().await.unwrap()[0].characters[0].id;
+
+        // A table where item 10 wears out and item 11 does not.
+        let table = {
+            use aika_data::itemlist::{field, RECORD_SIZE};
+            let mut raw = vec![0u8; 20 * RECORD_SIZE];
+            for index in [10usize, 11] {
+                raw[index * RECORD_SIZE + field::NAME.start] = b'x';
+            }
+            raw[10 * RECORD_SIZE + field::DURABILITY] = 80;
+            aika_data::itemlist::ItemList::decode(&raw).expect("the fixture table is malformed")
+        };
+        // never given one, and the table has a value for it
+        db.put_item(character_id, &Item { index: 10, container: 1, slot: 0, ..Item::default() })
+            .await
+            .unwrap();
+        // worn down to nothing, which is not the same thing at all
+        db.put_item(
+            character_id,
+            &Item {
+                index: 10,
+                container: 1,
+                slot: 1,
+                durability_min: 0,
+                durability_max: 80,
+                ..Item::default()
+            },
+        )
+        .await
+        .unwrap();
+        // and one the table itself says has no durability
+        db.put_item(character_id, &Item { index: 11, container: 1, slot: 2, ..Item::default() })
+            .await
+            .unwrap();
+
+        assert_eq!(db.repair_durability(&table).await.unwrap(), 1, "it fixed the wrong number");
+
+        let items = db.load_items(character_id).await.unwrap();
+        let at = |slot: u16| items.iter().find(|i| i.slot == slot).cloned().unwrap();
+        assert_eq!((at(0).durability_min, at(0).durability_max), (80, 80), "never given one");
+        assert_eq!((at(1).durability_min, at(1).durability_max), (0, 80), "worn, not broken");
+        assert_eq!((at(2).durability_min, at(2).durability_max), (0, 0), "none in the table");
+
+        // and running it again finds nothing, so a start-up cost is paid once
+        assert_eq!(db.repair_durability(&table).await.unwrap(), 0);
+    }
     #[tokio::test]
     async fn a_name_cannot_be_taken_twice() {
         let db = memory_db().await;

@@ -323,14 +323,7 @@ pub fn buy(
         return Err(ShopError::BagFull);
     }
 
-    let mut bought = Item {
-        index: id,
-        appearance: id,
-        refine: amount as u16,
-        durability_min: def.durability(),
-        durability_max: def.durability(),
-        ..Item::default()
-    };
+    let mut bought = Item { refine: amount as u16, ..Item::from_table(id, items) };
     // An item that is lent rather than sold starts its clock here, which is
     // where the original starts it too (`PutItem` calls `SetItemDuration`).
     // Without it a thirty-day saddle arrives already expired and the client

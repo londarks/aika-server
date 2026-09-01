@@ -594,7 +594,9 @@ mod tests {
 
     #[test]
     fn known_md5_of_admin() {
-        // the same hash the AikaEmu README uses for its example account
+        // The MD5 of "admin", which the original stores in `password_hash`.
+        // Pinned because the whole login turns on this one function agreeing
+        // with a column somebody else wrote years ago.
         assert_eq!(md5_hex("admin"), "21232f297a57a5a743894a0e4a801fc3");
     }
 

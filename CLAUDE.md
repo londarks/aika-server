@@ -2,10 +2,8 @@
 
 Server emulator for the MMORPG **Aika Online**, written in Rust.
 
-Ported from two references: the original **Delphi** server (authoritative — it is
-what our client actually talks to) and **[AikaEmu](https://github.com/lemestwo/AikaEmu)**
-in C# (GPL-3.0, more readable, used for cross-checking). Because of AikaEmu this
-project is GPL-3.0 too.
+Ported from the original **Delphi** server, which is the authority throughout: it
+is what our client actually talks to.
 
 ## Never in a tracked file
 
@@ -59,8 +57,8 @@ tracked: `assets/` is somebody else's data and `var/` is this machine's state.
 - `sql/` — the original MySQL dump. **Documentation of which fields the game
   needs, not a schema to copy.**
 
-Reference sources live outside this repo, in sibling directories:
-`../aika-delphi-bin/Src` (Delphi) and `../AikaEmu` (C#).
+The reference source lives outside this repo, in a sibling directory:
+`../aika-delphi-bin/Src`.
 
 ## Rules learned the hard way
 
@@ -73,10 +71,10 @@ Reference sources live outside this repo, in sibling directories:
   each other by 16 and 32 bytes. Trust the declared types, never the comments.
 - **Dead code hides behind `Exit;`** — check that a handler's body is actually
   reachable before porting it.
-- **The Delphi server is the authority; AikaEmu is a last resort.** The Delphi
-  is what our client actually speaks to. Reach for AikaEmu only for something
-  it alone documents, and never take game data from it: its tables are from a
-  different build of the game and describe a different server.
+- **The Delphi server is the authority, and the only one.** It is what our
+  client actually speaks to. Other emulators exist and describe a different
+  build of the game with different tables; nothing here comes from one, and
+  nothing should.
 - **The packet checksum does not protect the payload.** The cipher is linear, so
   the sum difference depends only on seed and length. Not an integrity check.
 - **Coordinates are always `f32` pairs, and there is no Z.** Height comes from

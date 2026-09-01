@@ -11,10 +11,11 @@
 //! offset 12..    body, layout depends on the opcode
 //! ```
 //!
-//! Unlike AikaEmu's `OnReceive` (which assumes one frame per socket read and
-//! carries a `TODO - Need complete overhaul`), this reader is sans-io: feed it
-//! bytes in whatever order they arrive and it hands back complete messages,
-//! coping with split frames and with several frames in one read.
+//! Unlike the original, which reads one frame per socket read, this reader is
+//! sans-io: feed it bytes in whatever order they arrive and it hands back
+//! complete messages, coping with split frames and with several frames in one
+//! read. TCP gives no promise that a read is a frame, and the original gets
+//! away with it only because the packets are small.
 
 use crate::crypto;
 
@@ -22,7 +23,8 @@ use crate::crypto;
 pub const MIN_FRAME: usize = 12;
 
 /// Prefix the client sends at the start of a connection, which the server
-/// discards (AikaEmu compares only the first 2 bytes; we require all 4).
+/// discards. The original cuts four bytes blindly; we check all four and
+/// decide from the content, so a client that sends no prefix still works.
 const CLIENT_HELLO: [u8; 4] = [0x11, 0xF3, 0x11, 0x1F];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

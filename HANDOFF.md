@@ -30,7 +30,6 @@ de onde veio. De dentro de `aika-rs/`, cada um destes é `../<nome>`.
 | `aika-delphi-bin/Src/` | **Fonte Delphi de referência** (~103k linhas). Só leitura — NUNCA executar os binários. |
 | `aika-client/` | O nosso cliente (linha de dados **BR**, protocolo 124). É o que o Gabriel usa pra testar. |
 | `aika-pacote-original/` | Pacote original baixado (documentação; reimplementar em Rust, não rodar). |
-| `AikaEmu/` | Emulador de referência de terceiros. Último recurso, só pra algo bem específico. Não copiar dele. |
 | (cliente CBM, fora desta árvore) | Cliente de um servidor comercial (linha **TK**, cifrado, GameGuard). Não mexer/decifrar — é de terceiro no ar. |
 
 ### Workspace `aika-rs/`

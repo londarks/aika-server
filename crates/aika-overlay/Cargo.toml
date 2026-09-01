@@ -2,7 +2,6 @@
 name = "aika-overlay"
 version = "0.1.0"
 edition = "2021"
-license = "GPL-3.0"
 
 # The file has to be called `d3d9.dll` for the client to load it, so the
 # library name is the export name and not the package name.

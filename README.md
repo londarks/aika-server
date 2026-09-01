@@ -2,11 +2,9 @@
 
 Server emulator for the MMORPG **Aika Online**, written in Rust.
 
-Ported from two references: the original **Delphi** server, which is
-authoritative because it is what our client actually talks to, and
-**[AikaEmu](https://github.com/lemestwo/AikaEmu)** in C# (GPL-3.0), which is
-more readable and useful for cross-checking. Because of AikaEmu this project is
-GPL-3.0 as well.
+Ported from the original **Delphi** server, which is the authority throughout:
+it is what our client actually talks to. Every behaviour here is traced back to
+the file in that source which owns it, and the commit that adds it says which.
 
 > No game client, asset or binary from Aika Online is included here. This
 > repository is server source code only.
@@ -15,21 +13,62 @@ GPL-3.0 as well.
 
 | Layer | State |
 |---|---|
-| Packet cipher | done, verified byte for byte against the original C# implementation |
+| Packet cipher | done — the 512-key table and the alternation are `Connections/EncDec.pas`, byte for byte |
 | TCP framing | done (reassembles fragments, splits coalesced packets, drops the client prefix) |
 | Token server (HTTP) | done — issues and validates tokens, character count, channel status, launcher routes |
 | Login server (TCP) | done — validates the token and clears the account |
-| Game server (TCP) | character selection, world entry and spawn in the starting city |
-| Movement | tracked, relayed to everyone in range |
-| Online registry | players see each other arrive, walk and leave |
-| `SL.bin` (channel list) | read and write, byte-exact round trip |
-| Item table | `ItemList.bin` parsed: 31,000 ids, 16,714 defined |
-| Persistence | next up (SQLite in development, MySQL in production) |
+| Characters | list, creation from the class templates, deletion, world entry |
+| Movement and chat | walking, turning, say and whisper, emotes, sitting and dancing |
+| Combat | swings, spells, damage with both animations, dying and getting up |
+| Monsters | the two clocks of `Mob/MOB.pas`: patrol, aggro, chase, leash, respawn, drops |
+| Skills | the class grid, learning at a trainer, casting, cooldowns per family |
+| Items | shops (gold, honor, medals, item currency), equipment, stacking, splitting, durability |
+| Storage | the account chest: 86 slots, four pages, gold in and out |
+| Buffs | potions and saddles start them; they expire on their own |
+| Mounts | worn, drawn on the rider, and their own two skills |
+| Persistence | SQLite in development, MySQL in production — position, gold, items, skills, chest |
+| Game data | `ItemList.bin`, `SkillData.bin`, `ExpList.bin`, `.npc`, mob CSVs, drops, `SL.bin` |
 
-90 tests, including an end-to-end run of the whole chain: HTTP token, TCP login
-and game server through to the character list.
+405 tests, including end-to-end runs over real sockets: HTTP token, TCP login
+and game server through to the character list, and a second server started on
+the same database file to prove what was saved.
 
-**The original client logs in, enters the world and walks.**
+**The original 2008 client logs in, fights, trades, learns skills and rides.**
+
+## Roadmap
+
+What is left, in the order it is worth doing. The ordering is not by size: it
+is by how much of the game each one unlocks for somebody playing alone, since
+that is how this is tested.
+
+**1. Effects.** The one piece everything else is waiting on. A skill and an
+item each carry an `EF`/`EFV` pair of arrays, and `GetCurrentScore` reads them
+through `GetMobAbility` to arrive at the numbers a character really has. Until
+it lands, a buff starts and shows and does nothing: a potion promising ten per
+cent more of everything changes no number, a mount adds no speed, and rings and
+necklaces are worth zero because that is where their whole value lives.
+
+**2. The rest of the character sheet.** Spending status points (`0x213`), the
+skill reset, and making a learned rank change what a spell does — learning
+raises the rank in the record today, but the damage is still the first rank's.
+
+**3. Keeping and mending things.** Repair, enchant, craft. The item types are
+already identified in `UseItem`; the work is the tables behind them.
+
+**4. The small ones.** Quests, dungeons.
+
+**5. Channels.** Changing channel needs the world split per channel first —
+today all four share one — and then the token handshake of `LoginIntoChannel`.
+Large, and worth little until there is somebody else online.
+
+**6. Everything that needs other people.** Guilds, parties and raids, friends
+and duels, trading, nations and relics, mail, the auction house, titles and
+events. About half the remaining opcodes, and none of it testable alone.
+
+Two things are already settled and should not be looked for again: the numeric
+PIN and `KarakAereo` are both dead code in the original, sitting behind an
+`Exit;` at the top of their handlers, and the live half of each is already
+implemented here.
 
 ## Running
 
@@ -137,9 +176,8 @@ operation alternates between `+4k`, `-(k>>1)`, `+2k` and `-(k>>2)`.
 
 **The checksum does not protect the payload.** The cipher is linear, so the
 difference between the sums depends only on the seed and the length: flipping a
-body byte still validates. That is how the original game behaves — confirmed by
-running the C# implementation. It is not an integrity check and must not be
-treated as one.
+body byte still validates. That is how the original game behaves. It is not an
+integrity check and must not be treated as one.
 
 ## Crates
 
@@ -206,4 +244,4 @@ account rows, e-mail addresses and password hashes.
 
 ## License
 
-GPL-3.0. See [LICENSE.md](LICENSE.md).
+See [LICENSE.md](LICENSE.md).

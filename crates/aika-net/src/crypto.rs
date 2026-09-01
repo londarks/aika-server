@@ -1,6 +1,8 @@
 //! Aika Online packet cipher.
 //!
-//! Faithful port of `AikaEmu.Shared/Network/Encryption/Encryption.cs` (GPL-3.0).
+//! Faithful port of `TEncDec` (`Connections/EncDec.pas` in the Delphi server).
+//! The 512-byte table below is that unit's `EncDecKeys`, byte for byte, and
+//! the alternation is its `case (I and 3)`.
 //!
 //! Wire frame layout (little-endian):
 //!

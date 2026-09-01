@@ -1,18 +1,31 @@
 # License
 
-This project is licensed under the **GNU General Public License v3.0**.
+Copyright © the aika-server authors. All rights reserved.
 
-It is a port of, and derives from, [AikaEmu](https://github.com/lemestwo/AikaEmu),
-which is itself GPL-3.0. The full license text is available at
-<https://www.gnu.org/licenses/gpl-3.0.txt>.
+No licence is granted yet. Read it, learn from it, open an issue — but there is
+no permission here to copy, modify or redistribute it, because none has been
+chosen. If you want to use any of this, ask.
 
-## Scope
+## What this code is
 
-The code in this repository is original work written in Rust. What was taken
-from the reference implementations is knowledge about a network protocol —
-byte offsets, opcode numbers, packet sizes — plus the cipher's 512-byte key
-table, which is the protocol's key material and cannot be derived.
+Original work in Rust. What it takes from elsewhere is knowledge about a
+network protocol — byte offsets, opcode numbers, packet sizes, the order things
+are sent in — read out of the original Aika Online server written in Delphi,
+which is the only thing that can settle what our client expects. Behaviour is
+traced back to the file that owns it rather than guessed at, and the commit
+that adds it says which file.
 
-No game assets, client binaries or copyrighted content from Aika Online are
-included or distributed here. Aika Online is the property of its respective
-rights holders. This project is for educational purposes.
+The cipher's 512-byte key table is that protocol's key material and cannot be
+derived from anything else. It is `EncDecKeys` from `Connections/EncDec.pas`,
+byte for byte.
+
+## What this code is not
+
+No game asset, client binary, item table, map or any other content from Aika
+Online is included or distributed here. This repository is server source only.
+The original server's database dump is kept as structure alone — every row was
+stripped, because it came from a private server that really ran and carried
+real e-mail addresses and password hashes.
+
+Aika Online and everything in it belong to their respective rights holders.
+This is a study of a protocol, written to make a client from 2008 work again.

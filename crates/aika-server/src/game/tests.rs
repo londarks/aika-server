@@ -1606,6 +1606,9 @@ const ROOTING_FAMILY: u32 = 13;
 /// Target type four, the second most common in the table after self.
 const AIMED_AT_SOMETHING: u32 = 4;
 const POTION_SKILL: usize = 9031;
+/// One of the seventeen the shipped table carries under the name
+/// "Pedra da Pran".
+const SUMMON_STONE: u16 = 104;
 
 fn buff_state() -> State {
     let mut state = shop_state();
@@ -1623,6 +1626,9 @@ fn buff_state() -> State {
         define(SADDLE, ITEM_TYPE_BUFF, SADDLE_SKILL as u16);
         define(LASTING_POTION, ITEM_TYPE_POTION_BUFF, POTION_SKILL as u16);
         define(HORSE, 9, 0);
+        // A Pran Summon Stone. Type ten is what sends it to equipment
+        // slot ten, which is the slot the companion lives in.
+        define(SUMMON_STONE, crate::pran::STONE_ITEM_TYPE, 0);
         ItemList::decode(&raw).expect("the fixture table is malformed")
     };
 
@@ -1847,6 +1853,129 @@ async fn a_skill_aimed_at_the_caster_by_its_own_type_still_lands() {
     assert!(session.buffs.has_family(&state.skills, crate::buffs::FAMILY_MOUNTED));
 }
 
+/// Wearing a summon stone brings out a companion, and the first stone to be
+/// worn hatches one. Both halves matter: the packet is what draws the pran
+/// window, and the effect is the whole of how a young one is shown.
+#[tokio::test]
+async fn wearing_a_summon_stone_hatches_a_pran_and_shows_it() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    assert!(session.account.as_ref().unwrap().prans.is_empty());
+
+    let frames = frames_of(handle_message(&state, &mut session, &wear_stone()).await);
+
+    let prans = &session.account.as_ref().unwrap().prans;
+    assert_eq!(prans.len(), 1, "no pran hatched");
+    assert_eq!(prans[0].item_id, 4242, "it is not bound to the stone it came out of");
+    assert_eq!(prans[0].class, 61);
+    assert!(session.dirty, "a pran that is not saved is hatched again next time");
+
+    assert!(
+        opcodes(&frames).contains(&crate::pran::OP_WORLD),
+        "the pran window was not drawn"
+    );
+    assert!(
+        effects_in(&frames).contains(&crate::pran::Element::Fire.fairy_effect()),
+        "a fairy is only ever an effect, so nothing was shown at all"
+    );
+}
+
+/// Wearing it a second time is the same pran, not another. The stone is what
+/// it belongs to, so taking it off and putting it back has to find it again.
+#[tokio::test]
+async fn the_same_stone_brings_back_the_same_pran() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+
+    handle_message(&state, &mut session, &wear_stone()).await;
+    session.account.as_mut().unwrap().prans[0].level = 9;
+
+    // off, and on again
+    let frames = frames_of(handle_message(&state, &mut session, &take_stone_off()).await);
+    assert!(effects_in(&frames).contains(&0), "the fairy was left on the player");
+    handle_message(&state, &mut session, &wear_stone()).await;
+
+    let prans = &session.account.as_ref().unwrap().prans;
+    assert_eq!(prans.len(), 1, "it hatched a second one");
+    assert_eq!(prans[0].level, 9, "and forgot the first");
+}
+
+/// Anything else in that slot is not a companion. The slot is reachable by
+/// item type alone, and a wrong guess would hatch a pran out of a hat.
+#[tokio::test]
+async fn something_that_is_not_a_stone_hatches_nothing() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying(&mut session, SADDLE, 7);
+
+    handle_message(&state, &mut session, &wear_stone()).await;
+
+    assert!(session.account.as_ref().unwrap().prans.is_empty());
+}
+
+/// The effect values in a burst of frames.
+///
+/// An effect is not its own packet: it shares `0x117` with the client index,
+/// and the two are told apart by the second word. So the opcode alone proves
+/// nothing -- arriving in the world sends a dozen of them.
+fn effects_in(frames: &[Vec<u8>]) -> Vec<u32> {
+    frames
+        .iter()
+        .map(|frame| decode(frame))
+        .filter(|m| m.body.len() >= 8)
+        .map(|m| u32::from_le_bytes(m.body[4..8].try_into().unwrap()))
+        .collect()
+}
+
+/// A summon stone in the bag, with an identific of its own: a pran belongs to
+/// one stone and not to a kind of stone.
+fn carrying_stone(session: &mut Session, identific: i32) {
+    session
+        .character
+        .as_mut()
+        .unwrap()
+        .items
+        .put(Item {
+            index: SUMMON_STONE,
+            container: inventory::BAG,
+            slot: 7,
+            identific,
+            ..Item::default()
+        })
+        .unwrap();
+}
+
+fn wear_stone() -> Message {
+    Message {
+        sender: TEST_CLIENT_ID,
+        opcode: OP_MOVE_ITEM,
+        time: 0,
+        body: MoveItem {
+            to_container: inventory::EQUIP as u16,
+            to_slot: crate::pran::STONE_SLOT,
+            from_container: inventory::BAG as u16,
+            from_slot: 7,
+        }
+        .to_body(),
+    }
+}
+
+fn take_stone_off() -> Message {
+    Message {
+        sender: TEST_CLIENT_ID,
+        opcode: OP_MOVE_ITEM,
+        time: 0,
+        body: MoveItem {
+            to_container: inventory::BAG as u16,
+            to_slot: 7,
+            from_container: inventory::EQUIP as u16,
+            from_slot: crate::pran::STONE_SLOT,
+        }
+        .to_body(),
+    }
+}
 /// Everyone watching has to see the spell go off. The original builds a fresh
 /// `0x302` for it rather than echoing the one it got, and fills the animation
 /// from the skill's own `SelfAnimation` — the client sends nothing useful in

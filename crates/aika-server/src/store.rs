@@ -31,6 +31,10 @@ pub struct Account {
     pub storage: Inventory,
     /// Gold kept in the chest, separate from what any character carries.
     pub storage_gold: u64,
+    /// The companions. They hang off the account for the same reason the
+    /// chest does -- `Account.Header.Pran1` and `Pran2` -- so every character
+    /// on it shares them. See [`crate::pran`].
+    pub prans: Vec<crate::pran::Pran>,
     pub last_token: Option<String>,
     pub last_token_at: Option<Instant>,
 }
@@ -319,6 +323,9 @@ impl Account {
             characters: entry.characters.iter().map(Character::from).collect(),
             storage: crate::creation::starting_storage(),
             storage_gold: 0,
+            // An account starts with none. One is hatched from a summon stone;
+            // see [`crate::pran`].
+            prans: Vec::new(),
             last_token: None,
             last_token_at: None,
         })

@@ -12,7 +12,7 @@
 use crate::state::State;
 use crate::inventory::{self, Inventory};
 use crate::store::{Account, Character, Item, MAX_CHARACTERS};
-use crate::{ability, combat, creation, dialog, expiry, promotion, shop, stats};
+use crate::{ability, combat, creation, dialog, expiry, pran, promotion, shop, stats};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
 use crate::effects::Effects;
 use aika_data::itemlist::ItemList;
@@ -1114,6 +1114,10 @@ fn handle_enter_world(
         frames.push(encode_client_index(client_id));
     }
     frames.push(zeroed(OP_ENTER_94C, 0, ENTER_94C_SIZE));
+
+    // The companion comes back with the stone still worn, which is where
+    // the original picks it up too.
+    frames.extend(pran_frames(state, session));
 
     let effects = Effects::of(&character, &state.items, &session.buffs, &state.skills);
     let stats = stats::of(&character, &state.items, &effects);
@@ -3580,6 +3584,98 @@ fn encode_effect(client_id: u16, effect: u32) -> Vec<u8> {
     )
 }
 
+/// Whatever the worn summon stone should be showing right now.
+///
+/// Called wherever equipment slot ten can have changed: entering the world,
+/// and any move that touches it. The original does the same thing in the same
+/// two places -- `Mob/Player.pas:5190` on arrival, and the move handler for
+/// everything after (`PacketHandlers.pas:6573`).
+///
+/// # Hatching
+///
+/// A stone with no pran bound to it gets one. That part is ours: on the
+/// original a pran comes from one of three quests -- 39 fire, 40 water, 41
+/// air -- and `FinishQuest` is the only thing in the source that ever makes
+/// one. There are no quests here yet, so the stone stands in for the chain,
+/// and it hatches fire because the element is the quest's choice and fire is
+/// no more arbitrary than the other two. When quests land, this is the
+/// paragraph to delete: the numbers themselves are already the original's.
+///
+/// Nothing checks that the stone suits the pran. `GetPranClassStoneItem` says
+/// which stone a class belongs in, but the original does not consult it here
+/// -- it matches the stone's `Identific` and nothing else -- so neither does
+/// this.
+fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+    let client_id = session.client_id;
+    let worn = session
+        .character
+        .as_ref()
+        .and_then(|c| c.items.get(inventory::EQUIP, pran::STONE_SLOT))
+        .filter(|item| !item.is_empty())
+        .cloned();
+
+    // Nothing worn, so nothing to send. Arriving with an empty slot is not the
+    // same as taking a stone off: the original only looks at slot ten on
+    // arrival `if Equip[10].Identific > 0`, and a player who has never had a
+    // pran should not be sent a packet about one. Clearing is the caller's to
+    // do, and only where a stone has just left.
+    let Some(stone) = worn else {
+        return Vec::new();
+    };
+    let is_stone = state
+        .items
+        .get(stone.index as usize)
+        .is_some_and(|def| pran::is_stone(def.item_type()));
+    if !is_stone {
+        return Vec::new();
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let Some(account) = session.account.as_mut() else {
+        return Vec::new();
+    };
+
+    let at = match account.prans.iter().position(|p| p.belongs_to(&stone)) {
+        Some(at) => at,
+        None => {
+            let hatched = pran::Pran::hatch(pran::Element::Fire, stone.identific, now);
+            info!(
+                stone = stone.index,
+                identific = stone.identific,
+                class = hatched.class,
+                "a pran hatched"
+            );
+            account.prans.push(hatched);
+            session.dirty = true;
+            account.prans.len() - 1
+        }
+    };
+
+    let pran = &account.prans[at];
+    let mut frames = vec![frame::encode(
+        &Message {
+            sender: dialog::FIXED_INDEX,
+            opcode: pran::OP_WORLD,
+            time: 0,
+            body: pran::world_body(pran),
+        },
+        rand::random(),
+    )];
+
+    // A young one has no body to spawn: it is an effect on the player, one
+    // per element. A grown one takes a client id out of its own range and is
+    // drawn like anything else, which is not built yet.
+    if let (true, Some(element)) = (pran.is_fairy(), pran.element()) {
+        frames.push(encode_effect(client_id, element.fairy_effect()));
+    }
+    frames
+}
+
+/// What the original sends to take a fairy off a player again.
+const EFFECT_NONE: u32 = 0;
 /// The effect number the client plays when a character gains a level
 /// (`AddLevel` sends `SendEffect(1)`).
 const EFFECT_LEVEL_UP: u32 = 1;

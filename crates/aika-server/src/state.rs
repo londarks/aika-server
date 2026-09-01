@@ -138,6 +138,14 @@ impl State {
         {
             warn!(account = %account.username, error = %e, "could not save the chest");
         }
+
+        // The companions hang off the account the same way the chest does, so
+        // they are written where it is written.
+        for pran in &account.prans {
+            if let Err(e) = db.save_pran(account.id as i64, pran).await {
+                warn!(account = %account.username, error = %e, "could not save a pran");
+            }
+        }
     }
 
     /// Equivalent of the `timeGetTime` the Delphi server stamps on packets:

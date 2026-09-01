@@ -100,6 +100,41 @@ CREATE INDEX IF NOT EXISTS items_by_character ON items (character_id);
 -- The chest. Same columns as `items`, but owned by the account rather than by
 -- a character, because that is what it is for: handing something from one of
 -- your characters to another.
+-- The companion, which belongs to the account and not to any one
+-- character, the same way the chest does. One row per pran, and the stone it
+-- was hatched in is what ties it to a slot on somebody's body.
+CREATE TABLE IF NOT EXISTS prans (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id    INTEGER NOT NULL,
+    item_id       INTEGER NOT NULL,
+    name          TEXT NOT NULL DEFAULT '',
+    level         INTEGER NOT NULL DEFAULT 1,
+    class         INTEGER NOT NULL,
+    hp            INTEGER NOT NULL,
+    max_hp        INTEGER NOT NULL,
+    mp            INTEGER NOT NULL,
+    max_mp        INTEGER NOT NULL,
+    xp            INTEGER NOT NULL DEFAULT 0,
+    def_p         INTEGER NOT NULL DEFAULT 0,
+    def_m         INTEGER NOT NULL DEFAULT 0,
+    food          INTEGER NOT NULL DEFAULT 0,
+    devotion      INTEGER NOT NULL DEFAULT 0,
+    p_cute        INTEGER NOT NULL DEFAULT 0,
+    p_smart       INTEGER NOT NULL DEFAULT 0,
+    p_sexy        INTEGER NOT NULL DEFAULT 0,
+    p_energetic   INTEGER NOT NULL DEFAULT 0,
+    p_tough       INTEGER NOT NULL DEFAULT 0,
+    p_corrupt     INTEGER NOT NULL DEFAULT 0,
+    width         INTEGER NOT NULL DEFAULT 0,
+    chest         INTEGER NOT NULL DEFAULT 0,
+    leg           INTEGER NOT NULL DEFAULT 0,
+    skills        BLOB,
+    bar           BLOB,
+    created_at    INTEGER NOT NULL DEFAULT 0,
+    updated_at    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS prans_by_account ON prans (account_id);
+
 CREATE TABLE IF NOT EXISTS storage_items (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id     INTEGER NOT NULL,
@@ -377,6 +412,7 @@ impl Database {
                 ban_days: row.try_get::<i64, _>("ban_days")? as u32,
                 characters: self.load_characters(id).await?,
                 storage: self.load_storage(id).await?,
+                prans: self.load_prans(id).await?,
                 storage_gold: row.try_get::<i64, _>("storage_gold").unwrap_or(0) as u64,
                 last_token: None,
                 last_token_at: None,
@@ -492,6 +528,159 @@ impl Database {
     /// pages and is a chest nobody could ever put anything in. A chest that
     /// has been used cannot look like this: the vaults are the one thing in it
     /// that cannot be taken out.
+    /// The account's companions.
+    ///
+    /// Columns are named rather than starred: this table gains one every time
+    /// another piece of the pran is built, and a `SELECT *` in the same process
+    /// that just added a column hands back the old width while claiming the new
+    /// one, then panics inside the driver rather than failing.
+    pub async fn load_prans(&self, account_id: i64) -> Result<Vec<crate::pran::Pran>> {
+        let rows = sqlx::query(
+            "SELECT id, item_id, name, level, class, hp, max_hp, mp, max_mp, xp,
+                    def_p, def_m, food, devotion,
+                    p_cute, p_smart, p_sexy, p_energetic, p_tough, p_corrupt,
+                    width, chest, leg, skills, bar, created_at, updated_at
+             FROM prans WHERE account_id = ? ORDER BY id",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("loading the prans")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::pran::Pran {
+                    id: row.try_get::<i64, _>("id")?,
+                    item_id: row.try_get::<i64, _>("item_id")? as i32,
+                    name: row.try_get::<String, _>("name")?,
+                    level: row.try_get::<i64, _>("level")? as u8,
+                    class: row.try_get::<i64, _>("class")? as u8,
+                    hp: row.try_get::<i64, _>("hp")? as u32,
+                    max_hp: row.try_get::<i64, _>("max_hp")? as u32,
+                    mp: row.try_get::<i64, _>("mp")? as u32,
+                    max_mp: row.try_get::<i64, _>("max_mp")? as u32,
+                    exp: row.try_get::<i64, _>("xp")? as u32,
+                    def_physical: row.try_get::<i64, _>("def_p")? as u16,
+                    def_magic: row.try_get::<i64, _>("def_m")? as u16,
+                    food: row.try_get::<i64, _>("food")? as u8,
+                    devotion: row.try_get::<i64, _>("devotion")? as u8,
+                    personality: crate::pran::Personality {
+                        cute: row.try_get::<i64, _>("p_cute")? as u16,
+                        smart: row.try_get::<i64, _>("p_smart")? as u16,
+                        sexy: row.try_get::<i64, _>("p_sexy")? as u16,
+                        energetic: row.try_get::<i64, _>("p_energetic")? as u16,
+                        tough: row.try_get::<i64, _>("p_tough")? as u16,
+                        corrupt: row.try_get::<i64, _>("p_corrupt")? as u16,
+                    },
+                    width: row.try_get::<i64, _>("width")? as u8,
+                    chest: row.try_get::<i64, _>("chest")? as u8,
+                    leg: row.try_get::<i64, _>("leg")? as u8,
+                    skills: unpack_u32(row.try_get::<Option<Vec<u8>>, _>("skills")?),
+                    bar: unpack_u8(row.try_get::<Option<Vec<u8>>, _>("bar")?),
+                    created_at: row.try_get::<i64, _>("created_at")?,
+                    updated_at: row.try_get::<i64, _>("updated_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Writes one companion.
+    ///
+    /// Keyed on the stone rather than on the row id. A pran belongs to one
+    /// summon stone and a stone holds one pran, so `(account, item_id)` names
+    /// it as well as the primary key does -- and it names it without the
+    /// caller having to carry an id back into memory after the first insert,
+    /// which is exactly the sort of bookkeeping that ends in a duplicate row
+    /// every time the game autosaves.
+    ///
+    /// Update first and insert only if it changed nothing: `INSERT OR REPLACE`
+    /// is SQLite's and `REPLACE INTO` is MySQL's, and this has to run on both.
+    pub async fn save_pran(&self, account_id: i64, pran: &crate::pran::Pran) -> Result<()> {
+        let updated = sqlx::query(
+            "UPDATE prans SET name = ?, level = ?, class = ?,
+                 hp = ?, max_hp = ?, mp = ?, max_mp = ?, xp = ?,
+                 def_p = ?, def_m = ?, food = ?, devotion = ?,
+                 p_cute = ?, p_smart = ?, p_sexy = ?, p_energetic = ?,
+                 p_tough = ?, p_corrupt = ?, width = ?, chest = ?, leg = ?,
+                 skills = ?, bar = ?, updated_at = ?
+             WHERE account_id = ? AND item_id = ?",
+        )
+        .bind(&pran.name)
+        .bind(pran.level as i64)
+        .bind(pran.class as i64)
+        .bind(pran.hp as i64)
+        .bind(pran.max_hp as i64)
+        .bind(pran.mp as i64)
+        .bind(pran.max_mp as i64)
+        .bind(pran.exp as i64)
+        .bind(pran.def_physical as i64)
+        .bind(pran.def_magic as i64)
+        .bind(pran.food as i64)
+        .bind(pran.devotion as i64)
+        .bind(pran.personality.cute as i64)
+        .bind(pran.personality.smart as i64)
+        .bind(pran.personality.sexy as i64)
+        .bind(pran.personality.energetic as i64)
+        .bind(pran.personality.tough as i64)
+        .bind(pran.personality.corrupt as i64)
+        .bind(pran.width as i64)
+        .bind(pran.chest as i64)
+        .bind(pran.leg as i64)
+        .bind(pack_u32(&pran.skills))
+        .bind(pran.bar.to_vec())
+        .bind(pran.updated_at)
+        .bind(account_id)
+        .bind(pran.item_id as i64)
+        .execute(&self.pool)
+        .await
+        .context("saving a pran")?;
+
+        if updated.rows_affected() > 0 {
+            return Ok(());
+        }
+
+        sqlx::query(
+            "INSERT INTO prans
+                 (name, level, class, hp, max_hp, mp, max_mp, xp,
+                  def_p, def_m, food, devotion,
+                  p_cute, p_smart, p_sexy, p_energetic, p_tough, p_corrupt,
+                  width, chest, leg, skills, bar, updated_at,
+                  account_id, item_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&pran.name)
+        .bind(pran.level as i64)
+        .bind(pran.class as i64)
+        .bind(pran.hp as i64)
+        .bind(pran.max_hp as i64)
+        .bind(pran.mp as i64)
+        .bind(pran.max_mp as i64)
+        .bind(pran.exp as i64)
+        .bind(pran.def_physical as i64)
+        .bind(pran.def_magic as i64)
+        .bind(pran.food as i64)
+        .bind(pran.devotion as i64)
+        .bind(pran.personality.cute as i64)
+        .bind(pran.personality.smart as i64)
+        .bind(pran.personality.sexy as i64)
+        .bind(pran.personality.energetic as i64)
+        .bind(pran.personality.tough as i64)
+        .bind(pran.personality.corrupt as i64)
+        .bind(pran.width as i64)
+        .bind(pran.chest as i64)
+        .bind(pran.leg as i64)
+        .bind(pack_u32(&pran.skills))
+        .bind(pran.bar.to_vec())
+        .bind(pran.updated_at)
+        .bind(account_id)
+        .bind(pran.item_id as i64)
+        .bind(pran.created_at)
+        .execute(&self.pool)
+        .await
+        .context("storing a pran")?;
+        Ok(())
+    }
     pub async fn load_storage(&self, account_id: i64) -> Result<Inventory> {
         let rows = sqlx::query("SELECT * FROM storage_items WHERE account_id = ? ORDER BY slot")
             .bind(account_id)
@@ -816,6 +1005,16 @@ fn now() -> i64 {
 /// Rather than a column each — sixty and forty of them — they are stored as
 /// one blob of little-endian bytes, which is portable between SQLite and
 /// MySQL and reads back into the same array.
+/// Bytes back out of a blob, zeroed when there is none.
+fn unpack_u8<const N: usize>(blob: Option<Vec<u8>>) -> [u8; N] {
+    let mut out = [0u8; N];
+    if let Some(blob) = blob {
+        for (at, byte) in blob.iter().take(N).enumerate() {
+            out[at] = *byte;
+        }
+    }
+    out
+}
 fn pack_u16<const N: usize>(values: &[u16; N]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -1226,6 +1425,74 @@ mod tests {
 
         // and running it again finds nothing, so a start-up cost is paid once
         assert_eq!(db.repair_durability(&table).await.unwrap(), 0);
+    }
+    /// A companion survives being written and read, whole.
+    #[tokio::test]
+    async fn a_pran_comes_back_the_way_it_went_in() {
+        let db = memory_db().await;
+        db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
+        let account_id = db.load_accounts().await.unwrap()[0].id as i64;
+
+        let mut pran = crate::pran::Pran::hatch(crate::pran::Element::Water, 4242, 1700);
+        pran.name = "Nina".into();
+        pran.level = 7;
+        pran.hp = 111;
+        pran.exp = 909;
+        pran.food = 64;
+        pran.devotion = 12;
+        pran.personality.smart = 30;
+        pran.bar = [3, 0, 1];
+        pran.updated_at = 1800;
+
+        db.save_pran(account_id, &pran).await.unwrap();
+        let back = db.load_prans(account_id).await.unwrap();
+
+        assert_eq!(back.len(), 1);
+        // The row id is the one field the caller does not set, so it is the
+        // one field that cannot match.
+        assert_eq!(crate::pran::Pran { id: 0, ..back[0].clone() }, pran);
+    }
+
+    /// Saving twice is one pran, not two. The autosave runs on a timer, so a
+    /// save that inserted every time would grow a row a minute.
+    #[tokio::test]
+    async fn saving_a_pran_again_updates_it_rather_than_making_another() {
+        let db = memory_db().await;
+        db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
+        let account_id = db.load_accounts().await.unwrap()[0].id as i64;
+
+        let mut pran = crate::pran::Pran::hatch(crate::pran::Element::Fire, 7, 1000);
+        db.save_pran(account_id, &pran).await.unwrap();
+
+        pran.level = 4;
+        pran.exp = 5000;
+        db.save_pran(account_id, &pran).await.unwrap();
+        db.save_pran(account_id, &pran).await.unwrap();
+
+        let back = db.load_prans(account_id).await.unwrap();
+        assert_eq!(back.len(), 1, "the autosave grew a second pran");
+        assert_eq!((back[0].level, back[0].exp), (4, 5000), "the update did nothing");
+    }
+
+    /// Two stones are two companions, which is what the second chest slot is
+    /// for. Keying the save on the stone has to keep them apart.
+    #[tokio::test]
+    async fn two_stones_hold_two_prans() {
+        let db = memory_db().await;
+        db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
+        let account_id = db.load_accounts().await.unwrap()[0].id as i64;
+
+        db.save_pran(account_id, &crate::pran::Pran::hatch(crate::pran::Element::Fire, 1, 0))
+            .await
+            .unwrap();
+        db.save_pran(account_id, &crate::pran::Pran::hatch(crate::pran::Element::Air, 2, 0))
+            .await
+            .unwrap();
+
+        let back = db.load_prans(account_id).await.unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].class, 61);
+        assert_eq!(back[1].class, 81, "the second wrote over the first");
     }
     #[tokio::test]
     async fn a_name_cannot_be_taken_twice() {

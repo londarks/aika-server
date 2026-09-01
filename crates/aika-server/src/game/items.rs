@@ -58,6 +58,23 @@ pub(crate) fn handle_move_item(state: &State, session: &mut Session, message: &M
     };
     if equipped {
         frames.extend(restat(state, session, from, to));
+
+        // Slot ten is the companion, and it is the one slot where equipping
+        // does more than change a number.
+        let stone_slot = |side: (u8, u16)| {
+            side.0 == inventory::EQUIP && side.1 == crate::pran::STONE_SLOT
+        };
+        if stone_slot(from) || stone_slot(to) {
+            let summoned = super::pran_frames(state, session);
+            if summoned.is_empty() {
+                // The stone came off, so the fairy comes off with it. The
+                // original sends the same effect packet it drew it with
+                // (`SendPranUnspawn`, for a pran under level four).
+                frames.push(super::encode_effect(session.client_id, super::EFFECT_NONE));
+            } else {
+                frames.extend(summoned);
+            }
+        }
     }
     Action::Reply(frames)
 }

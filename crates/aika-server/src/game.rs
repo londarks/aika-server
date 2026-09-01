@@ -242,6 +242,13 @@ const CREATE_MOB_SIZE: usize = 508;
 mod spawn_offset {
     pub const NAME: usize = 0;
     pub const EQUIP: usize = 16;
+    /// The stone and the mount, which are not in the equip array above: it
+    /// holds eight slots and they live in nine and ten. The original copies
+    /// their item ids into two fields of their own
+    /// (`ItemEffPedra`/`ItemEffMontaria`, `Mob/BaseMob.pas:3078`), and this is
+    /// the only place the client is told what somebody is riding.
+    pub const ITEM_EFF_STONE: usize = 32;
+    pub const ITEM_EFF_MOUNT: usize = 34;
     pub const ARMA_REFINE: usize = 39;
     /// The position is a pair of `f32`, not integers, and there is no Z.
     pub const POSITION_X: usize = 44;
@@ -277,9 +284,23 @@ const NPC_UNK0: u8 = 0x28;
 const NPC_IS_SERVICE: u8 = 1;
 const NPC_EFFECT_TYPE: u16 = 1;
 
-/// The equipment slots the spawn packet carries beyond the body and the
-/// hair. Slots 8 and up are accessories, which it has no room for.
+/// The equipment slots the spawn packet's equip array carries beyond the body
+/// and the hair. It holds eight and stops there.
 const WORN_SLOTS: std::ops::Range<u16> = 2..8;
+
+/// The two slots past that array, which the spawn carries in fields of their
+/// own: the stone whose effect glows on the gear, and the mount the character
+/// is riding. A mount is an item like any other — type 9 in the table — and
+/// putting one here is what puts the player on it.
+const STONE_SLOT: u16 = 8;
+const MOUNT_SLOT: u16 = 9;
+
+/// The item id in an equipment slot, or zero for an empty one. Unlike
+/// [`worn_appearance`] there is no appearance override here, because the
+/// original copies the index for these two and nothing else.
+fn worn_index(character: &Character, slot: u16) -> u16 {
+    character.items.get(inventory::EQUIP, slot).map_or(0, |item| item.index)
+}
 
 /// What the client should draw in one equipment slot.
 ///
@@ -1590,6 +1611,13 @@ fn encode_spawn_as(character: &Character, client_id: u16, spawn_type: u8) -> Vec
     for slot in WORN_SLOTS {
         put16(&mut body, off::EQUIP + slot as usize * 2, worn_appearance(character, slot));
     }
+
+    // The stone and the mount, by item id rather than by appearance: the
+    // original copies `Equip[8].Index` and `Equip[9].Index` straight across.
+    // Without the second of these a player on a horse is drawn on foot, since
+    // the equip array above stops at slot seven and never reaches it.
+    put16(&mut body, off::ITEM_EFF_STONE, worn_index(character, STONE_SLOT));
+    put16(&mut body, off::ITEM_EFF_MOUNT, worn_index(character, MOUNT_SLOT));
 
     body[off::ARMA_REFINE] = SPAWN_ARMA_REFINE;
 
@@ -5504,6 +5532,88 @@ mod tests {
         assert_eq!(u32::from_le_bytes(message.body[0..4].try_into().unwrap()), 180);
 
         assert!(mine_rx.try_recv().is_err(), "the sender heard its own turn");
+    }
+
+    /// A mount is drawn from a field of its own, not from the equip array the
+    /// spawn carries: that array holds eight slots and the mount is in the
+    /// tenth. Put it in the wrong place and the rider is drawn on foot.
+    #[test]
+    fn the_spawn_says_what_the_character_is_riding() {
+        const HORSE: u16 = 963;
+        const STONE: u16 = 4220;
+
+        let mut character = Character::from(&dev_character("Athus", 0));
+        character
+            .items
+            .put(Item {
+                index: HORSE,
+                container: inventory::EQUIP,
+                slot: MOUNT_SLOT,
+                ..Item::default()
+            })
+            .unwrap();
+        character
+            .items
+            .put(Item {
+                index: STONE,
+                container: inventory::EQUIP,
+                slot: STONE_SLOT,
+                ..Item::default()
+            })
+            .unwrap();
+
+        let body = decode(&encode_spawn(&character, TEST_CLIENT_ID)).body;
+        let at = |offset: usize| u16::from_le_bytes(body[offset..offset + 2].try_into().unwrap());
+
+        assert_eq!(at(spawn_offset::ITEM_EFF_MOUNT), HORSE, "the rider was drawn on foot");
+        assert_eq!(at(spawn_offset::ITEM_EFF_STONE), STONE);
+        // And the equip array, which ends before either of them, is untouched.
+        assert_eq!(at(spawn_offset::EQUIP + 7 * 2), 0, "the mount leaked into the equip array");
+    }
+
+    /// Getting on a horse has to reach everyone who can see the rider, which
+    /// is what the respawn after an equipment move is for.
+    #[tokio::test]
+    async fn mounting_makes_everyone_redraw_the_rider() {
+        const HORSE: u16 = 963;
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                index: HORSE,
+                container: inventory::BAG,
+                slot: 7,
+                durability_min: 255,
+                ..Item::default()
+            })
+            .unwrap();
+
+        let frames = frames_of(
+            handle_message(
+                &state,
+                &mut session,
+                &drag((inventory::BAG, 7), (inventory::EQUIP, MOUNT_SLOT)),
+            )
+            .await,
+        );
+
+        let spawn = frames
+            .iter()
+            .map(|f| decode(f))
+            .find(|m| m.opcode == OP_CREATE_MOB)
+            .expect("nobody was told the player got on a horse");
+        assert_eq!(
+            u16::from_le_bytes(
+                spawn.body[spawn_offset::ITEM_EFF_MOUNT..spawn_offset::ITEM_EFF_MOUNT + 2]
+                    .try_into()
+                    .unwrap()
+            ),
+            HORSE
+        );
     }
 
     /// The character sheet reads its numbers out of `0x10A` and nowhere else,

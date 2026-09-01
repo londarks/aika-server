@@ -21,9 +21,10 @@ use aika_data::npc::Npc;
 use aika_net::frame::{self, FrameError, FrameReader, Message, MIN_FRAME};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 /// Client to server: enter the game server with an authenticated account.
@@ -539,6 +540,11 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Resu
     let (mut incoming, mut outgoing) = stream.into_split();
     let (outbox, mut queue) = mpsc::unbounded_channel::<Vec<u8>>();
 
+    // Shared with the writer, because the writer is the only place every
+    // outbound frame passes through: a reply and a broadcast from somebody
+    // else's connection both end up in that queue.
+    let trace = Arc::new(Mutex::new(crate::trace::Trace::new(Instant::now())));
+
     // The id is ours to hand out, not the client's to claim: the client learns
     // it from the packets we send, and echoing back whatever it sent would give
     // every player the same one.
@@ -549,16 +555,26 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Resu
 
     // One task owns the write half, so a broadcast from another connection can
     // reach this player without either side waiting on the other.
-    let writer = tokio::spawn(async move {
-        while let Some(frame) = queue.recv().await {
-            if outgoing.write_all(&frame).await.is_err() {
-                break;
+    let writer = tokio::spawn({
+        let trace = Arc::clone(&trace);
+        async move {
+            while let Some(frame) = queue.recv().await {
+                {
+                    let mut trace = trace.lock().await;
+                    trace.sent_to_client(&frame, Instant::now());
+                    if trace.is_live() {
+                        debug!("{}", trace.last_line());
+                    }
+                }
+                if outgoing.write_all(&frame).await.is_err() {
+                    break;
+                }
             }
         }
     });
 
     let mut session = Session { client_id, ..Session::default() };
-    let result = read_loop(&state, &mut session, &outbox, &mut incoming).await;
+    let result = read_loop(&state, &mut session, &outbox, &mut incoming, &trace).await;
 
     // Saved before anything else in the teardown: whatever went wrong with
     // the connection, where the player stood and what it was carrying are
@@ -731,13 +747,27 @@ async fn read_loop(
     session: &mut Session,
     outbox: &Outbox,
     incoming: &mut tokio::net::tcp::OwnedReadHalf,
+    trace: &Arc<Mutex<crate::trace::Trace>>,
 ) -> anyhow::Result<()> {
     let mut reader = FrameReader::new();
     let mut prefix = LeadingPrefix::default();
     let mut buf = [0u8; 8192];
 
     loop {
-        let n = incoming.read(&mut buf).await?;
+        // The read is given a deadline rather than being waited on for ever,
+        // which is the only way a server notices a client that has stopped:
+        // a frozen one does not disconnect, it just goes quiet.
+        let n = match tokio::time::timeout(crate::trace::QUIET, incoming.read(&mut buf)).await {
+            Ok(read) => read?,
+            Err(_) => {
+                let now = Instant::now();
+                let mut trace = trace.lock().await;
+                if trace.has_stopped(now) {
+                    warn!("{}", trace.report(now));
+                }
+                continue;
+            }
+        };
         if n == 0 {
             return Ok(());
         }
@@ -751,6 +781,27 @@ async fn read_loop(
                 Ok(message) => {
                     let action = handle_message(state, session, &message).await;
                     autosave(state, session, false).await;
+
+                    // Recorded before the frames go out, so the order in the
+                    // ring is the order on the wire.
+                    {
+                        let answered =
+                            matches!(&action, Action::Reply(frames) if !frames.is_empty());
+                        let mut trace = trace.lock().await;
+                        trace.heard_from_client(
+                            message.opcode,
+                            &message.body,
+                            answered,
+                            Instant::now(),
+                        );
+                        if session.character.is_some() {
+                            trace.entered_the_world();
+                        }
+                        if trace.is_live() {
+                            debug!("{}", trace.last_line());
+                        }
+                    }
+
                     match action {
                         Action::Reply(frames) => {
                             for frame in frames {

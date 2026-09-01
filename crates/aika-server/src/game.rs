@@ -3648,6 +3648,14 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
         return Vec::new();
     };
 
+    // A stone with no identific names no pran and can never be bound to one:
+    // `belongs_to` is false for a pran whose `item_id` is zero, so hatching
+    // against it would hatch again on the next look, and again after that.
+    if stone.identific == 0 {
+        debug!(stone = stone.index, "a summon stone with nothing to identify it");
+        return Vec::new();
+    }
+
     let at = match account.prans.iter().position(|p| p.belongs_to(&stone)) {
         Some(at) => at,
         None => {

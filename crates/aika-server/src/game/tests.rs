@@ -1915,6 +1915,29 @@ async fn something_that_is_not_a_stone_hatches_nothing() {
     assert!(session.account.as_ref().unwrap().prans.is_empty());
 }
 
+/// A stone that identifies nothing hatches nothing.
+///
+/// The binding runs both ways: a pran remembers its stone by `Identific`, and
+/// a stone with none can never be matched again. Hatching against one would
+/// hatch a second the next time the slot is looked at, and a third after that.
+#[tokio::test]
+async fn a_stone_with_nothing_to_identify_it_hatches_nothing() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 0);
+
+    for _ in 0..3 {
+        handle_message(&state, &mut session, &wear_stone()).await;
+        handle_message(&state, &mut session, &take_stone_off()).await;
+    }
+
+    assert!(
+        session.account.as_ref().unwrap().prans.is_empty(),
+        "it hatched {} prans out of one nameless stone",
+        session.account.as_ref().unwrap().prans.len()
+    );
+}
+
 /// Every form after the first is a companion standing beside its owner, with
 /// a body and an id of its own. Only the first of each element is the
 /// bodiless glow.

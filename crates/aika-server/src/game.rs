@@ -514,6 +514,10 @@ pub(crate) struct Session {
     /// a buff is measured in minutes and would mean nothing after a logout,
     /// which is where the original keeps it too.
     buffs: crate::buffs::Buffs,
+    /// When the buff list last went out. An endless buff is drawn from a
+    /// window that counts down, so it has to be sent again before the
+    /// window empties or the icon leaves the bar on its own.
+    buffs_sent_at: Option<std::time::Instant>,
 }
 
 impl Session {
@@ -2346,6 +2350,7 @@ fn grant_buff(state: &State, session: &mut Session, skill: usize) -> Vec<Vec<u8>
         encode_add_buff(client_id, skill, ends_at),
         encode_buffs(client_id, &session.buffs, &state.skills),
     ];
+    session.buffs_sent_at = Some(std::time::Instant::now());
     let effects = session.effects(state);
     if let Some(character) = session.character.as_ref() {
         frames.push(encode_refresh_point(character));
@@ -2906,6 +2911,26 @@ fn cast_skill(
 }
 
 
+/// Sends the buff list again while something endless is running.
+///
+/// A buff with no end is drawn from a window that the client counts down, so
+/// left alone the icon would leave the bar while the buff was still on. This
+/// tops the window back up: one small packet a minute, and only while there
+/// is an endless buff to keep alive.
+fn top_up_endless(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+    if !session.buffs.any_endless(&state.skills) {
+        return Vec::new();
+    }
+    let due = session
+        .buffs_sent_at
+        .is_none_or(|at| at.elapsed() >= crate::buffs::ENDLESS_REFRESH);
+    if !due {
+        return Vec::new();
+    }
+    session.buffs_sent_at = Some(std::time::Instant::now());
+    vec![encode_buffs(session.client_id, &session.buffs, &state.skills)]
+}
+
 /// Takes off whatever has run out, and redraws what depended on it.
 ///
 /// `RefreshBuffs` sends fresh health, status and points when anything went,
@@ -2915,10 +2940,12 @@ fn cast_skill(
 fn drop_spent_buffs(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     let now = std::time::SystemTime::now();
     if session.buffs.expire(&state.skills, now) == 0 {
-        return Vec::new();
+        return top_up_endless(state, session);
     }
+    session.buffs_sent_at = Some(std::time::Instant::now());
     let client_id = session.client_id;
     let mut frames = vec![encode_buffs(client_id, &session.buffs, &state.skills)];
+    session.buffs_sent_at = Some(std::time::Instant::now());
     let effects = session.effects(state);
     if let Some(character) = session.character.as_ref() {
         let (max_hp, max_mp) = vitals(character);

@@ -1808,6 +1808,40 @@ async fn a_finished_cast_plays_its_animation() {
     );
 }
 
+/// A mount's buff has no end, but the field the client draws is a countdown.
+/// Told the truth — all ones — it made the label wide enough to shove the icon
+/// out of the buff bar. It gets a window that renders like any other instead,
+/// and the buff itself still never runs out.
+#[tokio::test]
+async fn an_endless_buff_is_drawn_with_a_window_and_never_expires() {
+    let mut state = buff_state();
+    state.skills = {
+        use aika_data::skills::{field, SkillTable, RECORD_SIZE, SLOTS};
+        let mut raw = vec![0u8; SLOTS * RECORD_SIZE + 4];
+        let r = &mut raw[SADDLE_SKILL * RECORD_SIZE..(SADDLE_SKILL + 1) * RECORD_SIZE];
+        r[field::FAMILY..field::FAMILY + 4]
+            .copy_from_slice(&crate::buffs::FAMILY_MOUNTED.to_le_bytes());
+        r[field::DURATION..field::DURATION + 4]
+            .copy_from_slice(&crate::buffs::FOREVER.to_le_bytes());
+        SkillTable::decode(&raw).expect("the fixture table is malformed")
+    };
+
+    let mut session = in_world(&state).await;
+    carrying(&mut session, SADDLE, 7);
+    handle_message(&state, &mut session, &use_buff_item(7)).await;
+
+    let body = decode(&encode_buffs(session.client_id, &session.buffs, &state.skills)).body;
+    let left = u32::from_le_bytes(body[BUFFS_TIMES_AT..BUFFS_TIMES_AT + 4].try_into().unwrap());
+    assert_eq!(left, crate::buffs::ENDLESS_SHOWN, "an unreadable label went out");
+    assert_ne!(left, crate::buffs::FOREVER);
+
+    // A century on and the rider is still mounted: the window is for drawing
+    // with, and nothing reads it back.
+    let far = std::time::SystemTime::now() + std::time::Duration::from_secs(3_000_000_000);
+    assert_eq!(session.buffs.expire(&state.skills, far), 0, "the rider was thrown off");
+    assert!(session.buffs.any_endless(&state.skills), "nothing said it needs topping up");
+}
+
 /// A swing at yourself is not a buff. Only a skill that lasts becomes one.
 #[tokio::test]
 async fn a_skill_that_does_not_last_is_not_a_self_buff() {

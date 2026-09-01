@@ -127,6 +127,14 @@ impl Buffs {
         self.started.is_empty()
     }
 
+    /// Whether anything running has no end of its own. Those are the ones
+    /// whose drawn countdown has to be topped up before it reaches zero.
+    pub fn any_endless(&self, skills: &SkillTable) -> bool {
+        self.started
+            .keys()
+            .any(|&id| skills.get(id).is_some_and(|s| s.duration_secs() == FOREVER))
+    }
+
     /// Takes one off by the skill that started it, which is what `0x329`
     /// names when the player clicks a buff away (`RemoveBuff`).
     pub fn remove(&mut self, skill: usize) -> bool {
@@ -150,6 +158,24 @@ fn ends_at(started: SystemTime, duration_secs: u32) -> Option<SystemTime> {
     Some(started + Duration::from_secs(duration_secs as u64))
 }
 
+/// What the client is told an endless buff has left.
+///
+/// It has no end, but the field is a countdown and the client draws it as one.
+/// Told the real answer — all ones, seventy-one million minutes — it made the
+/// label so wide that the icon was pushed out of the column and the buff bar
+/// stopped lining up. Told half a minute it drew it neatly and then, correctly,
+/// counted it down to nothing.
+///
+/// So it is given a window that renders like any other buff and is topped back
+/// up before it can run out. The buff itself never expires; this is a number
+/// for drawing with, and nothing reads it back.
+pub const ENDLESS_SHOWN: u32 = 600;
+
+/// How much of that window may run down before it is worth sending again.
+/// Small enough that the countdown never looks close to zero, large enough
+/// that this is one small packet a minute and not a stream of them.
+pub const ENDLESS_REFRESH: Duration = Duration::from_secs(60);
+
 /// How many seconds a buff has left, which is what the packet carries and
 /// what the client draws.
 ///
@@ -162,10 +188,10 @@ fn ends_at(started: SystemTime, duration_secs: u32) -> Option<SystemTime> {
 /// client that is not ours; either way this is what makes the number on
 /// screen the number the item promises.
 ///
-/// All ones for a buff that does not run out, since there is no duration to
-/// give for something that has no end.
+/// A buff with no end is given [`ENDLESS_SHOWN`] rather than all ones, which
+/// is a label no interface can lay out.
 pub fn remaining(at: Option<SystemTime>, now: SystemTime) -> u32 {
-    let Some(at) = at else { return FOREVER };
+    let Some(at) = at else { return ENDLESS_SHOWN };
     at.duration_since(now).map(|d| d.as_secs().min(FOREVER as u64) as u32).unwrap_or(0)
 }
 
@@ -275,7 +301,12 @@ mod tests {
 
         let running = buffs.running(&skills);
         assert_eq!(running[0].1, None, "it was given an end after all");
-        assert_eq!(remaining(running[0].1, at(0)), FOREVER, "a buff with no end has no countdown");
+        assert_eq!(
+            remaining(running[0].1, at(0)),
+            ENDLESS_SHOWN,
+            "an endless buff is drawn with a window, not with all ones"
+        );
+        assert!(buffs.any_endless(&skills), "nothing said it needs topping up");
     }
 
     /// Getting off is by family too.

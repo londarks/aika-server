@@ -307,6 +307,10 @@ pub fn skills_at_birth() -> usize {
 /// what draws its window.
 pub const OP_WORLD: u16 = 0x907;
 
+/// `TSendCreatePranPacket` (`Data/Packets.pas:380`): the companion standing
+/// beside its owner. The same opcode a player or an NPC is spawned with.
+pub const OP_SPAWN: u16 = 0x349;
+
 /// Where each field sits in the body, the header already past.
 pub mod at {
     pub const NAME: usize = 0;

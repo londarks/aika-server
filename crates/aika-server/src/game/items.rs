@@ -67,10 +67,8 @@ pub(crate) fn handle_move_item(state: &State, session: &mut Session, message: &M
         if stone_slot(from) || stone_slot(to) {
             let summoned = super::pran_frames(state, session);
             if summoned.is_empty() {
-                // The stone came off, so the fairy comes off with it. The
-                // original sends the same effect packet it drew it with
-                // (`SendPranUnspawn`, for a pran under level four).
-                frames.push(super::encode_effect(session.client_id, super::EFFECT_NONE));
+                // The stone came off, so whatever it brought goes with it.
+                frames.extend(super::dismiss_pran(session));
             } else {
                 frames.extend(summoned);
             }

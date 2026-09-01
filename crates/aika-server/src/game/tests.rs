@@ -1915,6 +1915,100 @@ async fn something_that_is_not_a_stone_hatches_nothing() {
     assert!(session.account.as_ref().unwrap().prans.is_empty());
 }
 
+/// Every form after the first is a companion standing beside its owner, with
+/// a body and an id of its own. Only the first of each element is the
+/// bodiless glow.
+#[tokio::test]
+async fn a_grown_pran_is_drawn_as_a_body_beside_its_owner() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+
+    // it grows, and comes back out
+    for class in [62u8, 63, 64] {
+        session.account.as_mut().unwrap().prans[0].class = class;
+        handle_message(&state, &mut session, &take_stone_off()).await;
+        let frames = frames_of(handle_message(&state, &mut session, &wear_stone()).await);
+
+        assert!(
+            opcodes(&frames).contains(&crate::pran::OP_SPAWN),
+            "class {class} was not given a body"
+        );
+        assert!(
+            !effects_in(&frames).contains(&crate::pran::Element::Fire.fairy_effect()),
+            "class {class} was drawn as a glow as well as a body"
+        );
+        assert!(session.pran_body.is_some(), "nothing was remembered to take away");
+    }
+}
+
+/// And the body it was given is the body that is taken away. The original
+/// picks by class on the way out and by level on the way back, which leaves a
+/// companion standing in the field for anything the two disagree about.
+#[tokio::test]
+async fn the_body_that_was_drawn_is_the_body_that_is_removed() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+    session.account.as_mut().unwrap().prans[0].class = 62;
+    // a level the original would have called an effect, with a class that has
+    // a body: the case the two tests disagree about
+    session.account.as_mut().unwrap().prans[0].level = 1;
+
+    handle_message(&state, &mut session, &take_stone_off()).await;
+    let frames = frames_of(handle_message(&state, &mut session, &wear_stone()).await);
+    let drawn_under = decode(
+        frames
+            .iter()
+            .find(|f| decode(f).opcode == crate::pran::OP_SPAWN)
+            .expect("no body was drawn"),
+    )
+    .sender;
+
+    let frames = frames_of(handle_message(&state, &mut session, &take_stone_off()).await);
+    let removed = frames.iter().map(|f| decode(f)).find(|m| m.opcode == OP_REMOVE_MOB);
+    let removed = removed.expect("the body was left standing in the field");
+
+    assert_eq!(
+        u32::from_le_bytes(removed.body[0..4].try_into().unwrap()),
+        drawn_under as u32,
+        "it removed something other than the companion it drew"
+    );
+    assert!(session.pran_body.is_none(), "it still thinks one is out");
+}
+
+/// The companion's id comes out of its own range, which is what stops the
+/// client drawing it on top of a player or a townsperson.
+#[tokio::test]
+async fn a_pran_is_drawn_under_an_id_of_its_own() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+    session.account.as_mut().unwrap().prans[0].class = 63;
+    handle_message(&state, &mut session, &take_stone_off()).await;
+
+    let frames = frames_of(handle_message(&state, &mut session, &wear_stone()).await);
+    let spawn = frames
+        .iter()
+        .map(|f| decode(f))
+        .find(|m| m.opcode == crate::pran::OP_SPAWN)
+        .expect("no body was drawn");
+
+    assert!(
+        crate::pran::IDS.contains(&(spawn.sender as u32)),
+        "drawn under {}, which belongs to somebody else",
+        spawn.sender
+    );
+    assert_ne!(spawn.sender, session.client_id, "drawn as its owner");
+
+    // and it is named after whoever it follows
+    let title = &spawn.body[444..444 + 32];
+    let title = String::from_utf8_lossy(&title[..title.iter().position(|b| *b == 0).unwrap()]);
+    assert!(title.starts_with("Pran do "), "the title reads {title:?}");
+}
 /// The effect values in a burst of frames.
 ///
 /// An effect is not its own packet: it shares `0x117` with the client index,

@@ -299,6 +299,10 @@ mod spawn_offset {
     pub const SPEED_MOVE: usize = 73;
     pub const SPAWN_TYPE: usize = 74;
     pub const SIZES: usize = 75;
+    /// Where the companion's own client id sits, in the fourth byte of
+    /// what is four bytes of build on a character and three on a pran
+    /// (`TSendCreatePranPacket`, `Data/Packets.pas:380`).
+    pub const PRAN_CLIENT_ID: usize = SIZES + 3;
     pub const GUILD_AND_NATION: usize = 476;
     /// Four WORDs; index 1 carries a fixed constant.
     pub const EFFECTS: usize = 478;
@@ -476,6 +480,12 @@ pub(crate) struct Session {
     /// NPCs already placed on this player's screen. Same reason as `visible`:
     /// sending a spawn twice makes the client draw two of them.
     visible_npcs: HashSet<u16>,
+    /// The id a companion with a body is being drawn under, if one is out.
+    ///
+    /// Kept because dismissing has to undo whatever summoning did, and by
+    /// the time the stone comes off there is nothing left to ask. A pran
+    /// drawn as an effect is cleared with an effect and leaves this `None`.
+    pran_body: Option<u32>,
     /// Which way the player is facing, so a repeat can be dropped.
     rotation: u32,
     /// What the player is doing that outlives the packet: sitting, or the
@@ -3665,17 +3675,152 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
         rand::random(),
     )];
 
-    // A young one has no body to spawn: it is an effect on the player, one
-    // per element. A grown one takes a client id out of its own range and is
-    // drawn like anything else, which is not built yet.
-    if let (true, Some(element)) = (pran.is_fairy(), pran.element()) {
-        frames.push(encode_effect(client_id, element.fairy_effect()));
+    // The first form of each element has no body at all: it is an effect on
+    // the player, one per element, and that is the whole of how it shows.
+    // Every form after it is a companion of its own, standing beside the
+    // player under an id from the pran range.
+    if pran.is_fairy() {
+        session.pran_body = None;
+        if let Some(element) = pran.element() {
+            frames.push(encode_effect(client_id, element.fairy_effect()));
+        }
+        return frames;
     }
+
+    let Some(pran_id) = pran_client_id(client_id) else {
+        warn!(client_id, "no companion id left for this connection");
+        return frames;
+    };
+    let pran = pran.clone();
+    let Some(owner) = session.character.as_ref() else {
+        return frames;
+    };
+    let at = neighbour_spot(
+        (owner.x as f32, owner.y as f32),
+        rand::random::<usize>() % NEIGHBOUR_SPOTS,
+    );
+    let speed_move = stats::of(owner, &state.items, &Effects::none()).speed_move;
+    frames.push(encode_pran_spawn(&pran, owner, pran_id, at, speed_move));
+    session.pran_body = Some(pran_id);
     frames
+}
+
+/// Takes the companion away again.
+///
+/// Which of the two ways depends on how it was shown, and that is the one
+/// place this does not follow the original. `SendPranUnspawn` chooses by
+/// *level*: under four it sends the effect away, otherwise it removes a body
+/// (`Mob/Player.pas:3846`). But `SendPranSpawn`, twenty lines above it,
+/// chooses by *class*. The two disagree for any pran whose class has a body
+/// while its level is still under four -- it is drawn as a companion and
+/// dismissed as an effect, and the body stays on the field with nothing left
+/// to remove it.
+///
+/// So this undoes what was actually done. Summoning records the id it drew
+/// under, and dismissing removes exactly that or clears the effect.
+fn dismiss_pran(session: &mut Session) -> Vec<Vec<u8>> {
+    match session.pran_body.take() {
+        Some(pran_id) => vec![encode_remove_mob(pran_id as u16, 0)],
+        None => vec![encode_effect(session.client_id, EFFECT_NONE)],
+    }
 }
 
 /// What the original sends to take a fairy off a player again.
 const EFFECT_NONE: u32 = 0;
+/// `TSendCreatePranPacket` (`0x349`), which the original's own comment calls
+/// "PlayerSpam" because it is the player spawn laid out again, field for
+/// field. So it is encoded with the same offsets, and the three that differ
+/// are the ones filled in here: the build is three bytes rather than four,
+/// the companion's own client id follows it, and the title is not a title but
+/// "Pran do <owner>".
+fn encode_pran_spawn(
+    pran: &pran::Pran,
+    owner: &Character,
+    pran_id: u32,
+    at: (f32, f32),
+    speed_move: u32,
+) -> Vec<u8> {
+    use spawn_offset as off;
+    let mut body = vec![0u8; off::BODY_SIZE];
+
+    let put16 = |b: &mut Vec<u8>, at: usize, v: u16| {
+        b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    let put32 = |b: &mut Vec<u8>, at: usize, v: u32| {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    };
+
+    write_fixed_str(&mut body[off::NAME..off::NAME + 16], &pran.name);
+
+    // Its own eight equipment slots, by item id. It has none yet, so the
+    // client dresses it in whatever the class alone gives it.
+
+    body[off::POSITION_X..off::POSITION_X + 4].copy_from_slice(&at.0.to_le_bytes());
+    body[off::POSITION_Y..off::POSITION_Y + 4].copy_from_slice(&at.1.to_le_bytes());
+
+    put32(&mut body, off::MAX_HP, pran.max_hp);
+    put32(&mut body, off::MAX_MP, pran.max_mp);
+    put32(&mut body, off::CUR_HP, pran.hp);
+    put32(&mut body, off::CUR_MP, pran.mp);
+
+    body[off::UNK0] = SPAWN_UNK0;
+    // It keeps up with whoever it belongs to, so it walks at their speed.
+    body[off::SPEED_MOVE] = speed_move.min(u8::MAX as u32) as u8;
+    body[off::SPAWN_TYPE] = SPAWN_NORMAL;
+
+    // Three bytes, not the character's four: the fourth is where the
+    // companion's client id begins.
+    body[off::SIZES] = pran.width;
+    body[off::SIZES + 1] = pran.chest;
+    body[off::SIZES + 2] = pran.leg;
+    put16(&mut body, off::PRAN_CLIENT_ID, pran_id as u16);
+
+    let title = format!("Pran do {}", owner.name);
+    write_fixed_str(
+        &mut body[npc_offset::TITLE..npc_offset::TITLE + npc_offset::TITLE_MAX],
+        &title,
+    );
+
+    put16(&mut body, off::GUILD_AND_NATION, owner.nation << 12);
+    put16(&mut body, off::EFFECTS + 2, SPAWN_EFFECT_1);
+
+    // The header carries the companion's id and not its owner's, which is
+    // what makes the client draw a second body instead of moving the first.
+    frame::encode(
+        &Message { sender: pran_id as u16, opcode: pran::OP_SPAWN, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// The client id a player's companion is drawn under.
+///
+/// The original takes the first free slot of a thousand-wide array. This
+/// derives it from the owner instead, which needs no allocator and cannot
+/// leak one: a connection owns exactly one, and player ids are unique while
+/// they are connected. `None` past the end of the range, which is a server
+/// holding more players than the original could.
+fn pran_client_id(client_id: u16) -> Option<u32> {
+    let id = pran::IDS.start() + client_id as u32 - 1;
+    pran::IDS.contains(&id).then_some(id)
+}
+
+/// Where a companion is put down.
+///
+/// `SetCurrentNeighbors` keeps nine spots around every player and the
+/// original picks one at random to stand its pran on. They are barely apart
+/// -- half a unit out, growing by a tenth every second spot, alternating
+/// which side of the player they fall on.
+fn neighbour_spot(at: (f32, f32), which: usize) -> (f32, f32) {
+    let offset = 0.5 + (which / 2) as f32 * 0.1;
+    if which % 2 == 0 {
+        (at.0 - offset, at.1 - offset)
+    } else {
+        (at.0 + offset, at.1 + offset)
+    }
+}
+
+/// How many of them there are (`Neighbors: Array [0 .. 8]`).
+const NEIGHBOUR_SPOTS: usize = 9;
 /// The effect number the client plays when a character gains a level
 /// (`AddLevel` sends `SendEffect(1)`).
 const EFFECT_LEVEL_UP: u32 = 1;

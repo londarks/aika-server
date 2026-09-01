@@ -3085,10 +3085,41 @@ fn finish_self_cast(state: &State, session: &mut Session, skill: usize) -> Actio
         return Action::Ignore;
     }
 
-    let frames = grant_buff(state, session, skill);
+    // Where the caster stands comes from the world, not from the packet.
+    let at = session
+        .character
+        .as_ref()
+        .map(|c| (c.x as f32, c.y as f32))
+        .unwrap_or((0.0, 0.0));
+
+    let mut frames = grant_buff(state, session, skill);
     if frames.is_empty() {
         return Action::Ignore;
     }
+
+    // And the animation, which is the packet everyone watching plays. The
+    // original builds a fresh `0x302` rather than echoing the one it got, and
+    // fills the animation from the skill's own `SelfAnimation` -- the client
+    // sends nothing useful in that field, so a cast finished without this
+    // leaves the caster standing still while the spell goes off.
+    let played = combat::Attack {
+        target: session.client_id,
+        animation: def.self_animation() as u16,
+        skill: skill as u16,
+        from: at,
+        at,
+    };
+    let relay = frame::encode(
+        &Message {
+            sender: session.client_id,
+            opcode: combat::OP_ATTACK,
+            time: 0,
+            body: played.to_body(),
+        },
+        rand::random(),
+    );
+    state.world.send_to_visible(session.client_id, relay.clone());
+    frames.insert(0, relay);
     Action::Reply(frames)
 }
 

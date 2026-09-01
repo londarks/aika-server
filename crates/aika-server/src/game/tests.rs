@@ -1768,6 +1768,46 @@ async fn a_cast_with_a_bar_finishes_on_the_second_packet() {
     assert!(opcodes(&frames).contains(&OP_ADD_BUFF), "the client was not told");
 }
 
+/// Everyone watching has to see the spell go off. The original builds a fresh
+/// `0x302` for it rather than echoing the one it got, and fills the animation
+/// from the skill's own `SelfAnimation` — the client sends nothing useful in
+/// that field, so a cast finished without it leaves the caster standing still
+/// while the spell happens.
+#[tokio::test]
+async fn a_finished_cast_plays_its_animation() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+
+    let finished = Message {
+        sender: TEST_CLIENT_ID,
+        opcode: combat::OP_ATTACK,
+        time: 0,
+        body: combat::Attack {
+            target: session.client_id,
+            // Whatever the client puts here is ignored.
+            animation: 0,
+            skill: SADDLE_SKILL as u16,
+            from: (0.0, 0.0),
+            at: (0.0, 0.0),
+        }
+        .to_body(),
+    };
+    let frames = frames_of(handle_message(&state, &mut session, &finished).await);
+
+    let played = frames
+        .iter()
+        .map(|f| decode(f))
+        .find(|m| m.opcode == combat::OP_ATTACK)
+        .expect("the spell went off with nobody seeing it");
+    let played = combat::Attack::parse(&played.body).expect("a well formed relay");
+    assert_eq!(played.skill, SADDLE_SKILL as u16);
+    assert_eq!(
+        played.animation as u32,
+        state.skills.get(SADDLE_SKILL).unwrap().self_animation(),
+        "the animation is the skill's own, not the one the client sent"
+    );
+}
+
 /// A swing at yourself is not a buff. Only a skill that lasts becomes one.
 #[tokio::test]
 async fn a_skill_that_does_not_last_is_not_a_self_buff() {

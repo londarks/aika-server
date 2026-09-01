@@ -106,6 +106,9 @@ pub const OP_ADD_BUFF: u16 = 0x16F;
 /// `TUseMountSkill` (`Data/Packets.pas:140`): one of the mount's own two
 /// skills (`UseMountSkill`, `$218`).
 pub const OP_MOUNT_SKILL: u16 = 0x218;
+/// `TGetStatusPointPacket` (`Data/Packets.pas:2150`): the player spent free
+/// points on an attribute (`GetStatusPoint`, `$213`).
+pub const OP_STATUS_POINT: u16 = 0x213;
 /// Walking, the only move type the original relays to other players
 /// (`Data/GlobalDefs.pas:216`). The real client also sends other values.
 const MOVE_NORMAL: u8 = 0;
@@ -896,6 +899,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         OP_CHEST_GOLD => handle_chest_gold(session, message),
         OP_USE_BUFF_ITEM => handle_use_buff_item(state, session, message),
         OP_MOUNT_SKILL => handle_mount_skill(state, session, message),
+        OP_STATUS_POINT => handle_status_point(state, session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
@@ -3225,6 +3229,67 @@ fn handle_mount_skill(state: &State, session: &mut Session, message: &Message) -
             .to_body(),
     };
     cast_skill(state, session, &cast, ability::Named::ByTheServer)
+}
+
+/// Where each attribute sits in `character.attributes`, in the order the
+/// client numbers them (`GetStatusPoint`: 0 strength, 1 agility, 2 intellect,
+/// 3 constitution, 4 luck). The fifth slot is the unspent count, which is not
+/// something to spend points on.
+const ATTRIBUTE_COUNT: u32 = 5;
+const FREE_POINTS: usize = 5;
+
+/// `0x213`: spend free points on an attribute (`GetStatusPoint`).
+///
+/// The original's checks are short and all of them matter: you cannot spend
+/// more than you have, and the index has to name one of the five. It then
+/// sends the score, the sheet, the points and the vitals, because raising
+/// constitution changes how much health there is.
+fn handle_status_point(state: &State, session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < 8 {
+        warn!(size = message.body.len(), "0x213 packet too short");
+        return Action::Ignore;
+    }
+    let which = u32::from_le_bytes(message.body[0..4].try_into().unwrap());
+    let amount = u32::from_le_bytes(message.body[4..8].try_into().unwrap());
+
+    let client_id = session.client_id;
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+
+    // Nought is not "spend nothing", it is a client that lost count.
+    if amount == 0 || which >= ATTRIBUTE_COUNT {
+        debug!(which, amount, "0x213 for an attribute that does not exist");
+        return Action::Ignore;
+    }
+    if amount > character.attributes[FREE_POINTS] as u32 {
+        debug!(
+            amount,
+            free = character.attributes[FREE_POINTS],
+            "0x213 for more points than the character has"
+        );
+        return Action::Ignore;
+    }
+
+    let amount = amount as u16;
+    character.attributes[which as usize] += amount;
+    character.attributes[FREE_POINTS] -= amount;
+    session.dirty = true;
+    info!(which, amount, left = character.attributes[FREE_POINTS], "status points spent");
+
+    // Health and mana move with constitution, so they are recomputed before
+    // being sent, exactly as `SendCurrentHPMP` after `GetCurrentScore` does.
+    let effects = session.effects(state);
+    let character = session.character.as_ref().expect("checked above");
+    let (max_hp, max_mp) = vitals(character);
+    session.cur_hp = session.cur_hp.min(max_hp);
+    session.cur_mp = session.cur_mp.min(max_mp);
+
+    Action::Reply(vec![
+        encode_refresh_status(character, &state.items, &effects),
+        encode_refresh_point(character),
+        encode_hp_mp(character, client_id, session.cur_hp, session.cur_mp),
+    ])
 }
 
 /// `0x202`: what time is it on the server (`RequestServerTime`).
@@ -5996,6 +6061,70 @@ mod tests {
         let now = crate::buffs::unix(Some(std::time::SystemTime::now()));
         assert!(ends > now, "the buff is already over");
         assert!(ends - now <= 3600, "an hour's buff lasts longer than an hour");
+    }
+
+    fn spend_points(which: u32, amount: u32) -> Message {
+        let mut body = which.to_le_bytes().to_vec();
+        body.extend_from_slice(&amount.to_le_bytes());
+        Message { sender: TEST_CLIENT_ID, opcode: OP_STATUS_POINT, time: 0, body }
+    }
+
+    /// Spending a point raises the attribute, spends the point, and reaches
+    /// the sheet — which is the whole of `GetStatusPoint`.
+    #[tokio::test]
+    async fn spending_a_status_point_raises_the_attribute() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session.character.as_mut().unwrap().attributes[FREE_POINTS] = 10;
+        let before = session.character.as_ref().unwrap().attributes[0];
+
+        let frames = frames_of(handle_message(&state, &mut session, &spend_points(0, 3)).await);
+
+        let after = session.character.as_ref().unwrap();
+        assert_eq!(after.attributes[0], before + 3, "strength did not go up");
+        assert_eq!(after.attributes[FREE_POINTS], 7, "the points were not spent");
+
+        let sent = opcodes(&frames);
+        assert!(sent.contains(&OP_REFRESH_STATUS), "the sheet was not sent: {sent:?}");
+        assert!(sent.contains(&OP_REFRESH_POINT), "the point count was not sent");
+    }
+
+    /// Points nobody has cannot be spent, however many the client claims.
+    #[tokio::test]
+    async fn points_that_are_not_there_cannot_be_spent() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session.character.as_mut().unwrap().attributes[FREE_POINTS] = 2;
+        let before = session.character.as_ref().unwrap().attributes;
+
+        handle_message(&state, &mut session, &spend_points(0, 99)).await;
+        assert_eq!(
+            session.character.as_ref().unwrap().attributes,
+            before,
+            "a character spent points it never had"
+        );
+
+        // And an attribute that does not exist is refused too.
+        handle_message(&state, &mut session, &spend_points(9, 1)).await;
+        assert_eq!(session.character.as_ref().unwrap().attributes, before);
+    }
+
+    /// The attributes really are what the fight reads, so a spent point has to
+    /// change the numbers. Strength is worth 2.6 attack a point.
+    #[tokio::test]
+    async fn a_spent_point_changes_what_the_character_is_worth() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session.character.as_mut().unwrap().attributes[FREE_POINTS] = 10;
+
+        let effects = session.effects(&state);
+        let before = stats::of(session.character.as_ref().unwrap(), &state.items, &effects).attack;
+
+        handle_message(&state, &mut session, &spend_points(0, 10)).await;
+
+        let effects = session.effects(&state);
+        let after = stats::of(session.character.as_ref().unwrap(), &state.items, &effects).attack;
+        assert_eq!(after, before + 26, "ten strength is twenty-six attack");
     }
 
     /// The whole point of a mount: it makes you faster. The speed is an

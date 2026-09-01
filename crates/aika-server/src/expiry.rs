@@ -42,12 +42,21 @@ use chrono::{Duration, NaiveDate, NaiveDateTime};
 /// Mounts, which are the one item type that counts in days.
 const ITEM_TYPE_MOUNT: u16 = 9;
 
-/// The date the mount countdown is measured from: `01/01/2023 22:00`
-/// (`BASE_DATETIME`, `Data/GlobalDefs.pas:81`).
+/// The date a mount's day count is measured from.
+///
+/// The Delphi writes it against `BASE_DATETIME`, `01/01/2023 22:00`
+/// (`Data/GlobalDefs.pas:81`). **The client does not read it that way.** A
+/// mount stamped with 1368 — thirty days past that base — came up in the
+/// client's tooltip as a licence expiring `1973/09/29`, and 1970-01-01 plus
+/// 1368 days is 1973-09-30. The client counts from the unix epoch.
+///
+/// So the epoch is what goes on the wire. The client is the authority for this
+/// one: it is what draws the date and what refuses a mount whose licence has
+/// run out, which is what "the mount skill does not work" turned out to be.
 fn base_datetime() -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(2023, 1, 1)
-        .and_then(|d| d.and_hms_opt(22, 0, 0))
-        .expect("the base date is a constant and is valid")
+    NaiveDate::from_ymd_opt(1970, 1, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .expect("the epoch is a constant and is valid")
 }
 
 /// The two hours the original adds on top of the item's own duration, without
@@ -141,14 +150,20 @@ mod tests {
         assert_eq!(expiry, at(2026, 10, 1, 2));
     }
 
-    /// A mount counts days from the base date and touches only its own two
+    /// A mount counts whole days from the epoch and touches only its own two
     /// bytes, because the byte above it is somebody else's.
+    ///
+    /// The count is five figures for any date this century. It was three,
+    /// measured from the Delphi's own base, and the client read those as days
+    /// from 1970 and drew a licence that ran out in 1973 — which is what made
+    /// it refuse the mount.
     #[test]
-    fn a_mount_counts_whole_days_from_the_base_date() {
+    fn a_mount_counts_whole_days_from_the_epoch() {
         let mut item = Item { index: HORSE, refine: 0x1234, ..Item::default() };
         stamp(&mut item, &table(), at(2026, 9, 1, 0));
 
         let days = (at(2026, 10, 1, 2) - base_datetime()).num_days();
+        assert!(days > 20_000, "a date this century is five figures from the epoch: {days}");
         assert_eq!(item.expires_at, (days as u32) << 8, "the days are not where Time is");
 
         // A mount does not stack, so the count beside it is one byte wide and

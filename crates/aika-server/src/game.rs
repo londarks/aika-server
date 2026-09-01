@@ -3201,6 +3201,15 @@ fn handle_revive(state: &State, session: &mut Session, _message: &Message) -> Ac
 ///
 /// The mana and the cooldown were taken when the bar started, so they are not
 /// taken again — this is the second half of one cast, not a second cast.
+/// The only target type the original treats as a cast on oneself.
+///
+/// `Mob/BaseMob.pas:5754` branches on exactly this and nothing else: type one
+/// goes to `SelfBuffSkill`, everything else is aimed at something. Two
+/// thousand of the table's skills are type one and eight hundred are type
+/// four, so the two branches are both well travelled and telling them apart by
+/// the target id in the packet gets the second one wrong.
+const TARGET_TYPE_SELF: u32 = 1;
+
 fn finish_self_cast(state: &State, session: &mut Session, skill: usize) -> Action {
     let Some(def) = state.skills.get(skill) else {
         debug!(skill, "cast finished, but the table has no such skill");
@@ -3285,27 +3294,45 @@ fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Act
     // The client sends `0x320` when the bar begins and this when it fills, so
     // for anything with a `CastTime` the effect belongs to this packet and not
     // to the other one — `AttackTarget` is where the original applies it too,
-    // told by `ByUseSkill` which of the two it came from. A blessing or a
-    // mount is aimed at the caster, so the target is their own id, and reading
-    // that as "a monster nobody can find" is why the bar filled and nothing
-    // happened.
-    if request.skill != 0 && request.target == session.client_id {
+    // told by `ByUseSkill` which of the two it came from.
+    //
+    // Which of the two branches it takes is decided by the skill, never by the
+    // packet: `if (DataSkill^.TargetType = 1) then SelfBuffSkill else [Target]`
+    // (`Mob/BaseMob.pas:5754`). Type one is the only self-cast there is, and it
+    // is most of the table — 2157 skills, every blessing, mount and stance.
+    //
+    // Reading the target id instead was close enough to work and wrong in the
+    // case that mattered. A skill aimed at nothing arrives carrying the
+    // caster's own id, so an attack the player had not aimed at anybody was
+    // handed to the player as a buff. Skill 289 is a sixty-second attack with
+    // a debuff on it; cast that way it rooted the caster where they stood, and
+    // the client was obeying us exactly.
+    let cast_def = state.skills.get(request.skill as usize);
+    if request.skill != 0 && cast_def.is_some_and(|s| s.target_type() == TARGET_TYPE_SELF) {
         return finish_self_cast(state, session, request.skill as usize);
     }
 
     // The position comes from the world, never from the packet: the client
     // sends where it thinks it is, and a modified one would reach across the
     // map by lying about it.
+    // A cast that lands on nothing still has to be let go of. The client is
+    // waiting to be told the bar it filled is finished with, and one it is
+    // never told about is one that stops sending anything but which way it is
+    // facing. Answering with nothing at all is what froze a session solid.
+    let animation = cast_def.map(|s| s.self_animation() as u16).unwrap_or(0);
+    let let_go = |session: &mut Session, why: &str| {
+        debug!(target = request.target, skill = request.skill, why, "cast landed on nothing");
+        play_self_cast(state, session, request.skill as usize, animation)
+    };
+
     let Some(target) = state.world.mob(request.target) else {
-        debug!(target = request.target, "0x302 at something that is not a monster");
-        return Action::Ignore;
+        return let_go(session, "not a monster");
     };
     if !target.is_alive() {
-        return Action::Ignore;
+        return let_go(session, "already dead");
     }
     if !within(at, target.position(), combat::MELEE_RANGE) {
-        debug!(target = request.target, "0x302 from out of reach");
-        return Action::Ignore;
+        return let_go(session, "out of reach");
     }
 
     // Attack comes off the character and its gear now, and the monster's

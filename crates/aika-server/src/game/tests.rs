@@ -1597,6 +1597,14 @@ const SADDLE: u16 = 4503;
 const HORSE: u16 = 963;
 const LASTING_POTION: u16 = 4879;
 const SADDLE_SKILL: usize = 7259;
+
+/// An attack that leaves something behind, aimed at a target. Skill 289 in
+/// the shipped table is one: sixty seconds of cooldown, 240 damage, and a
+/// duration, which is what let it be mistaken for a buff.
+const ROOTING_ATTACK: usize = 289;
+const ROOTING_FAMILY: u32 = 13;
+/// Target type four, the second most common in the table after self.
+const AIMED_AT_SOMETHING: u32 = 4;
 const POTION_SKILL: usize = 9031;
 
 fn buff_state() -> State {
@@ -1621,14 +1629,21 @@ fn buff_state() -> State {
     state.skills = {
         use aika_data::skills::{field, SkillTable, RECORD_SIZE, SLOTS};
         let mut raw = vec![0u8; SLOTS * RECORD_SIZE + 4];
-        let mut define = |id: usize, family: u32, seconds: u32| {
+        // The target type is the skill's own property and is what decides
+        // whether a cast lands on the caster, so the fixture has to carry it.
+        let mut define = |id: usize, family: u32, seconds: u32, target_type: u32| {
             let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
             r[field::FAMILY..field::FAMILY + 4].copy_from_slice(&family.to_le_bytes());
             r[field::DURATION..field::DURATION + 4].copy_from_slice(&seconds.to_le_bytes());
+            r[field::TARGET_TYPE..field::TARGET_TYPE + 4]
+                .copy_from_slice(&target_type.to_le_bytes());
             r[field::NAME_ENGLISH.start] = b'x';
         };
-        define(SADDLE_SKILL, crate::buffs::FAMILY_MOUNTED, 3600);
-        define(POTION_SKILL, 383, 10_800);
+        define(SADDLE_SKILL, crate::buffs::FAMILY_MOUNTED, 3600, TARGET_TYPE_SELF);
+        define(POTION_SKILL, 383, 10_800, TARGET_TYPE_SELF);
+        // And one that is aimed at something else, and lasts: the shape of
+        // the skill that froze a session.
+        define(ROOTING_ATTACK, ROOTING_FAMILY, 60, AIMED_AT_SOMETHING);
         SkillTable::decode(&raw).expect("the fixture table is malformed")
     };
     state
@@ -1767,6 +1782,69 @@ async fn a_cast_with_a_bar_finishes_on_the_second_packet() {
         "the cast finished and nothing came of it"
     );
     assert!(opcodes(&frames).contains(&OP_ADD_BUFF), "the client was not told");
+}
+
+/// An attack aimed at nobody arrives carrying the caster's own id, and that
+/// does not make it a cast on oneself.
+///
+/// The original decides by the skill: `if (DataSkill^.TargetType = 1) then
+/// SelfBuffSkill` (`Mob/BaseMob.pas:5754`). Deciding by the target id instead
+/// handed a player a sixty-second debuff off their own attack and rooted them
+/// where they stood -- no walking, no attacking, no casting, and a client that
+/// stopped sending anything but which way it was facing.
+#[tokio::test]
+async fn an_attack_carrying_the_casters_own_id_is_not_a_self_buff() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+
+    let finished = Message {
+        sender: TEST_CLIENT_ID,
+        opcode: combat::OP_ATTACK,
+        time: 0,
+        body: combat::Attack {
+            target: session.client_id,
+            animation: 0,
+            skill: ROOTING_ATTACK as u16,
+            from: (0.0, 0.0),
+            at: (0.0, 0.0),
+        }
+        .to_body(),
+    };
+    let frames = frames_of(handle_message(&state, &mut session, &finished).await);
+
+    assert!(
+        !session.buffs.has_family(&state.skills, ROOTING_FAMILY),
+        "the caster was given its own attack as a buff"
+    );
+    assert!(!opcodes(&frames).contains(&OP_ADD_BUFF), "and told about it");
+
+    // It still has to be let go of, or the cure is the same as the disease.
+    assert!(!frames.is_empty(), "the client was left waiting on the cast");
+}
+
+/// And the skill that really is a cast on oneself still is one, so the fix
+/// is a narrowing rather than a wall.
+#[tokio::test]
+async fn a_skill_aimed_at_the_caster_by_its_own_type_still_lands() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+
+    let finished = Message {
+        sender: TEST_CLIENT_ID,
+        opcode: combat::OP_ATTACK,
+        time: 0,
+        body: combat::Attack {
+            target: session.client_id,
+            animation: 0,
+            skill: SADDLE_SKILL as u16,
+            from: (0.0, 0.0),
+            at: (0.0, 0.0),
+        }
+        .to_body(),
+    };
+    handle_message(&state, &mut session, &finished).await;
+
+    assert!(session.buffs.has_family(&state.skills, crate::buffs::FAMILY_MOUNTED));
 }
 
 /// Everyone watching has to see the spell go off. The original builds a fresh
@@ -3151,9 +3229,13 @@ async fn a_monster_out_of_reach_cannot_be_hit() {
     let mut session = in_world(&state).await;
     session.character.as_mut().unwrap().x = 9000;
 
-    let action = handle_message(&state, &mut session, &attack_message(RAT)).await;
-    assert!(matches!(action, Action::Ignore));
+    let frames = frames_of(handle_message(&state, &mut session, &attack_message(RAT)).await);
     assert_eq!(state.world.mob(RAT).unwrap().hp, RAT_HP, "it was hit from across the map");
+
+    // Refused, but not in silence. The client filled a bar and is waiting to
+    // be told the cast is over; one that is never told stops sending anything
+    // but which way it is facing.
+    assert!(!frames.is_empty(), "the client was left waiting on a cast that missed");
 }
 
 #[tokio::test]
@@ -3161,10 +3243,11 @@ async fn hitting_something_that_is_not_a_monster_does_nothing() {
     let state = fight_state();
     let mut session = in_world(&state).await;
 
-    assert!(matches!(
-        handle_message(&state, &mut session, &attack_message(9999)).await,
-        Action::Ignore
-    ));
+    let frames = frames_of(handle_message(&state, &mut session, &attack_message(9999)).await);
+
+    // Nothing happens to the world, and the client is still let go of it.
+    assert!(!frames.is_empty(), "the client was left waiting on a cast at nothing");
+    assert_eq!(state.world.mob(RAT).unwrap().hp, RAT_HP);
 }
 
 /// Killing pays, and the corpse comes off the screen.

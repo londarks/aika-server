@@ -76,6 +76,13 @@ pub struct Entry {
     /// that is answered by nothing is where a frozen client is usually left
     /// waiting.
     pub answered: bool,
+    /// How many of the same thing in a row this stands for.
+    ///
+    /// A run is folded into one line rather than filling the ring. The first
+    /// time this was used the ring held nothing but forty-eight monster
+    /// movements broadcast in the same millisecond, and the cast that caused
+    /// the freeze had already fallen off the front.
+    pub repeats: u32,
 }
 
 impl Entry {
@@ -86,12 +93,14 @@ impl Entry {
             (Way::In, false) => "  <- nothing went back",
             _ => "",
         };
+        let run = if self.repeats > 1 { format!(" x{}", self.repeats) } else { String::new() };
         format!(
-            "  +{:>7.3}s {} 0x{:03x} {:>4}b  {}{}",
+            "  +{:>7.3}s {} 0x{:03x} {:>4}b{}  {}{}",
             self.at.as_secs_f32(),
             self.way.arrow(),
             self.opcode,
             self.size,
+            run,
             bytes.join(" "),
             tail
         )
@@ -137,6 +146,18 @@ impl Trace {
     }
 
     fn push(&mut self, entry: Entry) {
+        // A run of the same packet is one line with a count. Without this the
+        // ring is whatever the noisiest thing on the connection is, and the
+        // one packet worth seeing has already fallen off the front.
+        if let Some(last) = self.entries.back_mut() {
+            if last.way == entry.way
+                && last.opcode == entry.opcode
+                && last.answered == entry.answered
+            {
+                last.repeats += 1;
+                return;
+            }
+        }
         if self.entries.len() == KEPT {
             self.entries.pop_front();
         }
@@ -155,6 +176,7 @@ impl Trace {
             head,
             head_len,
             answered: true,
+            repeats: 1,
         }
     }
 
@@ -266,6 +288,33 @@ mod tests {
         assert_eq!(trace.entries.len(), KEPT);
         assert_eq!(trace.entries.front().unwrap().opcode, 10, "it kept the oldest");
         assert_eq!(trace.entries.back().unwrap().opcode, KEPT as u16 + 9);
+    }
+
+    /// A run of the same packet is one line with a count, or the ring holds
+    /// whatever the noisiest thing on the connection is and nothing else. The
+    /// first report this tool ever produced was forty-eight monster movements
+    /// broadcast in the same millisecond; the cast that caused the freeze had
+    /// already fallen off the front.
+    #[test]
+    fn a_run_of_the_same_packet_does_not_fill_the_ring() {
+        let start = Instant::now();
+        let mut trace = trace(start);
+        trace.entered_the_world();
+
+        trace.heard_from_client(0x320, &[], true, start);
+        for _ in 0..200 {
+            trace.sent_to_client(&frame(0x301, &[1, 2]), start);
+        }
+        trace.heard_from_client(0x305, &[], false, start);
+
+        assert_eq!(trace.entries.len(), 3, "the run was not folded into one");
+        assert_eq!(trace.entries[1].repeats, 200);
+
+        let report = trace.report(start + QUIET);
+        assert!(report.contains("0x320"), "what mattered fell off the front:
+{report}");
+        assert!(report.contains("x200"), "the run is not counted:
+{report}");
     }
 
     /// Silence before the character is in the world is a player choosing one,

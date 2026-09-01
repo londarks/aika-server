@@ -990,8 +990,8 @@ fn handle_request_login(state: &State, session: &mut Session, message: &Message)
     debug!(
         account = request.account_id,
         user = %request.username,
-        versao = request.version,
-        "0x685 recebido"
+        version = request.version,
+        "0x685 received"
     );
 
     let expected = state.cfg.game.client_version;
@@ -999,8 +999,8 @@ fn handle_request_login(state: &State, session: &mut Session, message: &Message)
         // A wrong version usually means a wrong offset, not an old client:
         // the dump shows where the fields really are.
         warn!(
-            versao = request.version,
-            esperada = expected,
+            version = request.version,
+            expected,
             user = %request.username,
             body = %hex_dump(&message.body),
             "client with a different version"
@@ -1021,7 +1021,7 @@ fn handle_request_login(state: &State, session: &mut Session, message: &Message)
     info!(
         user = %account.username,
         id = account.id,
-        personagens = account.characters.len(),
+        characters = account.characters.len(),
         "entered the game server"
     );
 

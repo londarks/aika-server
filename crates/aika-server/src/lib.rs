@@ -20,6 +20,7 @@ pub mod config;
 pub mod creation;
 pub mod db;
 pub mod dialog;
+pub mod effects;
 pub mod expiry;
 pub mod game;
 pub mod http;

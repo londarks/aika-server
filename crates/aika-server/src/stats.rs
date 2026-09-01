@@ -14,6 +14,7 @@
 //! real attack and the real defence and reads as a fight; when the missing
 //! systems land, this is the one function to replace.
 
+use crate::effects::Effects;
 use crate::inventory::Inventory;
 use crate::store::Character;
 use aika_data::itemlist::ItemList;
@@ -69,6 +70,8 @@ pub struct Stats {
     pub dodge: u32,
     pub double_attack: u32,
     pub resistance: u32,
+    /// Forty, plus whatever a mount or a spell adds.
+    pub speed_move: u32,
     pub max_hp: u32,
     pub max_mp: u32,
 }
@@ -80,27 +83,68 @@ pub struct Stats {
 /// agility, strength and luck alone. What is missing from it is the effects —
 /// `GetMobAbility` reads the buffs, pran and relic bonuses this server does
 /// not keep — so every line here is the original's minus its effect term.
-pub fn of(character: &Character, items: &ItemList) -> Stats {
+pub fn of(character: &Character, items: &ItemList, effects: &Effects) -> Stats {
+    use crate::effects::id;
+
     let gear = gear_of(&character.items, items);
     let weapon = weapon_of(&character.items, items);
     let armour = armour_of(&character.items, items);
 
+    // An attribute is what the character has plus what is working on it,
+    // and every line below reads the raised one -- which is why the effects
+    // are folded in here rather than at each use.
     let [strength, agility, intellect, _constitution, luck, _free] = character.attributes;
-    let (strength, agility, intellect, luck) =
-        (strength as f32, agility as f32, intellect as f32, luck as f32);
+    let strength = strength as f32 + effects.get(id::STR) as f32;
+    let agility = agility as f32 + effects.get(id::DEX) as f32;
+    let intellect = intellect as f32 + effects.get(id::INT) as f32;
+    let luck = luck as f32 + effects.get(id::SPI) as f32;
     let level = character.level as u32;
 
+    // Defence: the armour, what effects add flat, then a percentage on top,
+    // and `UNARMOR` takes the lot away.
+    let (mut defence, mut magic_defence) = armour;
+    defence += effects.plus(id::RESISTANCE1) + effects.plus(id::PRAN_RESISTANCE1);
+    magic_defence += effects.plus(id::RESISTANCE2) + effects.plus(id::PRAN_RESISTANCE2);
+    defence += defence / 100 * effects.plus(id::PER_RESISTANCE1);
+    magic_defence += magic_defence / 100 * effects.plus(id::PER_RESISTANCE2);
+    if effects.get(id::UNARMOR) > 0 {
+        defence = 0;
+        magic_defence = 0;
+    }
+
+    // Attack: the weapon and the attributes, then the same shape -- a
+    // percentage up, a percentage down, and a flat term last.
+    let mut attack = weapon.0
+        + (strength * STRENGTH_TO_ATTACK) as u32
+        + (agility * AGILITY_TO_ATTACK) as u32
+        + effects.plus(id::PRAN_DAMAGE1);
+    attack += attack / 100 * effects.plus(id::PER_DAMAGE1);
+    attack = attack.saturating_sub(attack / 100 * effects.plus(id::DECREASE_PER_DAMAGE1));
+    attack += effects.plus(id::DAMAGE1);
+
+    let mut magic_attack =
+        weapon.1 + (intellect * INTELLECT_TO_MAGIC) as u32 + effects.plus(id::PRAN_DAMAGE2);
+    magic_attack += magic_attack / 100 * effects.plus(id::PER_DAMAGE2);
+    magic_attack =
+        magic_attack.saturating_sub(magic_attack / 100 * effects.plus(id::DECREASE_PER_DAMAGE2));
+    magic_attack += effects.plus(id::DAMAGE2);
+
     Stats {
-        attack: weapon.0 + (strength * STRENGTH_TO_ATTACK) as u32
-            + (agility * AGILITY_TO_ATTACK) as u32,
-        magic_attack: weapon.1 + (intellect * INTELLECT_TO_MAGIC) as u32,
-        defence: armour.0,
-        magic_defence: armour.1,
-        critical: (agility * AGILITY_TO_CRITICAL) as u32,
-        accuracy: (agility * AGILITY_TO_ACCURACY) as u32,
-        dodge: (agility * AGILITY_TO_DODGE) as u32,
-        double_attack: (strength * STRENGTH_TO_DOUBLE) as u32,
-        resistance: (luck * LUCK_TO_RESISTANCE).round() as u32,
+        attack,
+        magic_attack,
+        defence,
+        magic_defence,
+        critical: (agility * AGILITY_TO_CRITICAL) as u32 + effects.plus(id::CRITICAL),
+        accuracy: (agility * AGILITY_TO_ACCURACY) as u32 + effects.plus(id::HIT),
+        dodge: (agility * AGILITY_TO_DODGE) as u32
+            + effects.plus(id::PARRY)
+            + effects.plus(id::PRAN_PARRY),
+        double_attack: (strength * STRENGTH_TO_DOUBLE) as u32 + effects.plus(id::DOUBLE),
+        resistance: (luck * LUCK_TO_RESISTANCE).round() as u32
+            + effects.plus(id::STATE_RESISTANCE),
+        // Speed is not read off the character at all: forty, and what
+        // effects say on top. A mount is thirty of it.
+        speed_move: BASE_SPEED_MOVE as u32 + effects.plus(id::RUNSPEED),
         // Health and mana are still ours: the original grows them from tables
         // this has not read.
         max_hp: BASE_HP + level * HP_PER_LEVEL + gear.hp,
@@ -281,7 +325,7 @@ mod tests {
         wearing(&mut c, 6, 1000);
         wearing(&mut c, 2, 2000);
 
-        let s = of(&c, &items);
+        let s = of(&c, &items, &Effects::none());
         assert_eq!(s.attack, 120 + 52 + 104, "weapon, then strength and agility at 2.6");
         assert_eq!(s.magic_attack, 16, "five intellect at 3.2");
         assert_eq!(s.defence, 80, "the breastplate, and nothing from the attributes");
@@ -300,10 +344,10 @@ mod tests {
         let mut c = character([0, 0, 0, 0, 0, 0], 1);
         wearing(&mut c, 8, 1000);
 
-        assert_eq!(of(&c, &items).attack, 0, "a sword in the wrong slot armed the character");
+        assert_eq!(of(&c, &items, &Effects::none()).attack, 0, "a sword in the wrong slot armed the character");
 
         wearing(&mut c, 6, 1000);
-        assert_eq!(of(&c, &items).attack, 120);
+        assert_eq!(of(&c, &items, &Effects::none()).attack, 120);
     }
 
     /// A piece worn down to nothing is worth nothing, which is the original's
@@ -322,7 +366,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(of(&c, &items).attack, 0, "a broken weapon still hit");
+        assert_eq!(of(&c, &items, &Effects::none()).attack, 0, "a broken weapon still hit");
     }
 
     /// A caster and a warrior of the same level are not the same, which is
@@ -339,8 +383,8 @@ mod tests {
         let mut caster = character([7, 9, 16, 8, 10, 0], 10);
         wearing(&mut caster, 6, 3000);
 
-        let w = of(&warrior, &items);
-        let c = of(&caster, &items);
+        let w = of(&warrior, &items, &Effects::none());
+        let c = of(&caster, &items, &Effects::none());
 
         assert!(w.attack > c.attack, "the warrior does not hit harder");
         assert!(c.magic_attack > w.magic_attack, "the caster is not the better mage");

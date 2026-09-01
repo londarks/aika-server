@@ -14,6 +14,7 @@ use crate::inventory::{self, Inventory};
 use crate::store::{Account, Character, Item, MAX_CHARACTERS};
 use crate::{ability, combat, creation, dialog, expiry, shop, stats};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
+use crate::effects::Effects;
 use aika_data::itemlist::ItemList;
 use aika_data::skills::SkillTable;
 use aika_data::npc::Npc;
@@ -507,6 +508,21 @@ struct Session {
     /// a buff is measured in minutes and would mean nothing after a logout,
     /// which is where the original keeps it too.
     buffs: crate::buffs::Buffs,
+}
+
+impl Session {
+    /// Everything working on this character: its buffs and what it wears.
+    ///
+    /// Worked out on demand rather than kept, because a buff runs out on its
+    /// own and a stored copy would go stale without anything saying so.
+    fn effects(&self, state: &State) -> Effects {
+        match self.character.as_ref() {
+            Some(character) => {
+                Effects::of(character, &state.items, &self.buffs, &state.skills)
+            }
+            None => Effects::none(),
+        }
+    }
 }
 
 async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Result<()> {
@@ -1036,7 +1052,8 @@ fn handle_enter_world(
     }
     frames.push(zeroed(OP_ENTER_94C, 0, ENTER_94C_SIZE));
 
-    let stats = stats::of(&character, &state.items);
+    let effects = Effects::of(&character, &state.items, &session.buffs, &state.skills);
+    let stats = stats::of(&character, &state.items, &effects);
     session.cur_hp = stats.max_hp;
     session.cur_mp = stats.max_mp;
     session.character = Some(character);
@@ -1074,7 +1091,8 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
     state.world.enter(session.client_id, character.clone());
 
     let skills = known_skills(state, &character);
-    let mut frames = world_burst(&character, session.client_id, &skills, &state.items);
+    let effects = Effects::of(&character, &state.items, &session.buffs, &state.skills);
+    let mut frames = world_burst(&character, session.client_id, &skills, &state.items, &effects);
 
     // The city is drawn by the client; the people in it are not. Without this
     // the player arrives in an empty town.
@@ -1087,10 +1105,15 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
 
     // Everyone nearby sees an arrival, not somebody who was always there.
     // The original makes the same distinction (`Mob/Player.pas:5185`).
-    let mine = encode_spawn_as(&character, session.client_id, SPAWN_TELEPORT_IN);
+    let mine = encode_spawn_as(
+        &character,
+        session.client_id,
+        SPAWN_TELEPORT_IN,
+        stats::BASE_SPEED_MOVE as u32,
+    );
     for other in &neighbours {
         if let Some(their_character) = &other.character {
-            frames.push(encode_spawn(their_character, other.client_id));
+            frames.push(encode_spawn(their_character, other.client_id, stats::BASE_SPEED_MOVE as u32));
         }
         other.send(mine.clone());
         session.visible.insert(other.client_id);
@@ -1125,11 +1148,14 @@ fn world_burst(
     client_id: u16,
     skills: &[usize],
     items: &ItemList,
+    effects: &Effects,
 ) -> Vec<Vec<u8>> {
     let (hp, mp) = vitals(character);
+    // What the client walks the body at: forty and whatever a mount adds.
+    let speed_move = stats::of(character, items, effects).speed_move;
 
     let mut frames = vec![
-        encode_spawn(character, client_id),
+        encode_spawn(character, client_id, speed_move),
         encode_skill_list(client_id, skills),
         encode_skills_level(character, client_id),
         encode_signal(OP_CASH, 0, 0, character.gold.min(u32::MAX as u64) as u32),
@@ -1138,7 +1164,7 @@ fn world_burst(
         zeroed(OP_ACTIVE_TITLE, client_id, ACTIVE_TITLE_SIZE),
         zeroed(OP_RELICS, FIXED_INDEX, RELICS_SIZE),
         encode_refresh_point(character),
-        encode_refresh_status(character, items),
+        encode_refresh_status(character, items, effects),
         zeroed(OP_ALL_ATTRIBUTES, client_id, ALL_ATTRIBUTES_SIZE),
         encode_level(character, client_id),
         encode_hp_mp(character, client_id, hp, mp),
@@ -1146,7 +1172,7 @@ fn world_burst(
 
     // The original spawns the player a second time here, after its stats have
     // been recomputed. Same opcode, same recipient, fresher numbers.
-    frames.push(encode_spawn(character, client_id));
+    frames.push(encode_spawn(character, client_id, speed_move));
     frames
 }
 
@@ -1222,8 +1248,8 @@ mod status_offset {
 /// but the speed used to go out as zero — so a player in full armour was told
 /// they had no attack, no defence and no critical. The values are
 /// `GetCurrentScore`'s, worked out in [`stats::of`].
-fn encode_refresh_status(character: &Character, items: &ItemList) -> Vec<u8> {
-    let stats = stats::of(character, items);
+fn encode_refresh_status(character: &Character, items: &ItemList, effects: &Effects) -> Vec<u8> {
+    let stats = stats::of(character, items, effects);
     let mut body = vec![0u8; REFRESH_STATUS_SIZE - MIN_FRAME];
     let mut put = |at: usize, value: u32| {
         body[at..at + 2].copy_from_slice(&(value.min(u16::MAX as u32) as u16).to_le_bytes());
@@ -1234,8 +1260,9 @@ fn encode_refresh_status(character: &Character, items: &ItemList) -> Vec<u8> {
     put(status_offset::MAGIC_ATTACK, stats.magic_attack);
     put(status_offset::MAGIC_DEFENCE, stats.magic_defence);
     // Not the character's stored speed: the original starts from forty and
-    // adds what effects say, and never reads the field.
-    put(status_offset::SPEED_MOVE, stats::BASE_SPEED_MOVE as u32);
+    // adds what effects say, and never reads the field. A mount is thirty of
+    // it, which is the whole reason to be on one.
+    put(status_offset::SPEED_MOVE, stats.speed_move);
     put(status_offset::CRITICAL, stats.critical);
     put(status_offset::DODGE, stats.dodge);
     put(status_offset::ACCURACY, stats.accuracy);
@@ -1383,12 +1410,12 @@ fn refresh_visibility(state: &State, session: &mut Session) -> Action {
     let mut frames = refresh_npc_visibility(state, session);
     frames.extend(refresh_mob_visibility(state, session));
     let character = session.character.as_ref().expect("checked above");
-    let mine = encode_spawn(character, session.client_id);
+    let mine = encode_spawn(character, session.client_id, session.effects(state).plus(crate::effects::id::RUNSPEED) + stats::BASE_SPEED_MOVE as u32);
 
     for other in &neighbours {
         if session.visible.insert(other.client_id) {
             if let Some(their_character) = &other.character {
-                frames.push(encode_spawn(their_character, other.client_id));
+                frames.push(encode_spawn(their_character, other.client_id, stats::BASE_SPEED_MOVE as u32));
             }
             other.send(mine.clone());
 
@@ -1616,12 +1643,17 @@ impl Movement {
 /// the player themselves and once to those nearby. Here we send only the
 /// player's own; the neighbour one lands once there is a registry of
 /// online players exists.
-fn encode_spawn(character: &Character, client_id: u16) -> Vec<u8> {
-    encode_spawn_as(character, client_id, SPAWN_NORMAL)
+fn encode_spawn(character: &Character, client_id: u16, speed_move: u32) -> Vec<u8> {
+    encode_spawn_as(character, client_id, SPAWN_NORMAL, speed_move)
 }
 
 /// The same, saying how the creature is appearing.
-fn encode_spawn_as(character: &Character, client_id: u16, spawn_type: u8) -> Vec<u8> {
+fn encode_spawn_as(
+    character: &Character,
+    client_id: u16,
+    spawn_type: u8,
+    speed_move: u32,
+) -> Vec<u8> {
     use spawn_offset as off;
     let mut body = vec![0u8; off::BODY_SIZE];
 
@@ -1672,7 +1704,10 @@ fn encode_spawn_as(character: &Character, client_id: u16, spawn_type: u8) -> Vec
     put32(&mut body, off::CUR_MP, mp);
 
     body[off::UNK0] = SPAWN_UNK0;
-    body[off::SPEED_MOVE] = character.speed_move;
+    // The speed everyone sees the character move at. It is not the stored
+    // field either: `GetCurrentScore` builds it from forty plus the effects,
+    // so a rider spawns at a rider's speed.
+    body[off::SPEED_MOVE] = speed_move.min(u8::MAX as u32) as u8;
     body[off::SPAWN_TYPE] = spawn_type;
     body[off::SIZES..off::SIZES + 4].copy_from_slice(&character.sizes);
 
@@ -2009,10 +2044,11 @@ fn restat(
     let (max_hp, max_mp) = vitals(character);
     session.cur_hp = session.cur_hp.min(max_hp);
     session.cur_mp = session.cur_mp.min(max_mp);
+    let effects = session.effects(state);
     let character = session.character.as_ref().expect("checked above");
 
     let mut frames = vec![
-        encode_refresh_status(character, &state.items),
+        encode_refresh_status(character, &state.items, &effects),
         encode_refresh_point(character),
         encode_hp_mp(character, client_id, session.cur_hp, session.cur_mp),
     ];
@@ -2021,7 +2057,7 @@ fn restat(
         .iter()
         .any(|side| side.0 == inventory::EQUIP && WORN_ON_THE_BODY.contains(&side.1));
     if shows {
-        let spawn = encode_spawn(character, client_id);
+        let spawn = encode_spawn(character, client_id, stats::of(character, &state.items, &effects).speed_move);
         state.world.send_to_visible(client_id, spawn.clone());
         frames.push(spawn);
     }
@@ -3101,9 +3137,10 @@ fn grant_buff(state: &State, session: &mut Session, skill: usize) -> Vec<Vec<u8>
         encode_add_buff(client_id, skill, ends_at),
         encode_buffs(client_id, &session.buffs, &state.skills),
     ];
+    let effects = session.effects(state);
     if let Some(character) = session.character.as_ref() {
         frames.push(encode_refresh_point(character));
-        frames.push(encode_refresh_status(character, &state.items));
+        frames.push(encode_refresh_status(character, &state.items, &effects));
     }
     info!(skill, "buff started");
     frames
@@ -3527,7 +3564,7 @@ fn cast_skill(
     }
 
     // A spell leans on the caster's magic attack rather than its swing.
-    let stats = stats::of(character, &state.items);
+    let stats = stats::of(character, &state.items, &session.effects(state));
     let blow = combat::swing_with(
         character.level,
         target.level,
@@ -3577,6 +3614,7 @@ fn drop_spent_buffs(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     }
     let client_id = session.client_id;
     let mut frames = vec![encode_buffs(client_id, &session.buffs, &state.skills)];
+    let effects = session.effects(state);
     if let Some(character) = session.character.as_ref() {
         let (max_hp, max_mp) = vitals(character);
         frames.push(encode_hp_mp(
@@ -3585,7 +3623,7 @@ fn drop_spent_buffs(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
             session.cur_hp.min(max_hp),
             session.cur_mp.min(max_mp),
         ));
-        frames.push(encode_refresh_status(character, &state.items));
+        frames.push(encode_refresh_status(character, &state.items, &effects));
         frames.push(encode_refresh_point(character));
     }
     info!("a buff ran out");
@@ -3607,7 +3645,11 @@ fn collect_blows(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     }
 
     let client_id = session.client_id;
-    let stats = stats::of(session.character.as_ref().expect("checked above"), &state.items);
+    let stats = stats::of(
+        session.character.as_ref().expect("checked above"),
+        &state.items,
+        &session.effects(state),
+    );
     let mut frames = Vec::new();
 
     for blow in blows {
@@ -3692,7 +3734,7 @@ fn handle_revive(state: &State, session: &mut Session, _message: &Message) -> Ac
     character.y = y;
 
     let character = session.character.as_ref().expect("checked above").clone();
-    let stats = stats::of(&character, &state.items);
+    let stats = stats::of(&character, &state.items, &session.effects(state));
 
     session.dead = false;
     session.cur_hp = stats.max_hp;
@@ -3707,7 +3749,7 @@ fn handle_revive(state: &State, session: &mut Session, _message: &Message) -> Ac
     info!(character = %character.name, "got up");
 
     let mut frames = vec![
-        encode_spawn_as(&character, session.client_id, SPAWN_TELEPORT_IN),
+        encode_spawn_as(&character, session.client_id, SPAWN_TELEPORT_IN, stats.speed_move),
         encode_hp_mp(&character, session.client_id, session.cur_hp, session.cur_mp),
     ];
     frames.extend(refresh_npc_visibility(state, session));
@@ -3752,7 +3794,11 @@ fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Act
 
     // Attack comes off the character and its gear now, and the monster's
     // level stands in for the armour it is not wearing.
-    let stats = stats::of(session.character.as_ref().expect("checked above"), &state.items);
+    let stats = stats::of(
+        session.character.as_ref().expect("checked above"),
+        &state.items,
+        &session.effects(state),
+    );
     let blow = combat::swing_with(
         level,
         target.level,
@@ -3829,7 +3875,7 @@ fn reward_for(state: &State, session: &mut Session, target: &crate::mob::Mob) ->
         // Health and mana come back full: a level is the one moment the game
         // hands them over, and arriving at a new level nearly dead is a
         // punishment for winning.
-        let stats = stats::of(character, &state.items);
+        let stats = stats::of(character, &state.items, &Effects::none());
         session.cur_hp = stats.max_hp;
         session.cur_mp = stats.max_mp;
         frames.push(encode_hp_mp(
@@ -5952,6 +5998,60 @@ mod tests {
         assert!(ends - now <= 3600, "an hour's buff lasts longer than an hour");
     }
 
+    /// The whole point of a mount: it makes you faster. The speed is an
+    /// effect the saddle's skill carries, and the sheet reads it through
+    /// `GetCurrentScore` rather than off the character.
+    #[tokio::test]
+    async fn a_mount_makes_the_rider_faster() {
+        let mut state = buff_state();
+        state.skills = {
+            use aika_data::skills::{field, SkillTable, RECORD_SIZE, SLOTS};
+            let mut raw = vec![0u8; SLOTS * RECORD_SIZE + 4];
+            let r = &mut raw[SADDLE_SKILL * RECORD_SIZE..(SADDLE_SKILL + 1) * RECORD_SIZE];
+            r[field::FAMILY..field::FAMILY + 4]
+                .copy_from_slice(&crate::buffs::FAMILY_MOUNTED.to_le_bytes());
+            r[field::DURATION..field::DURATION + 4].copy_from_slice(&3600u32.to_le_bytes());
+            // The real saddle's second pair: run speed, thirty of it.
+            r[field::EFFECT.start + 4..field::EFFECT.start + 8]
+                .copy_from_slice(&(crate::effects::id::RUNSPEED as u32).to_le_bytes());
+            r[field::EFFECT_VALUE.start + 4..field::EFFECT_VALUE.start + 8]
+                .copy_from_slice(&30u32.to_le_bytes());
+            SkillTable::decode(&raw).expect("the fixture table is malformed")
+        };
+
+        let mut session = in_world(&state).await;
+        carrying(&mut session, SADDLE, 7);
+
+        let on_foot = stats::of(
+            session.character.as_ref().unwrap(),
+            &state.items,
+            &session.effects(&state),
+        );
+        assert_eq!(on_foot.speed_move, stats::BASE_SPEED_MOVE as u32, "walking is forty");
+
+        handle_message(&state, &mut session, &use_buff_item(7)).await;
+
+        let mounted = stats::of(
+            session.character.as_ref().unwrap(),
+            &state.items,
+            &session.effects(&state),
+        );
+        assert_eq!(mounted.speed_move, stats::BASE_SPEED_MOVE as u32 + 30, "the mount added nothing");
+
+        // And the client is told, in the packet the sheet reads.
+        let frame = encode_refresh_status(
+            session.character.as_ref().unwrap(),
+            &state.items,
+            &session.effects(&state),
+        );
+        let body = decode(&frame).body;
+        let at = status_offset::SPEED_MOVE;
+        assert_eq!(
+            u16::from_le_bytes(body[at..at + 2].try_into().unwrap()),
+            stats::BASE_SPEED_MOVE + 30
+        );
+    }
+
     /// A mount's skills belong to no class, so the ownership test that stops a
     /// client asking for a skill it never learned would refuse them outright.
     /// The server is the one that names them, so there is nothing to own.
@@ -6081,7 +6181,7 @@ mod tests {
             })
             .unwrap();
 
-        let body = decode(&encode_spawn(&character, TEST_CLIENT_ID)).body;
+        let body = decode(&encode_spawn(&character, TEST_CLIENT_ID, stats::BASE_SPEED_MOVE as u32)).body;
         let at = |offset: usize| u16::from_le_bytes(body[offset..offset + 2].try_into().unwrap());
 
         assert_eq!(at(spawn_offset::ITEM_EFF_MOUNT), HORSE, "the rider was drawn on foot");
@@ -6232,12 +6332,12 @@ mod tests {
             })
             .unwrap();
 
-        let frame = encode_refresh_status(&character, &state.items);
+        let frame = encode_refresh_status(&character, &state.items, &crate::effects::Effects::none());
         let body = decode(&frame).body;
         let at = |offset: usize| u16::from_le_bytes(body[offset..offset + 2].try_into().unwrap());
 
         use status_offset as off;
-        let stats = stats::of(&character, &state.items);
+        let stats = stats::of(&character, &state.items, &crate::effects::Effects::none());
         assert!(stats.attack > 0, "the fixture sword is worth nothing, so this proves nothing");
         assert_eq!(at(off::ATTACK), stats.attack as u16, "attack went out as zero");
         assert_eq!(at(off::MAGIC_ATTACK), stats.magic_attack as u16);
@@ -6290,7 +6390,7 @@ mod tests {
         let attack =
             u16::from_le_bytes(status[status_offset::ATTACK..status_offset::ATTACK + 2].try_into().unwrap());
         let character = session.character.as_ref().unwrap();
-        assert_eq!(attack, stats::of(character, &state.items).attack as u16);
+        assert_eq!(attack, stats::of(character, &state.items, &crate::effects::Effects::none()).attack as u16);
     }
 
     /// A `0x70F` the way the client sends one.
@@ -6767,7 +6867,7 @@ mod tests {
         );
 
         // the copy the player gets of itself is the ordinary kind
-        let own = decode(&world_burst(&character, session.client_id, &[], &state.items)[0]);
+        let own = decode(&world_burst(&character, session.client_id, &[], &state.items, &crate::effects::Effects::none())[0]);
         assert_eq!(own.body[spawn_offset::SPAWN_TYPE], SPAWN_NORMAL);
     }
 
@@ -7418,7 +7518,7 @@ mod tests {
             .unwrap();
 
         let character = session.character.as_ref().unwrap().clone();
-        let spawn = decode(&encode_spawn(&character, TEST_CLIENT_ID));
+        let spawn = decode(&encode_spawn(&character, TEST_CLIENT_ID, stats::BASE_SPEED_MOVE as u32));
 
         use spawn_offset as off;
         let worn = |slot: usize| {
@@ -7498,7 +7598,7 @@ mod tests {
 
         kill_the_rat(&state, &mut session).await;
 
-        let stats = stats::of(session.character.as_ref().unwrap(), &state.items);
+        let stats = stats::of(session.character.as_ref().unwrap(), &state.items, &crate::effects::Effects::none());
         assert_eq!(session.cur_hp, stats.max_hp, "it levelled and stayed hurt");
     }
 

@@ -12,7 +12,7 @@
 //! the shape of the answer is the same. A spatial grid belongs here later,
 //! behind the same methods.
 
-use crate::mob::{Attack, Mob, Turn};
+use crate::mob::{Attack, Mob, Reaction, Turn};
 use crate::store::Character;
 use aika_data::npc::Npc;
 use std::collections::HashMap;
@@ -149,32 +149,65 @@ impl World {
         Some((mob.clone(), killed))
     }
 
-    /// Runs every monster's turn and collects what they swing at.
+    /// The movement thread: `TMobMovimentThread1`, every three seconds.
+    ///
+    /// A monster that is fighting drifts towards whoever it is fighting; one
+    /// that is not ambles between its two points. Nothing here starts a fight
+    /// — that is the other thread's job, which is why a monster walking past
+    /// you does not turn round.
     ///
     /// The positions of the players are passed in rather than read under the
     /// same lock: taking both locks in one place is how two of them end up
     /// taken in the other order somewhere else.
-    pub fn think_mobs(&self, players: &[(u16, (f32, f32))], now: Instant) -> Vec<(Mob, Turn)> {
+    pub fn move_mobs(&self, players: &[(u16, (f32, f32))], now: Instant) -> Vec<(Mob, Turn)> {
         let mut turns = Vec::new();
         let mut mobs = self.mobs.lock().unwrap();
 
         for mob in mobs.iter_mut().filter(|m| m.is_alive()) {
-            // The nearest player, which is all a monster this simple needs.
-            let nearest = players
-                .iter()
-                .map(|(id, at)| (*id, *at, mob.distance_to(*at)))
-                .min_by(|a, b| a.2.total_cmp(&b.2))
-                .map(|(id, at, _)| (id, at));
-
-            let turn = mob.think(nearest, now);
-            if let Some(attack) = turn.attack {
-                mob.last_hurt_by = Some(attack.target);
-            }
+            let turn = mob.move_turn(players, now);
             if turn != Turn::default() {
                 turns.push((mob.clone(), turn));
             }
         }
         turns
+    }
+
+    /// The combat thread: `TMobHandlerThread1`, every second.
+    ///
+    /// It swings, or it closes the distance by putting the monster beside
+    /// whoever it is after, or it gives up and goes home. This is also where
+    /// a fight starts: the original checks it from the player's side —
+    /// `LureMobsInRange` walks what the *player* can see and annoys anything
+    /// within eight of them — and runs it from inside this same handler
+    /// (`Mob/MOB.pas:1124`), so it belongs on this clock rather than on every
+    /// movement packet.
+    ///
+    /// Returns the blows to deal and, separately, the monsters that moved, so
+    /// the caller can tell everyone who can see them.
+    pub fn fight_mobs(
+        &self,
+        players: &[(u16, (f32, f32))],
+        now: Instant,
+    ) -> (Vec<Attack>, Vec<(Mob, Turn)>) {
+        let mut blows = Vec::new();
+        let mut moved = Vec::new();
+        let mut mobs = self.mobs.lock().unwrap();
+
+        for mob in mobs.iter_mut().filter(|m| m.is_alive()) {
+            if !mob.is_fighting() {
+                if let Some((who, _)) = players.iter().find(|(_, at)| mob.is_lured_by(*at)) {
+                    mob.provoked_by(*who);
+                }
+            }
+            match mob.combat_turn(players, now) {
+                Some(Reaction::Swing(attack)) => blows.push(attack),
+                Some(Reaction::Closed { to, speed } | Reaction::WentHome { to, speed }) => {
+                    moved.push((mob.clone(), Turn { walk: Some(to), speed }));
+                }
+                None => {}
+            }
+        }
+        (blows, moved)
     }
 
     /// Leaves a blow for a player to find on its next packet.

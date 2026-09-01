@@ -72,6 +72,23 @@ mod spawn {
 /// which is as fragile as it sounds, but it is what the data was built for.
 const ROOTED_NAMES: [&str; 2] = ["Mutante", "Crenon"];
 
+/// Of those two, only one is marked a mutant, and a mutant is never lured
+/// (`ServerSocket.pas:626`). A Crenon stands still but still bites.
+const MUTANT_NAME: &str = "Mutante";
+
+/// Monsters whose name begins with this are never lured either
+/// (`BaseMob.pas:2138`), whatever their level. They are the tame ones the
+/// starting area is full of.
+const TAME_NAME: &str = "Max";
+
+/// The kinds the original treats as town guards, by their string-table index
+/// (`IfGuard`, `ServerSocket.pas:566`). A guard stays where it is put and
+/// minds only players of another nation, from much further off.
+const GUARD_NAMES: [u16; 20] = [
+    81, 82, 117, 485, 486, 739, 888, 889, 890, 897, 901, 915, 924, 1935, 1936,
+    1925, 1926, 1927, 1922, 1923,
+];
+
 /// A kind of monster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MobKind {
@@ -106,7 +123,24 @@ impl MobKind {
 
     /// Whether this kind stays where it is put.
     pub fn is_rooted(&self) -> bool {
-        ROOTED_NAMES.iter().any(|word| self.name.contains(word))
+        ROOTED_NAMES.iter().any(|word| self.name.contains(word)) || self.is_guard()
+    }
+
+    /// Whether it is a town guard, which the original decides from a list of
+    /// twenty string-table indices rather than from anything in the file.
+    pub fn is_guard(&self) -> bool {
+        GUARD_NAMES.contains(&self.name_index)
+    }
+
+    /// Whether walking past it is enough to start a fight.
+    ///
+    /// For most kinds it is. Guards, mutants and the tame `Max` kinds are the
+    /// three the original skips (`TBaseMob.LureMobsInRange`), which is why the
+    /// starting area is walkable at all: every monster in it is a `Max`.
+    pub fn is_lurable(&self) -> bool {
+        !self.is_guard()
+            && !self.name.contains(MUTANT_NAME)
+            && !self.name.starts_with(TAME_NAME)
     }
 }
 
@@ -323,10 +357,13 @@ fn parse_spawns(text: &str) -> Result<Vec<MobSpawn>, MobError> {
         // the walking code needs no special case for them.
         let start = (n(spawn::START_X)? as f32, n(spawn::START_Y)? as f32);
         let rooted = ROOTED_NAMES.iter().any(|word| kind.contains(word));
+        // And the far end is the file's second point shifted five on both
+        // axes, which the original does without saying why
+        // (`ServerSocket.pas:637`).
         let end = if rooted {
             start
         } else {
-            (n(spawn::END_X)? as f32, n(spawn::END_Y)? as f32)
+            (n(spawn::END_X)? as f32 + 5.0, n(spawn::END_Y)? as f32 + 5.0)
         };
 
         spawns.push(MobSpawn {
@@ -416,7 +453,7 @@ mod tests {
 
         assert_eq!(first.kind, "Max_Filhote");
         assert_eq!(first.start, (3496.0, 844.0));
-        assert_eq!(first.end, (3474.0, 831.0));
+        assert_eq!(first.end, (3479.0, 836.0), "the far end is the file's plus five");
         assert_eq!((first.start_range, first.start_wait), (11, 8));
         assert!(!first.is_stationary());
     }

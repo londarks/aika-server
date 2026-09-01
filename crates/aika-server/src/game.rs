@@ -397,64 +397,107 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Resu
     result
 }
 
-/// How often the world is looked at for things that happen on their own.
-///
-/// Only one thing does so far: monsters whose respawn time is up. A second is
-/// finer than any respawn in the shipped data, the shortest of which is
-/// thirty, so nothing waits noticeably longer than the file says. It is also
-/// what a monster's step is measured against, so it sets how fast they amble.
-const WORLD_TICK: std::time::Duration = crate::mob::TICK;
+/// How often monsters are brought back, which nothing else is measured
+/// against. A second is finer than any respawn in the shipped data, the
+/// shortest of which is thirty.
+const RESPAWN_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Brings monsters back on their own clock.
+/// Runs the monsters, on the two clocks the original runs them on.
 ///
-/// The players are not told from here. Each connection keeps its own idea of
-/// what is on its screen, and pushing a spawn from outside would desync it;
-/// instead the session notices on its next refresh, which the client's own
-/// twice-a-second heartbeat drives.
+/// `ServerSocket.pas:876` starts two threads and gives them two periods:
+/// `TMobHandlerThread1` every second decides who swings, and
+/// `TMobMovimentThread1` every three seconds decides where everything
+/// stands. Both numbers are behaviour, not tuning — running the movement on
+/// a fast clock is what made monsters sprint across the field, because each
+/// turn shifts a fixed distance rather than a distance per second.
+///
+/// The players are not told about respawns from here. Each connection keeps
+/// its own idea of what is on its screen, and pushing a spawn from outside
+/// would desync it; instead the session notices on its next refresh, which
+/// the client's own twice-a-second heartbeat drives.
 pub fn spawn_world_tick(state: Arc<State>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(WORLD_TICK);
+        let mut respawns = tokio::time::interval(RESPAWN_TICK);
+        let mut fights = tokio::time::interval(crate::mob::COMBAT_TICK);
+        let mut moves = tokio::time::interval(crate::mob::MOVE_TICK);
+
         loop {
-            ticker.tick().await;
-            let now = std::time::Instant::now();
+            let now = tokio::select! {
+                _ = respawns.tick() => {
+                    let revived = state.world.revive_mobs(std::time::Instant::now());
+                    if !revived.is_empty() {
+                        debug!(count = revived.len(), "monsters came back");
+                    }
+                    continue;
+                }
+                _ = fights.tick() => Clock::Combat,
+                _ = moves.tick() => Clock::Movement,
+            };
 
-            let revived = state.world.revive_mobs(now);
-            if !revived.is_empty() {
-                debug!(count = revived.len(), "monsters came back");
-            }
-
-            // Nothing to think about with nobody in the world, and five
+            // Nothing to think about with nobody in the world, and several
             // thousand monsters pacing for an empty map is work for nothing.
             let players = state.world.positions();
             if players.is_empty() {
                 continue;
             }
 
-            for (mob, turn) in state.world.think_mobs(&players, now) {
-                if let Some(attack) = turn.attack {
-                    debug!(
-                        mob = mob.id,
-                        target = attack.target,
-                        damage = attack.damage,
-                        skill = attack.skill,
-                        "a monster swung"
-                    );
-                    state.world.deal_to_player(attack.target, attack);
-                }
-
-                // A walk is told to everyone who can see it, once, with the
-                // destination. The client animates the way there itself.
-                if let Some(to) = turn.walk {
-                    let frame = encode_mob_walk(&mob, to, turn.speed);
-                    for (id, at) in &players {
-                        if within(*at, mob.position(), DISTANCE_TO_WATCH) {
-                            state.world.send_to(*id, frame.clone());
-                        }
-                    }
-                }
+            match now {
+                Clock::Combat => run_combat(&state, &players),
+                Clock::Movement => run_movement(&state, &players),
             }
         }
     })
+}
+
+/// Which of the two monster threads a turn of the loop is.
+enum Clock {
+    Combat,
+    Movement,
+}
+
+/// `TMobSPosition.MobHandler`: who swings at whom, and who closes in.
+fn run_combat(state: &Arc<State>, players: &[(u16, (f32, f32))]) {
+    let (blows, moved) = state.world.fight_mobs(players, std::time::Instant::now());
+
+    for attack in blows {
+        debug!(
+            mob = attack.attacker,
+            target = attack.target,
+            damage = attack.damage,
+            skill = attack.skill,
+            "a monster swung"
+        );
+        state.world.deal_to_player(attack.target, attack);
+    }
+    tell_watchers(state, players, moved);
+}
+
+/// `TMobSPosition.MobMoviment`: where everything stands.
+fn run_movement(state: &Arc<State>, players: &[(u16, (f32, f32))]) {
+    let moved = state.world.move_mobs(players, std::time::Instant::now());
+    tell_watchers(state, players, moved);
+}
+
+/// Tells everyone who can see a monster where it has got to.
+///
+/// The original sends where the monster now *is*, having already moved it
+/// there, and the client walks it the whole way at the speed in the packet.
+/// Sending a short step on a fast clock instead is what made monsters stutter:
+/// the client kept arriving early and standing still until the next one.
+fn tell_watchers(
+    state: &Arc<State>,
+    players: &[(u16, (f32, f32))],
+    moved: Vec<(crate::mob::Mob, crate::mob::Turn)>,
+) {
+    for (mob, turn) in moved {
+        let Some(to) = turn.walk else { continue };
+        let frame = encode_mob_walk(&mob, to, turn.speed);
+        for (id, at) in players {
+            if within(*at, mob.position(), DISTANCE_TO_WATCH) {
+                state.world.send_to(*id, frame.clone());
+            }
+        }
+    }
 }
 
 /// `0x301` for a monster: `TBaseMob.WalkTo`.

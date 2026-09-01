@@ -84,6 +84,15 @@ pub const OP_ACTION: u16 = 0x304;
 /// `$202` (`RequestServerTime`, `PacketHandlers.pas:13038`): the player asked
 /// what time it is where the server is.
 pub const OP_SERVER_TIME: u16 = 0x202;
+/// `TStoragePacket` (`Data/Packets.pas:985`): the whole chest in one packet,
+/// the gold in it and all eighty-six slots (`SendStorage`, `Mob/Player.pas:4402`).
+pub const OP_STORAGE: u16 = 0x137;
+/// The signal that opens the chest window, carrying which chest it is
+/// (`SendData(clientId, $310, StorageType)`).
+pub const OP_STORAGE_OPEN: u16 = 0x310;
+/// `TChangeChestGoldPacket` (`Data/Packets.pas:976`): move gold between the
+/// purse and the chest. The amount is signed — out of the chest is negative.
+pub const OP_CHEST_GOLD: u16 = 0xF59;
 /// Walking, the only move type the original relays to other players
 /// (`Data/GlobalDefs.pas:216`). The real client also sends other values.
 const MOVE_NORMAL: u8 = 0;
@@ -191,6 +200,34 @@ const ITEM_TYPE_TEARS: u16 = 29;
 const ITEM_TYPE_HP_POTION: u16 = 700;
 const ITEM_TYPE_MP_POTION: u16 = 701;
 const ITEM_TYPE_HPMP_POTION: u16 = 800;
+/// The item that opens the chest wherever the player is standing
+/// (`ITEM_TYPE_STORAGE_OPEN`, `Data/GlobalDefs.pas:856`).
+const ITEM_TYPE_STORAGE_OPEN: u16 = 226;
+/// Only prans go in the last two chest slots, and this is what one is
+/// (`MoveItem` checks `ItemType = 10`).
+const ITEM_TYPE_PRAN: u16 = 10;
+
+/// Which chest a packet is about (`Data/GlobalDefs.pas:363`). Two is the
+/// player's own; three is the guild's, which waits on guilds.
+const STORAGE_TYPE_PLAYER: u32 = 1;
+const CHEST_TYPE_STORAGE: u32 = 2;
+
+/// What the original marks as the window being open: option seven is the
+/// chest (`ITEM_TYPE_STORAGE_OPEN` sets `OpennedOption := 7`).
+const OPTION_STORAGE: u32 = 7;
+
+/// The most gold either the purse or the chest will hold. The original
+/// refuses a transfer that would push past it rather than wrapping round.
+const GOLD_CAP: u64 = 2_000_000_000;
+
+/// `TStoragePacket`: a dword the original leaves at zero, the gold, and the
+/// eighty-six slots.
+const STORAGE_SIZE: usize = MIN_FRAME
+    + 4
+    + 8
+    + inventory::STORAGE_SLOTS as usize * character_offset::ITEM_SIZE;
+/// `TChangeChestGoldPacket`: which chest, and how much in or out.
+const CHEST_GOLD_SIZE: usize = MIN_FRAME + 4 + 8;
 
 /// The index the original stamps on a menu entry (`NPCHandlers.pas:172`).
 /// Note that it is not the `0x7535` used everywhere else — the digits are
@@ -409,6 +446,11 @@ struct Session {
     /// against it: a client that never opened a shop must not be able to buy
     /// from one, and the original refuses on the same grounds.
     opened_npc: Option<u16>,
+    /// Which window it is (`OpennedOption`). The chest is seven, and putting
+    /// something into it is refused unless this says the chest is open — the
+    /// original's own guard, and the reason it is kept rather than inferred
+    /// from the NPC alone: an item opens the chest with no NPC involved.
+    opened_option: u32,
 }
 
 async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Result<()> {
@@ -593,6 +635,11 @@ async fn autosave(state: &State, session: &mut Session, force: bool) {
     };
 
     state.save_session(character).await;
+    // And the chest, which the same edits reach: an item dragged out of the
+    // bag and into it changes both sides at once.
+    if let Some(account) = session.account.as_ref() {
+        state.save_storage(account).await;
+    }
     session.dirty = false;
     session.saved_at = Some(std::time::Instant::now());
 }
@@ -761,7 +808,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         creation::OP_CREATE_CHARACTER => {
             handle_create_character(state, session, message).await
         }
-        OP_MOVE_ITEM => handle_move_item(session, message),
+        OP_MOVE_ITEM => handle_move_item(state, session, message),
         OP_USE_ITEM => handle_use_item(state, session, message),
         combat::OP_ATTACK => handle_attack(state, session, message),
         OP_REVIVE => handle_revive(state, session, message),
@@ -774,6 +821,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         OP_LEARN_SKILL => handle_learn_skill(state, session, message),
         OP_ACTION => handle_action(state, session, message),
         OP_SERVER_TIME => handle_server_time(session),
+        OP_CHEST_GOLD => handle_chest_gold(session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
@@ -1679,6 +1727,7 @@ fn handle_buy(state: &State, session: &mut Session, message: &Message) -> Action
     };
 
     let client_id = session.client_id;
+    let chest = chest_gold(session);
     let Some(character) = session.character.as_mut() else {
         return Action::Ignore;
     };
@@ -1702,7 +1751,7 @@ fn handle_buy(state: &State, session: &mut Session, message: &Message) -> Action
                 frames.push(encode_refresh_item(inventory::BAG, *slot, left, false));
             }
             frames.push(encode_refresh_item(inventory::BAG, change.slot, &change.item, true));
-            frames.push(encode_refresh_money(change.gold));
+            frames.push(encode_refresh_money(change.gold, chest));
             Action::Reply(frames)
         }
         Err(e) => {
@@ -1727,6 +1776,7 @@ fn handle_sell(state: &State, session: &mut Session, message: &Message) -> Actio
     }
 
     let client_id = session.client_id;
+    let chest = chest_gold(session);
     let Some(character) = session.character.as_mut() else {
         return Action::Ignore;
     };
@@ -1739,7 +1789,7 @@ fn handle_sell(state: &State, session: &mut Session, message: &Message) -> Actio
             info!(slot = change.slot, gold = change.gold, "sold");
             Action::Reply(vec![
                 encode_refresh_item(inventory::BAG, change.slot, &change.item, true),
-                encode_refresh_money(change.gold),
+                encode_refresh_money(change.gold, chest),
             ])
         }
         Err(e) => {
@@ -1775,32 +1825,126 @@ fn open_shop<'a>(state: &'a State, session: &Session, claimed: u16) -> Option<&'
 }
 
 /// `0x70F`: an item dragged from one slot to another.
-fn handle_move_item(session: &mut Session, message: &Message) -> Action {
+///
+/// The chest makes this a move between two owners rather than inside one: the
+/// bag belongs to the character and the chest to the account. Both sides are
+/// checked the way `MoveItem` checks them — the page a slot is on has to be
+/// unlocked, the item that unlocks a page cannot itself be dragged, only prans
+/// go in the last two chest slots, and putting something into the chest needs
+/// the chest window to be open.
+fn handle_move_item(state: &State, session: &mut Session, message: &Message) -> Action {
     let Some(request) = MoveItem::parse(&message.body) else {
         warn!(size = message.body.len(), "0x70F packet too short");
         return Action::Ignore;
     };
+    let (from, to) = (request.from(), request.to());
 
-    let Some(character) = session.character.as_mut() else {
+    if session.character.is_none() || session.account.is_none() {
+        return Action::Ignore;
+    }
+    if let Err(reason) = check_move(state, session, from, to) {
+        debug!(?from, ?to, reason, "item not moved");
+        return refresh_both(session, from, to);
+    }
+
+    let (Some(character), Some(account)) =
+        (session.character.as_mut(), session.account.as_mut())
+    else {
         return Action::Ignore;
     };
+    let (bag, chest) = (&mut character.items, &mut account.storage);
 
-    let (from, to) = (request.from(), request.to());
-    match character.items.move_item(from, to) {
+    let moved = match (from.0, to.0) {
+        (inventory::STORAGE, inventory::STORAGE) => chest.move_item(from, to),
+        (inventory::STORAGE, _) => chest.move_into(from, bag, to),
+        (_, inventory::STORAGE) => bag.move_into(from, chest, to),
+        _ => bag.move_item(from, to),
+    };
+    match moved {
         Ok(()) => session.dirty = true,
         Err(e) => debug!(?from, ?to, error = %e, "item not moved"),
     }
 
-    let character = session.character.as_ref().expect("checked above");
+    refresh_both(session, from, to)
+}
 
-    // Both slots go back either way. The client has already drawn the item in
-    // its new place, so on a refusal it has to be told what is really there,
-    // and on success it needs the source cleared.
-    let there = slot_item(&character.items, to.0, to.1);
-    let here = slot_item(&character.items, from.0, from.1);
+/// Says why a move is refused, or nothing when it is allowed.
+///
+/// Split out because the reasons are the interesting part and they are the
+/// original's, not ours (`MoveItem`, `PacketHandlers.pas:5376`).
+fn check_move(
+    state: &State,
+    session: &Session,
+    from: (u8, u16),
+    to: (u8, u16),
+) -> Result<(), &'static str> {
+    // A bag or a vault is the reason its page exists; it is not cargo.
+    if inventory::is_page_item(from.0, from.1) || inventory::is_page_item(to.0, to.1) {
+        return Err("that slot holds the thing that unlocks a page");
+    }
+
+    // Putting something in needs the window open. Taking something out does
+    // not: the original has that check commented out on the source side, and
+    // a player pulling from their own chest robs nobody.
+    if to.0 == inventory::STORAGE
+        && (session.opened_option != OPTION_STORAGE || session.opened_npc.is_none())
+    {
+        return Err("the chest is not open");
+    }
+
+    let (Some(character), Some(account)) = (session.character.as_ref(), session.account.as_ref())
+    else {
+        return Err("nobody is in the world");
+    };
+    let held = |side: (u8, u16)| {
+        let owner = if side.0 == inventory::STORAGE { &account.storage } else { &character.items };
+        owner.get(side.0, side.1).cloned()
+    };
+
+    // A locked page is not a place to take from or put into.
+    for side in [from, to] {
+        if let Some(page) = inventory::page_item_for(side.0, side.1) {
+            let owner =
+                if side.0 == inventory::STORAGE { &account.storage } else { &character.items };
+            if owner.get(side.0, page).is_none_or(|i| i.is_empty()) {
+                return Err("that page has not been unlocked");
+            }
+        }
+    }
+
+    // And the last two chest slots hold prans and nothing else.
+    if to.0 == inventory::STORAGE && inventory::STORAGE_PRAN_SLOTS.contains(&to.1) {
+        let is_pran = held(from)
+            .and_then(|item| state.items.get(item.index as usize))
+            .is_some_and(|def| def.item_type() == ITEM_TYPE_PRAN);
+        if !is_pran {
+            return Err("only a pran goes in the pran slots");
+        }
+    }
+
+    Ok(())
+}
+
+/// Sends both slots back as they really are.
+///
+/// The client has already drawn the item in its new place, so a refusal has to
+/// say what is actually there, and a move has to clear the slot it came from.
+fn refresh_both(session: &Session, from: (u8, u16), to: (u8, u16)) -> Action {
+    let (Some(character), Some(account)) = (session.character.as_ref(), session.account.as_ref())
+    else {
+        return Action::Ignore;
+    };
+    let owner = |container: u8| {
+        if container == inventory::STORAGE {
+            &account.storage
+        } else {
+            &character.items
+        }
+    };
+
     Action::Reply(vec![
-        encode_refresh_item(to.0, to.1, &there, false),
-        encode_refresh_item(from.0, from.1, &here, false),
+        encode_refresh_item(to.0, to.1, &slot_item(owner(to.0), to.0, to.1), false),
+        encode_refresh_item(from.0, from.1, &slot_item(owner(from.0), from.0, from.1), false),
     ])
 }
 
@@ -1823,6 +1967,7 @@ fn handle_learn_skill(state: &State, session: &mut Session, message: &Message) -
     let npc = u32::from_le_bytes(message.body[4..8].try_into().unwrap()) as u16;
 
     let client_id = session.client_id;
+    let chest = chest_gold(session);
     let Some(character) = session.character.as_mut() else {
         return Action::Ignore;
     };
@@ -1868,7 +2013,7 @@ fn handle_learn_skill(state: &State, session: &mut Session, message: &Message) -
         encode_skill_list_from(client_id, npc, &known),
         encode_skills_level(character, client_id),
         encode_refresh_point(character),
-        encode_refresh_money(character.gold),
+        encode_refresh_money(character.gold, chest),
     ])
 }
 
@@ -2041,6 +2186,23 @@ fn handle_use_item(state: &State, session: &mut Session, message: &Message) -> A
         ITEM_TYPE_HP_POTION => (true, false),
         ITEM_TYPE_MP_POTION => (false, true),
         ITEM_TYPE_HPMP_POTION | ITEM_TYPE_TEARS => (true, true),
+        // The chest opens wherever the player is standing, and the item is
+        // not spent doing it — the original returns before the stack is
+        // touched. It names the player as the NPC whose window is open,
+        // because there is no NPC.
+        ITEM_TYPE_STORAGE_OPEN => {
+            session.opened_option = OPTION_STORAGE;
+            session.opened_npc = Some(client_id);
+            let Some(account) = session.account.as_ref() else {
+                return Action::Ignore;
+            };
+            info!(item = item.index, "the chest was opened with an item");
+            return Action::Reply(open_storage(
+                client_id,
+                account.storage_gold,
+                &account.storage,
+            ));
+        }
         other => {
             debug!(item = item.index, item_type = other, "this kind of item is not usable yet");
             return Action::Reply(vec![encode_client_message(
@@ -2085,6 +2247,12 @@ fn session_heal(current: &mut u32, by: u32, ceiling: u32) {
 }
 
 /// What is in a slot, or an empty item addressed to it when nothing is.
+/// What the account keeps in the chest, or nothing when there is no account
+/// yet. Every packet that shows the purse shows this beside it.
+fn chest_gold(session: &Session) -> u64 {
+    session.account.as_ref().map_or(0, |account| account.storage_gold)
+}
+
 fn slot_item(inventory: &Inventory, container: u8, slot: u16) -> Item {
     inventory
         .get(container, slot)
@@ -2260,13 +2428,14 @@ fn encode_refresh_item(container: u8, slot: u16, item: &Item, notice: bool) -> V
     )
 }
 
-/// `TRefreshMoneyPacket` (`0x312`): the purse, and the storage purse we do
-/// not keep yet.
-fn encode_refresh_money(gold: u64) -> Vec<u8> {
+/// `TRefreshMoneyPacket` (`0x312`): what is in the purse and what is in the
+/// chest, which the original sends together because the window that shows one
+/// shows the other (`RefreshMoney`, `Mob/Player.pas:4374`).
+fn encode_refresh_money(gold: u64, chest_gold: u64) -> Vec<u8> {
     let mut body = Vec::with_capacity(shop::REFRESH_MONEY_SIZE - MIN_FRAME);
     body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(&gold.to_le_bytes());
-    body.extend_from_slice(&0u64.to_le_bytes());
+    body.extend_from_slice(&chest_gold.to_le_bytes());
 
     debug_assert_eq!(body.len() + MIN_FRAME, shop::REFRESH_MONEY_SIZE);
     frame::encode(
@@ -2562,6 +2731,98 @@ fn encode_action(client_id: u16, index: u32, in_loop: u32) -> Vec<u8> {
         &Message { sender: client_id, opcode: OP_ACTION, time: 0, body },
         rand::random(),
     )
+}
+
+/// `TStoragePacket` (`0x137`): the chest, gold and every slot of it.
+///
+/// The original copies the whole `TStoragePlayer` into the packet in one
+/// `Move`, so the layout is exactly the record's: the gold, then eighty-six
+/// twenty-byte items. Empty slots go out as zeroes, which is what tells the
+/// client the space is there but nothing is in it.
+fn encode_storage(client_id: u16, gold: u64, storage: &Inventory) -> Vec<u8> {
+    let mut body = vec![0u8; STORAGE_SIZE - MIN_FRAME];
+    body[4..12].copy_from_slice(&gold.min(GOLD_CAP).to_le_bytes());
+
+    for slot in 0..inventory::STORAGE_SLOTS {
+        if let Some(item) = storage.get(inventory::STORAGE, slot) {
+            let at = 12 + slot as usize * character_offset::ITEM_SIZE;
+            write_item(&mut body[at..at + character_offset::ITEM_SIZE], item);
+        }
+    }
+
+    debug_assert_eq!(body.len() + MIN_FRAME, STORAGE_SIZE);
+    frame::encode(
+        &Message { sender: client_id, opcode: OP_STORAGE, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// Everything `SendStorage` sends: the chest, the signal that opens its
+/// window, and the two pran slots on their own.
+///
+/// The two extra refreshes are the original's and look redundant until you
+/// notice which slots they name — 84 and 85 sit past the four pages, and the
+/// client draws the pran centre from a different part of its interface.
+fn open_storage(client_id: u16, gold: u64, storage: &Inventory) -> Vec<Vec<u8>> {
+    let mut frames = vec![
+        encode_storage(client_id, gold, storage),
+        encode_signal(OP_STORAGE_OPEN, client_id, 0, STORAGE_TYPE_PLAYER),
+    ];
+    for slot in inventory::STORAGE_PRAN_SLOTS {
+        let item = slot_item(storage, inventory::STORAGE, slot);
+        frames.push(encode_refresh_item(inventory::STORAGE, slot, &item, false));
+    }
+    frames
+}
+
+/// `0xF59`: move gold between the purse and the chest (`ChangeGold`).
+///
+/// The amount is signed: positive puts gold in, negative takes it out. Both
+/// sides are checked against the two-billion cap the original stops at rather
+/// than letting either wrap, and a transfer of nothing is refused outright so
+/// a stuck client cannot make the chest redraw for ever.
+fn handle_chest_gold(session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < CHEST_GOLD_SIZE - MIN_FRAME {
+        warn!(size = message.body.len(), "0xF59 packet too short");
+        return Action::Ignore;
+    }
+    let chest = u32::from_le_bytes(message.body[0..4].try_into().unwrap());
+    let value = i64::from_le_bytes(message.body[4..12].try_into().unwrap());
+
+    // The guild chest is the other half of this packet and waits on guilds.
+    if chest != CHEST_TYPE_STORAGE || value == 0 {
+        debug!(chest, value, "0xF59 for a chest we do not keep");
+        return Action::Ignore;
+    }
+
+    let client_id = session.client_id;
+    let (Some(character), Some(account)) =
+        (session.character.as_mut(), session.account.as_mut())
+    else {
+        return Action::Ignore;
+    };
+
+    let amount = value.unsigned_abs();
+    let (from, to) = if value > 0 {
+        (&mut character.gold, &mut account.storage_gold)
+    } else {
+        (&mut account.storage_gold, &mut character.gold)
+    };
+    if *from < amount || *to + amount > GOLD_CAP {
+        debug!(value, "not enough gold, or the other side is full");
+        return Action::Ignore;
+    }
+    *from -= amount;
+    *to += amount;
+
+    let (gold, chest_gold) = (character.gold, account.storage_gold);
+    let storage = account.storage.clone();
+    session.dirty = true;
+    info!(value, gold, chest_gold, "gold moved to or from the chest");
+
+    let mut frames = vec![encode_refresh_money(gold, chest_gold)];
+    frames.extend(open_storage(client_id, chest_gold, &storage));
+    Action::Reply(frames)
 }
 
 /// `0x202`: what time is it on the server (`RequestServerTime`).
@@ -4282,6 +4543,12 @@ mod tests {
             .copy_from_slice(&ITEM_TYPE_HP_POTION.to_le_bytes());
         r[field::USE_EFFECT..field::USE_EFFECT + 2].copy_from_slice(&500u16.to_le_bytes());
 
+        // and the item that opens the chest, which is spent by nothing
+        let r = &mut raw[CHEST_KEY as usize * RECORD_SIZE..(CHEST_KEY as usize + 1) * RECORD_SIZE];
+        r[field::NAME.start] = b'x';
+        r[field::ITEM_TYPE..field::ITEM_TYPE + 2]
+            .copy_from_slice(&ITEM_TYPE_STORAGE_OPEN.to_le_bytes());
+
         ItemList::decode(&raw).expect("the fixture table is malformed")
     }
 
@@ -4289,10 +4556,26 @@ mod tests {
     const POTION: u16 = 4351;
 
     /// A session standing in the world, ready to talk to somebody.
+    ///
+    /// It carries the six bags every character is created with. Without them
+    /// the bag has no unlocked pages and nothing in it can be dragged, which
+    /// is true of the real thing too -- these fixtures build a character the
+    /// short way round and would otherwise be one nobody could ever have.
     async fn in_world(state: &State) -> Session {
         let mut session = logged_in(state).await;
         handle_message(state, &mut session, &enter_world(0)).await;
         handle_client_ready(state, &mut session);
+        if let Some(character) = session.character.as_mut() {
+            for slot in creation::BAG_SLOTS {
+                let _ = character.items.put(Item {
+                    container: inventory::BAG,
+                    slot,
+                    index: creation::BAG_ITEM,
+                    refine: 1,
+                    ..Item::default()
+                });
+            }
+        }
         session
     }
 
@@ -4303,6 +4586,19 @@ mod tests {
             time: 0,
             body: dialog::OpenNpc { npc, option, extra: 0 }.to_body(),
         }
+    }
+
+    /// Whether the character is carrying nothing but the bags it was made
+    /// with, which is what "the bag is empty" means once a fixture is a
+    /// character somebody could really have.
+    fn carries_nothing(session: &Session) -> bool {
+        session
+            .character
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.index == creation::BAG_ITEM)
     }
 
     fn frames_of(action: Action) -> Vec<Vec<u8>> {
@@ -4746,7 +5042,7 @@ mod tests {
         assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
         assert_eq!(message_text(&frames[0]), "You are too far from the shop.");
         assert_eq!(session.character.as_ref().unwrap().gold, 2000, "gold was taken anyway");
-        assert!(session.character.as_ref().unwrap().items.is_empty());
+        assert!(carries_nothing(&session), "an item was handed over anyway");
     }
 
     /// An npc id nobody has is refused rather than crashing a lookup.
@@ -4820,7 +5116,7 @@ mod tests {
         let character = session.character.as_ref().unwrap();
         assert_eq!(character.gold, 840, "20 potions back at a fifth of 10");
         assert!(character.gold < 1000, "the round trip made money");
-        assert!(character.items.is_empty(), "the stack is still in the bag");
+        assert!(carries_nothing(&session), "the stack is still in the bag");
     }
 
     /// The field order, pinned against the record rather than against my
@@ -5115,6 +5411,255 @@ mod tests {
         assert_eq!(u32::from_le_bytes(message.body[0..4].try_into().unwrap()), 180);
 
         assert!(mine_rx.try_recv().is_err(), "the sender heard its own turn");
+    }
+
+    /// A `0x70F` the way the client sends one.
+    fn drag(from: (u8, u16), to: (u8, u16)) -> Message {
+        Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_MOVE_ITEM,
+            time: 0,
+            body: MoveItem {
+                to_container: to.0 as u16,
+                to_slot: to.1,
+                from_container: from.0 as u16,
+                from_slot: from.1,
+            }
+            .to_body(),
+        }
+    }
+
+    /// Opens the chest the way the client does, by using the item that opens
+    /// it, and hands back the frames that came out.
+    async fn open_the_chest(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+        let slot = 40;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                container: inventory::BAG,
+                slot,
+                index: CHEST_KEY,
+                refine: 1,
+                ..Item::default()
+            })
+            .unwrap();
+        let use_it = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_USE_ITEM,
+            time: 0,
+            body: UseItem { container: inventory::BAG as u32, slot: slot as u32, argument: 0 }
+                .to_body(),
+        };
+        frames_of(handle_message(state, session, &use_it).await)
+    }
+
+    /// The item of type 226 in the fixture table.
+    const CHEST_KEY: u16 = 4400;
+
+    /// The chest comes over in one packet, followed by the signal that opens
+    /// its window and the two pran slots the original sends on their own.
+    #[tokio::test]
+    async fn using_the_key_opens_the_chest() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+
+        let frames = open_the_chest(&state, &mut session).await;
+
+        assert_eq!(
+            opcodes(&frames),
+            vec![OP_STORAGE, OP_STORAGE_OPEN, shop::OP_REFRESH_ITEM, shop::OP_REFRESH_ITEM]
+        );
+        assert_eq!(frames[0].len(), STORAGE_SIZE, "the chest packet is the wrong size");
+
+        // The four vaults an account is created with are in it.
+        let chest = decode(&frames[0]);
+        for slot in inventory::STORAGE_PAGE_ITEMS {
+            let at = 12 + slot as usize * character_offset::ITEM_SIZE;
+            assert_eq!(
+                u16::from_le_bytes(chest.body[at..at + 2].try_into().unwrap()),
+                creation::VAULT_ITEM,
+                "no vault in slot {slot}, so the page is locked"
+            );
+        }
+        assert_eq!(session.opened_option, OPTION_STORAGE, "the window was not marked open");
+    }
+
+    /// Something put in the chest by one character is there for the next one:
+    /// that is what the chest is for.
+    #[tokio::test]
+    async fn an_item_goes_into_the_chest_and_comes_back() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        open_the_chest(&state, &mut session).await;
+
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item { index: 1000, container: inventory::BAG, slot: 7, ..Item::default() })
+            .unwrap();
+
+        handle_message(&state, &mut session, &drag((inventory::BAG, 7), (inventory::STORAGE, 3)))
+            .await;
+
+        let account = session.account.as_ref().unwrap();
+        assert_eq!(
+            account.storage.get(inventory::STORAGE, 3).map(|i| i.index),
+            Some(1000),
+            "the item did not reach the chest"
+        );
+        assert!(
+            session.character.as_ref().unwrap().items.get(inventory::BAG, 7).is_none(),
+            "the item is in the bag as well, which would duplicate it"
+        );
+
+        handle_message(&state, &mut session, &drag((inventory::STORAGE, 3), (inventory::BAG, 9)))
+            .await;
+
+        assert_eq!(
+            session.character.as_ref().unwrap().items.get(inventory::BAG, 9).map(|i| i.index),
+            Some(1000),
+            "the item did not come back"
+        );
+        assert!(session.account.as_ref().unwrap().storage.get(inventory::STORAGE, 3).is_none());
+    }
+
+    /// Putting something in needs the window open, which is the original's own
+    /// guard and stops a client stashing things it never opened a chest for.
+    #[tokio::test]
+    async fn the_chest_refuses_an_item_while_it_is_shut() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item { index: 1000, container: inventory::BAG, slot: 7, ..Item::default() })
+            .unwrap();
+
+        handle_message(&state, &mut session, &drag((inventory::BAG, 7), (inventory::STORAGE, 3)))
+            .await;
+
+        assert!(
+            session.account.as_ref().unwrap().storage.get(inventory::STORAGE, 3).is_none(),
+            "the item went into a chest nobody opened"
+        );
+        assert_eq!(
+            session.character.as_ref().unwrap().items.get(inventory::BAG, 7).map(|i| i.index),
+            Some(1000),
+            "and it left the bag on the way"
+        );
+    }
+
+    /// A page with no vault in front of it is not a place to put things. The
+    /// item has to stay where it was rather than fall down the gap.
+    #[tokio::test]
+    async fn a_locked_page_of_the_chest_refuses_an_item() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        open_the_chest(&state, &mut session).await;
+
+        // Take the vault that unlocks the second page away.
+        let account = session.account.as_mut().unwrap();
+        account.storage.take(inventory::STORAGE, 81).unwrap();
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item { index: 1000, container: inventory::BAG, slot: 7, ..Item::default() })
+            .unwrap();
+
+        handle_message(&state, &mut session, &drag((inventory::BAG, 7), (inventory::STORAGE, 25)))
+            .await;
+
+        assert!(
+            session.account.as_ref().unwrap().storage.get(inventory::STORAGE, 25).is_none(),
+            "an item landed on a page that was never unlocked"
+        );
+        assert_eq!(
+            session.character.as_ref().unwrap().items.get(inventory::BAG, 7).map(|i| i.index),
+            Some(1000),
+            "and it was lost on the way"
+        );
+    }
+
+    /// A vault is the reason a page exists; dragging it away would take the
+    /// page with it.
+    #[tokio::test]
+    async fn a_vault_cannot_be_dragged_out_of_the_chest() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        open_the_chest(&state, &mut session).await;
+
+        handle_message(&state, &mut session, &drag((inventory::STORAGE, 80), (inventory::BAG, 9)))
+            .await;
+
+        assert_eq!(
+            session.account.as_ref().unwrap().storage.get(inventory::STORAGE, 80).map(|i| i.index),
+            Some(creation::VAULT_ITEM),
+            "the vault left the chest and took its page with it"
+        );
+    }
+
+    /// Gold moves both ways on one packet, the sign saying which.
+    #[tokio::test]
+    async fn gold_goes_into_the_chest_and_comes_out_again() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        let purse = session.character.as_ref().unwrap().gold;
+
+        let deposit = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_CHEST_GOLD,
+            time: 0,
+            body: chest_gold_body(CHEST_TYPE_STORAGE, 500),
+        };
+        handle_message(&state, &mut session, &deposit).await;
+
+        assert_eq!(session.account.as_ref().unwrap().storage_gold, 500);
+        assert_eq!(session.character.as_ref().unwrap().gold, purse - 500);
+
+        let withdraw = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_CHEST_GOLD,
+            time: 0,
+            body: chest_gold_body(CHEST_TYPE_STORAGE, -200),
+        };
+        handle_message(&state, &mut session, &withdraw).await;
+
+        assert_eq!(session.account.as_ref().unwrap().storage_gold, 300);
+        assert_eq!(session.character.as_ref().unwrap().gold, purse - 300);
+    }
+
+    /// Taking out gold that is not there would be money from nowhere.
+    #[tokio::test]
+    async fn the_chest_refuses_gold_it_does_not_have() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        let purse = session.character.as_ref().unwrap().gold;
+
+        let withdraw = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_CHEST_GOLD,
+            time: 0,
+            body: chest_gold_body(CHEST_TYPE_STORAGE, -1),
+        };
+        handle_message(&state, &mut session, &withdraw).await;
+
+        assert_eq!(session.account.as_ref().unwrap().storage_gold, 0);
+        assert_eq!(session.character.as_ref().unwrap().gold, purse, "gold appeared from nowhere");
+    }
+
+    fn chest_gold_body(chest: u32, value: i64) -> Vec<u8> {
+        let mut body = chest.to_le_bytes().to_vec();
+        body.extend_from_slice(&value.to_le_bytes());
+        body
     }
 
     /// A `0x304` the way the client sends one.
@@ -5619,7 +6164,7 @@ mod tests {
     #[tokio::test]
     async fn a_monster_nearby_is_on_screen_on_arrival() {
         let state = fight_state();
-        let mut session = in_world(&state).await;
+        let session = in_world(&state).await;
 
         assert!(session.visible_mobs.contains(&RAT), "the monster never appeared");
     }
@@ -6229,7 +6774,7 @@ mod tests {
         // with an empty drop table nothing can drop, which is the case that
         // has to not crash
         kill_the_rat(&state, &mut session).await;
-        assert!(session.character.as_ref().unwrap().items.is_empty());
+        assert!(carries_nothing(&session), "something dropped from an empty table");
     }
 
     /// Gear is what makes a character hit harder, which is the whole point of

@@ -101,6 +101,29 @@ pub const TOWN_SECOND: (u32, u32) = (3470, 935);
 pub const BAG_ITEM: u16 = 5300;
 pub const BAG_SLOTS: std::ops::RangeInclusive<u16> = 120..=125;
 
+/// The vaults that unlock the chest's four pages, put there in the same breath
+/// as the bags (`PacketHandlers.pas:630`). Note the asymmetry, which is the
+/// original's: a bag is given an appearance and a refine of one, a vault only
+/// its index.
+pub const VAULT_ITEM: u16 = 5310;
+
+/// The chest as an account starts with it: four vaults and nothing else.
+///
+/// It sits here rather than in `create` because the chest belongs to the
+/// account, not to the character being made — but this is where the original
+/// fills it, so a chest with no vaults in it is one nobody could ever put
+/// anything into.
+pub fn starting_storage() -> crate::inventory::Inventory {
+    crate::inventory::STORAGE_PAGE_ITEMS
+        .map(|slot| Item {
+            container: crate::inventory::STORAGE,
+            slot,
+            index: VAULT_ITEM,
+            ..Item::default()
+        })
+        .collect()
+}
+
 /// Ammunition, and the two classes that get it.
 ///
 /// Only the two that shoot: the Atirador takes rifle rounds and the

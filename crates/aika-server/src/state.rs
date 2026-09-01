@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::store::{AccountStore, Character};
+use crate::store::{Account, AccountStore, Character};
 use crate::world::World;
 use aika_data::itemlist::ItemList;
 use aika_data::mobs::MobTable;
@@ -114,6 +114,19 @@ impl State {
         let Some(db) = &self.db else { return };
         if let Err(e) = db.save_session(character).await {
             warn!(character = %character.name, error = %e, "could not save the session");
+        }
+    }
+
+    /// Writes the chest, which belongs to the account rather than to the
+    /// character and so is saved beside the session rather than inside it.
+    pub async fn save_storage(&self, account: &Account) {
+        self.store.update_storage(account);
+
+        let Some(db) = &self.db else { return };
+        if let Err(e) =
+            db.save_storage(account.id as i64, account.storage_gold, &account.storage).await
+        {
+            warn!(account = %account.username, error = %e, "could not save the chest");
         }
     }
 

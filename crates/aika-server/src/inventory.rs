@@ -19,6 +19,9 @@ use crate::store::Item;
 pub const EQUIP_SLOTS: u16 = 16;
 /// Bag slots, from `Inventory: Array [0 .. 125] of TITEM`.
 pub const BAG_SLOTS: u16 = 126;
+/// Storage slots, from `Itens: Array [0 .. 85] of TITEM`
+/// (`TStoragePlayer`, `Data/PlayerData.pas:376`).
+pub const STORAGE_SLOTS: u16 = 86;
 
 /// Which container a slot belongs to. The numbers are the `TypeSlot` the
 /// protocol carries and the `container` column the database stores.
@@ -31,7 +34,50 @@ pub fn capacity(container: u8) -> Option<u16> {
     match container {
         EQUIP => Some(EQUIP_SLOTS),
         BAG => Some(BAG_SLOTS),
+        STORAGE => Some(STORAGE_SLOTS),
         _ => None,
+    }
+}
+
+/// How many slots one page of a container holds. Both the bag and the storage
+/// are unlocked twenty at a time.
+const PAGE: u16 = 20;
+
+/// The bag and the storage each keep the items that unlock their pages in the
+/// slots past the usable ones: the six bags at 120 to 125 and the four vaults
+/// at 80 to 83 (`MoveItem`, `PacketHandlers.pas:5376`). Those slots are not
+/// places to put things; they are the reason the places exist.
+pub const BAG_PAGE_ITEMS: std::ops::RangeInclusive<u16> = 120..=125;
+pub const STORAGE_PAGE_ITEMS: std::ops::RangeInclusive<u16> = 80..=83;
+/// The last two storage slots hold prans and nothing else.
+pub const STORAGE_PRAN_SLOTS: [u16; 2] = [84, 85];
+
+/// Which slot holds the item that unlocks the page this one is on, or `None`
+/// for a slot that needs no unlocking.
+///
+/// This is what stops an item being dropped into a page the player has not
+/// bought: the original looks the unlocking item up on both sides of a move
+/// and refuses when its slot is empty. Equipment has no pages.
+pub fn page_item_for(container: u8, slot: u16) -> Option<u16> {
+    match container {
+        BAG if slot < *BAG_PAGE_ITEMS.start() => {
+            Some(BAG_PAGE_ITEMS.start() + slot / PAGE)
+        }
+        STORAGE if slot < *STORAGE_PAGE_ITEMS.start() => {
+            Some(STORAGE_PAGE_ITEMS.start() + slot / PAGE)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a slot holds a page-unlocking item, which cannot itself be dragged
+/// anywhere: the original leaves the range that reaches them unhandled and
+/// falls out of `MoveItem`.
+pub fn is_page_item(container: u8, slot: u16) -> bool {
+    match container {
+        BAG => BAG_PAGE_ITEMS.contains(&slot),
+        STORAGE => STORAGE_PAGE_ITEMS.contains(&slot),
+        _ => false,
     }
 }
 
@@ -175,6 +221,39 @@ impl Inventory {
         Ok(())
     }
 
+    /// Moves an item out of this inventory into another one, swapping when the
+    /// destination is taken.
+    ///
+    /// The storage belongs to the account and the bag to the character, so a
+    /// move between the two crosses two of these. Same two-step as
+    /// [`Inventory::move_item`]: both sides come out before either goes back,
+    /// so nothing can end up in two places at once.
+    pub fn move_into(
+        &mut self,
+        from: (u8, u16),
+        other: &mut Inventory,
+        to: (u8, u16),
+    ) -> Result<(), InventoryError> {
+        let within = capacity(to.0).is_some_and(|c| to.1 < c);
+        if !within {
+            return Err(InventoryError::NoSuchSlot { container: to.0, slot: to.1 });
+        }
+
+        let mut moving = self.take(from.0, from.1)?;
+        let displaced = other.take(to.0, to.1).ok();
+
+        moving.container = to.0;
+        moving.slot = to.1;
+        other.put(moving)?;
+
+        if let Some(mut displaced) = displaced {
+            displaced.container = from.0;
+            displaced.slot = from.1;
+            self.put(displaced)?;
+        }
+        Ok(())
+    }
+
     /// How many free slots the bag has, which is what a purchase checks.
     pub fn free_slots(&self, container: u8) -> u16 {
         let Some(capacity) = capacity(container) else {
@@ -309,7 +388,7 @@ mod tests {
             inv.put(item(1000, EQUIP, EQUIP_SLOTS)),
             Err(InventoryError::NoSuchSlot { container: EQUIP, slot: EQUIP_SLOTS })
         );
-        assert!(inv.put(item(1000, STORAGE, 0)).is_err(), "storage is not modelled yet");
+        assert!(inv.put(item(1000, STORAGE, STORAGE_SLOTS)).is_err(), "past the end of the chest");
     }
 
     #[test]

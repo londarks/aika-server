@@ -25,6 +25,12 @@ pub struct Account {
     pub ban_days: u32,
     /// Three at most, one per slot on the selection screen.
     pub characters: Vec<Character>,
+    /// The chest, which belongs to the account and not to any one character:
+    /// `Account.Header.Storage`. That is what makes it useful — it is how a
+    /// player hands something from one of their characters to another.
+    pub storage: Inventory,
+    /// Gold kept in the chest, separate from what any character carries.
+    pub storage_gold: u64,
     pub last_token: Option<String>,
     pub last_token_at: Option<Instant>,
 }
@@ -277,6 +283,8 @@ impl Account {
             account_status: entry.account_status,
             ban_days: entry.ban_days,
             characters: entry.characters.iter().map(Character::from).collect(),
+            storage: crate::creation::starting_storage(),
+            storage_gold: 0,
             last_token: None,
             last_token_at: None,
         })
@@ -341,6 +349,18 @@ impl AccountStore {
             }
         }
         false
+    }
+
+    /// Copies a session's chest back over the stored account, so the next
+    /// character to log in on the same account finds what the last one left.
+    pub fn update_storage(&self, updated: &Account) -> bool {
+        let mut accounts = self.accounts.lock().unwrap();
+        let Some(account) = accounts.get_mut(&updated.username) else {
+            return false;
+        };
+        account.storage = updated.storage.clone();
+        account.storage_gold = updated.storage_gold;
+        true
     }
 
     /// Whether any account already has a character by this name. Names are

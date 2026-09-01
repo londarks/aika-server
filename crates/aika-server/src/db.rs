@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     nation         INTEGER NOT NULL DEFAULT 0,
     account_status INTEGER NOT NULL DEFAULT 0,
     ban_days       INTEGER NOT NULL DEFAULT 0,
+    storage_gold   INTEGER NOT NULL DEFAULT 0,
     created_at     INTEGER NOT NULL
 );
 
@@ -95,6 +96,31 @@ CREATE TABLE IF NOT EXISTS items (
 );
 
 CREATE INDEX IF NOT EXISTS items_by_character ON items (character_id);
+
+-- The chest. Same columns as `items`, but owned by the account rather than by
+-- a character, because that is what it is for: handing something from one of
+-- your characters to another.
+CREATE TABLE IF NOT EXISTS storage_items (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id     INTEGER NOT NULL,
+    slot           INTEGER NOT NULL,
+    item_index     INTEGER NOT NULL,
+    appearance     INTEGER NOT NULL DEFAULT 0,
+    identific      INTEGER NOT NULL DEFAULT 0,
+    effect1_index  INTEGER NOT NULL DEFAULT 0,
+    effect2_index  INTEGER NOT NULL DEFAULT 0,
+    effect3_index  INTEGER NOT NULL DEFAULT 0,
+    effect1_value  INTEGER NOT NULL DEFAULT 0,
+    effect2_value  INTEGER NOT NULL DEFAULT 0,
+    effect3_value  INTEGER NOT NULL DEFAULT 0,
+    durability_min INTEGER NOT NULL DEFAULT 0,
+    durability_max INTEGER NOT NULL DEFAULT 0,
+    refine         INTEGER NOT NULL DEFAULT 0,
+    expires_at     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (account_id, slot)
+);
+
+CREATE INDEX IF NOT EXISTS storage_by_account ON storage_items (account_id);
 "#;
 
 pub struct Database {
@@ -137,8 +163,13 @@ impl Database {
         // database that already has the column is a "duplicate column" error,
         // which is the one error we swallow — both dialects raise it, and it
         // means the work is already done.
-        for column in ["skill_list BLOB", "item_bar BLOB", "skill_points INTEGER NOT NULL DEFAULT 0"] {
-            let sql = format!("ALTER TABLE characters ADD COLUMN {column}");
+        for (table, column) in [
+            ("characters", "skill_list BLOB"),
+            ("characters", "item_bar BLOB"),
+            ("characters", "skill_points INTEGER NOT NULL DEFAULT 0"),
+            ("accounts", "storage_gold INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let sql = format!("ALTER TABLE {table} ADD COLUMN {column}");
             if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
                 let text = e.to_string().to_ascii_lowercase();
                 if !text.contains("duplicate column") {
@@ -166,6 +197,10 @@ impl Database {
         for entry in accounts {
             let account = Account::from_dev(entry, 0)?;
             let account_id = self.insert_account(&account).await?;
+            // The chest belongs to the account, so it is written here rather
+            // than once per character, and it is written even though it holds
+            // only the vaults: those are what its pages are unlocked by.
+            self.save_storage(account_id, account.storage_gold, &account.storage).await?;
             for character in &account.characters {
                 self.insert_character(account_id, character).await?;
             }
@@ -244,10 +279,18 @@ impl Database {
 
     /// Every account with its characters and their items.
     pub async fn load_accounts(&self) -> Result<Vec<Account>> {
-        let rows = sqlx::query("SELECT * FROM accounts ORDER BY id")
-            .fetch_all(&self.pool)
-            .await
-            .context("loading accounts")?;
+        // The columns are named rather than starred. A `SELECT *` prepared in
+        // the same process that just added a column through ALTER TABLE hands
+        // back a row with the old width while claiming the new one, and reading
+        // the added column then panics inside the driver rather than failing.
+        let rows = sqlx::query(
+            "SELECT id, username, password_hash, nation, account_status, ban_days,
+                    storage_gold
+             FROM accounts ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("loading accounts")?;
 
         let mut accounts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -260,6 +303,8 @@ impl Database {
                 account_status: row.try_get::<i64, _>("account_status")? as u8,
                 ban_days: row.try_get::<i64, _>("ban_days")? as u32,
                 characters: self.load_characters(id).await?,
+                storage: self.load_storage(id).await?,
+                storage_gold: row.try_get::<i64, _>("storage_gold").unwrap_or(0) as u64,
                 last_token: None,
                 last_token_at: None,
             });
@@ -268,8 +313,13 @@ impl Database {
     }
 
     async fn load_characters(&self, account_id: i64) -> Result<Vec<Character>> {
+        // Named for the same reason the account columns are.
         let rows = sqlx::query(
-            "SELECT * FROM characters
+            "SELECT id, slot, name, nation, class_index, hair, level, exp, gold,
+                    x, y, speed_move, height, torso, legs, body,
+                    strength, agility, intellect, constitution, luck, free_points,
+                    skill_list, item_bar, skill_points
+             FROM characters
              WHERE account_id = ? AND deleted_at IS NULL
              ORDER BY slot",
         )
@@ -357,6 +407,112 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    /// The account's chest. Its rows carry no container: every one of them is
+    /// in the storage, which is the whole point of the separate table.
+    ///
+    /// Nothing at all means a chest that was never written — an account made
+    /// before there was a table to write it to. It comes back with the vaults
+    /// a new one is given, because a chest with no vaults has no unlocked
+    /// pages and is a chest nobody could ever put anything in. A chest that
+    /// has been used cannot look like this: the vaults are the one thing in it
+    /// that cannot be taken out.
+    pub async fn load_storage(&self, account_id: i64) -> Result<Inventory> {
+        let rows = sqlx::query("SELECT * FROM storage_items WHERE account_id = ? ORDER BY slot")
+            .bind(account_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("loading the storage")?;
+
+        if rows.is_empty() {
+            return Ok(crate::creation::starting_storage());
+        }
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(Item {
+                    container: crate::inventory::STORAGE,
+                    slot: row.try_get::<i64, _>("slot")? as u16,
+                    index: row.try_get::<i64, _>("item_index")? as u16,
+                    appearance: row.try_get::<i64, _>("appearance")? as u16,
+                    identific: row.try_get::<i64, _>("identific")? as i32,
+                    effect_index: [
+                        row.try_get::<i64, _>("effect1_index")? as u8,
+                        row.try_get::<i64, _>("effect2_index")? as u8,
+                        row.try_get::<i64, _>("effect3_index")? as u8,
+                    ],
+                    effect_value: [
+                        row.try_get::<i64, _>("effect1_value")? as u8,
+                        row.try_get::<i64, _>("effect2_value")? as u8,
+                        row.try_get::<i64, _>("effect3_value")? as u8,
+                    ],
+                    durability_min: row.try_get::<i64, _>("durability_min")? as u8,
+                    durability_max: row.try_get::<i64, _>("durability_max")? as u8,
+                    refine: row.try_get::<i64, _>("refine")? as u16,
+                    expires_at: row.try_get::<i64, _>("expires_at")? as u16,
+                })
+            })
+            .collect()
+    }
+
+    /// Writes the chest and the gold in it. One call and one transaction: a
+    /// crash between the two would move an item without moving what paid for
+    /// the space, or worse, lose it.
+    pub async fn save_storage(
+        &self,
+        account_id: i64,
+        gold: u64,
+        storage: &Inventory,
+    ) -> Result<usize> {
+        let mut tx = self.pool.begin().await.context("saving the storage")?;
+
+        sqlx::query("UPDATE accounts SET storage_gold = ? WHERE id = ?")
+            .bind(gold as i64)
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await
+            .context("saving the storage gold")?;
+
+        sqlx::query("DELETE FROM storage_items WHERE account_id = ?")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await
+            .context("clearing the old storage")?;
+
+        let mut written = 0;
+        for item in storage.iter().filter(|i| !i.is_empty()) {
+            sqlx::query(
+                "INSERT INTO storage_items
+                   (account_id, slot, item_index, appearance, identific,
+                    effect1_index, effect2_index, effect3_index,
+                    effect1_value, effect2_value, effect3_value,
+                    durability_min, durability_max, refine, expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(account_id)
+            .bind(item.slot as i64)
+            .bind(item.index as i64)
+            .bind(item.appearance as i64)
+            .bind(item.identific as i64)
+            .bind(item.effect_index[0] as i64)
+            .bind(item.effect_index[1] as i64)
+            .bind(item.effect_index[2] as i64)
+            .bind(item.effect_value[0] as i64)
+            .bind(item.effect_value[1] as i64)
+            .bind(item.effect_value[2] as i64)
+            .bind(item.durability_min as i64)
+            .bind(item.durability_max as i64)
+            .bind(item.refine as i64)
+            .bind(item.expires_at as i64)
+            .execute(&mut *tx)
+            .await
+            .context("writing a storage item")?;
+            written += 1;
+        }
+
+        tx.commit().await.context("committing the storage")?;
+        Ok(written)
     }
 
     /// Saves where a character stands, which is what makes a player log back
@@ -888,6 +1044,39 @@ mod tests {
         // an empty item clears the slot
         db.put_item(id, &Item { index: 0, ..sword }).await.unwrap();
         assert!(db.load_items(id).await.unwrap().is_empty());
+    }
+
+    /// The chest is the account's, so it has to come back for whichever
+    /// character logs in next — with its gold, which is not the purse.
+    #[tokio::test]
+    async fn the_chest_and_its_gold_survive_a_reload() {
+        let db = memory_db().await;
+        db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
+        let account_id = db.load_accounts().await.unwrap()[0].id as i64;
+
+        // A seeded account starts with the four vaults and nothing else.
+        let mut storage = db.load_storage(account_id).await.unwrap();
+        assert_eq!(
+            storage.in_container(crate::inventory::STORAGE).count(),
+            crate::inventory::STORAGE_PAGE_ITEMS.count(),
+            "a fresh chest has no vaults, so none of its pages open"
+        );
+
+        storage
+            .put(Item {
+                container: crate::inventory::STORAGE,
+                slot: 3,
+                index: 4314,
+                refine: 2,
+                ..Item::default()
+            })
+            .unwrap();
+        db.save_storage(account_id, 12_345, &storage).await.unwrap();
+
+        let account = &db.load_accounts().await.unwrap()[0];
+        assert_eq!(account.storage_gold, 12_345, "the chest gold did not come back");
+        let kept = account.storage.get(crate::inventory::STORAGE, 3).expect("slot 3 came back empty");
+        assert_eq!((kept.index, kept.refine), (4314, 2));
     }
 
     #[tokio::test]

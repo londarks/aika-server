@@ -164,6 +164,22 @@ pub fn belongs_to(class_number: u32, id: usize) -> bool {
     (start..start + IDS_PER_CLASS).contains(&id)
 }
 
+/// Which slot of the record's sixty-word skill list a skill id belongs to.
+///
+/// The sixteen ranks of one slot are consecutive ids starting one past the
+/// slot's base, so the slot is the id's distance from the class block divided
+/// by sixteen. Slots zero to five are the basic skills and six to forty-five
+/// the advanced ones, which is exactly how the record is laid out. `None` for
+/// an id that is not this class's or lands past the sixty slots.
+pub fn record_slot(class_number: u32, id: usize) -> Option<usize> {
+    if !belongs_to(class_number, id) {
+        return None;
+    }
+    let offset = id.checked_sub(class_block(class_number) + 1)?;
+    let slot = offset / RANKS_PER_SLOT;
+    (slot < SLOTS_PER_CLASS).then_some(slot)
+}
+
 /// The skills a character of this class starts with, in slot order: the six
 /// basic ones, then the forty the bar carries.
 ///

@@ -83,6 +83,31 @@ pub struct Character {
     pub y: u32,
     /// Everything the character carries, across every container.
     pub items: Inventory,
+    /// The skills the character knows, as the client reads them from the
+    /// record: sixty slots, zero for empty. Kept as laid out so the client's
+    /// own packing is preserved.
+    pub skill_list: [u16; 60],
+    /// The hotbar: forty action-bar slots, mostly empty. What the template
+    /// puts here is what the player sees on the bar the first time they log
+    /// in, and it is saved so a rearranged bar survives a logout.
+    pub item_bar: [u32; 40],
+    /// Unspent skill points. One is earned per level; learning a skill spends
+    /// what that skill costs. The client shows this in the skill window.
+    pub skill_points: u16,
+}
+
+/// How many skill points a character of a given level has earned in total
+/// (`TPlayer.CalcSkillPoints`): one per level, and below the cap of fifty that
+/// is the whole story.
+pub fn skill_points_for(level: u16) -> u16 {
+    let mut points = 0u16;
+    for l in 1..=level {
+        points = points.saturating_add(1);
+        if l > 50 && l % 10 == 1 {
+            points = points.saturating_add(7);
+        }
+    }
+    points
 }
 
 /// Where a brand new character appears.
@@ -144,6 +169,9 @@ impl From<&DevCharacter> for Character {
             x: dev.x.unwrap_or(CITY_SPAWN.0),
             y: dev.y.unwrap_or(CITY_SPAWN.1),
             items: Inventory::new(),
+            skill_list: [0; 60],
+            item_bar: [0; 40],
+            skill_points: skill_points_for(dev.level),
         }
     }
 }

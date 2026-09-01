@@ -122,6 +122,37 @@ fn ammunition_for(class_number: u16) -> Option<u16> {
     }
 }
 
+/// The marker the original writes for a learned basic skill
+/// (`SetPlayerSkills`). The client reads this out of the record to decide the
+/// skill may be cast; anything else and it treats the skill as unlearned.
+const BASIC_LEARNED: u16 = 2;
+
+/// Builds the record's skill list the way `TPlayer.SetPlayerSkills` does,
+/// rather than copying the template's stored bytes.
+///
+/// The template's `skills()` table says, for each of the six basic and forty
+/// advanced slots, what rank the character has learned. This turns that into
+/// the sixty-slot array the client reads: a learned basic is `2`, a learned
+/// advanced skill carries its level in slots six and up, and everything else
+/// stays zero.
+fn skill_list_from(template: &Template) -> [u16; 60] {
+    let mut list = [0u16; 60];
+    let learned = template.skills();
+
+    for i in 0..aika_data::template::BASIC_SKILLS {
+        if learned[i].rank != 0 {
+            list[i] = BASIC_LEARNED;
+        }
+    }
+    for i in 0..aika_data::template::OTHER_SKILLS {
+        let entry = learned[aika_data::template::BASIC_SKILLS + i];
+        if entry.rank != 0 {
+            list[aika_data::template::BASIC_SKILLS + i] = entry.rank;
+        }
+    }
+    list
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateError {
     NoFreeSlot,
@@ -286,15 +317,28 @@ pub fn create(
         x,
         y,
         items: Default::default(),
+        skill_list: [0; 60],
+        item_bar: [0; 40],
+        skill_points: crate::store::skill_points_for(1),
     };
 
     // Everything a class is born with comes from its template. Without one
     // the character is still playable, just naked and with flat attributes.
     if let Some(template) = template {
         character.level = template.level().max(1);
+        character.skill_points = crate::store::skill_points_for(character.level);
         character.sizes = template.sizes();
         character.attributes = template.attributes();
         character.gold = template.gold();
+        // The icons already on its bar, straight from the template.
+        character.item_bar = template.item_bar();
+        // And the record's skill list, which is not copied but *built* — the
+        // original computes it in `TPlayer.SetPlayerSkills` rather than
+        // trusting the stored bytes. A learned basic is marked `2`; a learned
+        // advanced skill carries its level. Without these markers the client
+        // treats the skill as unlearned and cancels the cast, which is why a
+        // fresh character's basic attack did nothing.
+        character.skill_list = skill_list_from(template);
 
         for item in template.equipment() {
             let _ = character.items.put(from_template(item, crate::inventory::EQUIP));
@@ -493,6 +537,36 @@ mod tests {
             character.items.get(crate::inventory::EQUIP, AMMO_SLOT).map(|i| i.index),
             Some(4615)
         );
+
+        // The bar carries the template's icon, and the record marks the basic
+        // skills learned so the client lets the player cast them. The
+        // Atirador template learns its six basics at rank one.
+        assert_ne!(character.item_bar, [0; 40], "the action bar came up empty");
+        assert_eq!(
+            &character.skill_list[0..6],
+            &[2, 2, 2, 2, 2, 2],
+            "the basic skills are not marked learned, so the client cancels the cast"
+        );
+    }
+
+    /// The skill list is computed, not copied: a learned basic is `2` and the
+    /// advanced slots stay empty until they are earned.
+    #[test]
+    fn the_skill_list_marks_learned_basics() {
+        use aika_data::template::{Template, BASIC_SKILLS, CHARACTER_AT, FILE_SIZE, SKILLS_AT};
+
+        let mut raw = vec![0u8; FILE_SIZE];
+        raw[CHARACTER_AT + aika_data::template::field::CLASS_INFO] = 21;
+        // four basics learned at rank one, two left unlearned
+        for i in 0..4 {
+            raw[SKILLS_AT + i * 4..SKILLS_AT + i * 4 + 2].copy_from_slice(&(1921u16).to_le_bytes());
+            raw[SKILLS_AT + i * 4 + 2..SKILLS_AT + i * 4 + 4].copy_from_slice(&1u16.to_le_bytes());
+        }
+        let template = Template::decode(&raw).unwrap();
+
+        let list = skill_list_from(&template);
+        assert_eq!(&list[0..BASIC_SKILLS], &[2, 2, 2, 2, 0, 0], "only learned basics are marked");
+        assert!(list[BASIC_SKILLS..].iter().all(|&v| v == 0), "no advanced skill is learned");
     }
 
     #[test]

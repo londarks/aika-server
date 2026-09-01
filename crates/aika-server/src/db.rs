@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS characters (
     constitution INTEGER NOT NULL DEFAULT 0,
     luck         INTEGER NOT NULL DEFAULT 0,
     free_points  INTEGER NOT NULL DEFAULT 0,
+    skill_list   BLOB,
+    item_bar     BLOB,
+    skill_points INTEGER NOT NULL DEFAULT 0,
     created_at   INTEGER NOT NULL,
     deleted_at   INTEGER,
     UNIQUE (account_id, slot)
@@ -127,6 +130,22 @@ impl Database {
                 .await
                 .with_context(|| format!("applying schema: {}", statement.trim()))?;
         }
+
+        // Columns added after the first release. A database made before them
+        // has the rest of the schema already, so `CREATE TABLE IF NOT EXISTS`
+        // leaves it untouched and these fill the gap. Re-running them on a
+        // database that already has the column is a "duplicate column" error,
+        // which is the one error we swallow — both dialects raise it, and it
+        // means the work is already done.
+        for column in ["skill_list BLOB", "item_bar BLOB", "skill_points INTEGER NOT NULL DEFAULT 0"] {
+            let sql = format!("ALTER TABLE characters ADD COLUMN {column}");
+            if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
+                let text = e.to_string().to_ascii_lowercase();
+                if !text.contains("duplicate column") {
+                    return Err(anyhow::Error::new(e).context(format!("adding {column}")));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -180,8 +199,9 @@ impl Database {
             "INSERT INTO characters
                  (account_id, slot, name, nation, class_index, hair, level, exp, gold,
                   x, y, speed_move, height, torso, legs, body,
-                  strength, agility, intellect, constitution, luck, free_points, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  strength, agility, intellect, constitution, luck, free_points,
+                  skill_list, item_bar, skill_points, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              RETURNING id",
         )
         .bind(account_id)
@@ -206,6 +226,9 @@ impl Database {
         .bind(character.attributes[3] as i64)
         .bind(character.attributes[4] as i64)
         .bind(character.attributes[5] as i64)
+        .bind(pack_u16(&character.skill_list))
+        .bind(pack_u32(&character.item_bar))
+        .bind(character.skill_points as i64)
         .bind(now())
         .fetch_one(&self.pool)
         .await
@@ -285,6 +308,15 @@ impl Database {
                     row.try_get::<i64, _>("luck")? as u16,
                     row.try_get::<i64, _>("free_points")? as u16,
                 ],
+                skill_list: unpack_u16(row.try_get::<Option<Vec<u8>>, _>("skill_list")?),
+                item_bar: unpack_u32(row.try_get::<Option<Vec<u8>>, _>("item_bar")?),
+                skill_points: match row.try_get::<i64, _>("skill_points") {
+                    Ok(points) => points as u16,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "skill_points column not read, defaulting to 0");
+                        0
+                    }
+                },
                 items: self.load_items(id).await?.into(),
             });
         }
@@ -475,14 +507,21 @@ impl Database {
     /// What a session leaves behind: where the character stood, what it holds
     /// and how much it has. One call so a disconnect cannot save half of it.
     pub async fn save_session(&self, character: &Character) -> Result<()> {
-        sqlx::query("UPDATE characters SET x = ?, y = ?, gold = ? WHERE id = ?")
-            .bind(character.x as i64)
-            .bind(character.y as i64)
-            .bind(character.gold as i64)
-            .bind(character.id)
-            .execute(&self.pool)
-            .await
-            .context("saving the character")?;
+        sqlx::query(
+            "UPDATE characters SET x = ?, y = ?, gold = ?, skill_list = ?, item_bar = ?,
+                 skill_points = ?
+             WHERE id = ?",
+        )
+        .bind(character.x as i64)
+        .bind(character.y as i64)
+        .bind(character.gold as i64)
+        .bind(pack_u16(&character.skill_list))
+        .bind(pack_u32(&character.item_bar))
+        .bind(character.skill_points as i64)
+        .bind(character.id)
+        .execute(&self.pool)
+        .await
+        .context("saving the character")?;
 
         self.save_inventory(character.id, &character.items).await?;
         Ok(())
@@ -540,6 +579,41 @@ impl Database {
 /// SQLite and MySQL.
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// The skill list and the hotbar are fixed-size arrays of little numbers.
+/// Rather than a column each — sixty and forty of them — they are stored as
+/// one blob of little-endian bytes, which is portable between SQLite and
+/// MySQL and reads back into the same array.
+fn pack_u16<const N: usize>(values: &[u16; N]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn pack_u32<const N: usize>(values: &[u32; N]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// Reads a blob back into a fixed array. A missing or short blob — an older
+/// row, a NULL — fills what it can and leaves the rest zero, so a character
+/// saved before these columns existed simply comes back with an empty bar.
+fn unpack_u16<const N: usize>(blob: Option<Vec<u8>>) -> [u16; N] {
+    let bytes = blob.unwrap_or_default();
+    std::array::from_fn(|i| {
+        bytes
+            .get(i * 2..i * 2 + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .unwrap_or(0)
+    })
+}
+
+fn unpack_u32<const N: usize>(blob: Option<Vec<u8>>) -> [u32; N] {
+    let bytes = blob.unwrap_or_default();
+    std::array::from_fn(|i| {
+        bytes
+            .get(i * 4..i * 4 + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0)
+    })
 }
 
 /// Defaults used when seeding a character that the configuration left blank.

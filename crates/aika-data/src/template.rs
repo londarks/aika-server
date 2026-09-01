@@ -41,7 +41,7 @@ pub const BASIC_SKILLS: usize = 6;
 pub const OTHER_SKILLS: usize = 40;
 
 /// Offsets inside the `TCharacter`, the same ones the protocol uses.
-mod field {
+pub mod field {
     pub const NATION: usize = 28;
     pub const CLASS_INFO: usize = 29;
     pub const ATTRIBUTES: usize = 32;
@@ -52,6 +52,14 @@ mod field {
     pub const EQUIP: usize = 340;
     pub const INVENTORY: usize = 664;
     pub const GOLD: usize = 3184;
+    /// Sixty words the client reads as the skills the character knows
+    /// (`TCharacter.SkillList`, `Data/PlayerData.pas:236`), inside the record.
+    pub const SKILL_LIST: usize = 4596;
+    pub const SKILL_LIST_SLOTS: usize = 60;
+    /// Forty dwords: the hotbar, what sits on the action bar
+    /// (`TCharacter.ItemBar`, `Data/PlayerData.pas:238`, bytes 4716..4875).
+    pub const ITEM_BAR: usize = 4716;
+    pub const ITEM_BAR_SLOTS: usize = 40;
     pub const ITEM_SIZE: usize = 20;
     pub const EQUIP_SLOTS: usize = 16;
     pub const INVENTORY_SLOTS: usize = 126;
@@ -206,6 +214,21 @@ impl Template {
             .collect()
     }
 
+    /// The skills the character is born knowing, straight out of the record.
+    ///
+    /// Sixty slots; the class ones sit near the end (52 on). Zero means empty,
+    /// and the client packs them itself, so the gaps are kept.
+    pub fn skill_list(&self) -> [u16; field::SKILL_LIST_SLOTS] {
+        std::array::from_fn(|i| u16le(&self.raw, self.at(field::SKILL_LIST) + i * 2))
+    }
+
+    /// The hotbar as the template lays it out: forty action-bar slots, most of
+    /// them empty. This is what puts an icon on the bar the moment a character
+    /// is made, rather than an empty row.
+    pub fn item_bar(&self) -> [u32; field::ITEM_BAR_SLOTS] {
+        std::array::from_fn(|i| u32le(&self.raw, self.at(field::ITEM_BAR) + i * 4))
+    }
+
     /// The six basic skills and the forty the bar carries, in slot order,
     /// with the ranks the template gives them.
     pub fn skills(&self) -> Vec<StartingSkill> {
@@ -286,6 +309,12 @@ mod tests {
         put16(&mut raw, SKILLS_AT + 4, 1937);
         put16(&mut raw, SKILLS_AT + 6, 1);
 
+        // a class skill known in record slot 52, and one icon on the bar
+        put16(&mut raw, CHARACTER_AT + field::SKILL_LIST + 52 * 2, 15378);
+        raw[CHARACTER_AT + field::ITEM_BAR + 3 * 4
+            ..CHARACTER_AT + field::ITEM_BAR + 3 * 4 + 4]
+            .copy_from_slice(&30994u32.to_le_bytes());
+
         Template::decode(&raw).expect("the fixture is malformed")
     }
 
@@ -322,6 +351,19 @@ mod tests {
         assert_eq!(skills[0], StartingSkill { index: 1921, rank: 1 });
         assert_eq!(skills[1], StartingSkill { index: 1937, rank: 1 });
         assert_eq!(skills[2], StartingSkill { index: 0, rank: 0 }, "an empty slot");
+    }
+
+    #[test]
+    fn reads_the_hotbar_and_known_skills_out_of_the_record() {
+        let t = built();
+
+        let bar = t.item_bar();
+        assert_eq!(bar[3], 30994, "the one icon the template puts on the bar");
+        assert_eq!(bar[0], 0, "the rest of the bar is empty");
+
+        let known = t.skill_list();
+        assert_eq!(known[52], 15378, "the class skill it is born knowing");
+        assert_eq!(known[0], 0, "the early slots are empty, as the client packs them");
     }
 
     #[test]

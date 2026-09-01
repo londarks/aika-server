@@ -67,6 +67,10 @@ pub const OP_CLIENT_MESSAGE: u16 = 0x984;
 /// and the one the server echoes back to everyone who should hear it. The
 /// original dispatches it at `$F86` (`ServerSocket.pas:3696`).
 pub const OP_CHAT: u16 = 0xF86;
+/// `TChangeItemBarPacket` (`Data/Packets.pas:1118`): the player dragged
+/// something onto, off, or across the action bar. The original both reads and
+/// echoes it at `$31E` (`ServerSocket.pas:3626`, `RefreshItemBarSlot`).
+pub const OP_CHANGE_ITEM_BAR: u16 = 0x31E;
 /// `TAgroupItemPacket` (`Data/Packets.pas:887`): stack one pile onto another
 /// (`AgroupItem`, `$332`).
 pub const OP_GROUP_ITEM: u16 = 0x332;
@@ -100,6 +104,13 @@ const DELETE_NORMAL: u32 = 0;
 // this to consider itself in the world (`Mob/Player.pas:4945-5244`).
 /// Skill list.
 pub const OP_SKILLS: u16 = 0x106;
+/// `TSendSkillsLevelPacket` (`0x107`): which skills are learned and at what
+/// level, plus how many skill points are unspent (`SendPlayerSkillsLevel`).
+/// This is what tells the client a basic is castable and greys out the rest.
+pub const OP_SKILLS_LEVEL: u16 = 0x107;
+/// `TLearnSkillPacket` (`Data/Packets.pas:1439`): the player spent points at a
+/// trainer to learn or rank up a skill (`LearnSkill`, `$31C`).
+pub const OP_LEARN_SKILL: u16 = 0x31C;
 /// Cash balance, carried as a plain signal.
 pub const OP_CASH: u16 = 0x139;
 /// Account status.
@@ -292,6 +303,13 @@ mod character_offset {
     pub const CUR_HP: usize = SCORE + 20;
     pub const MAX_MP: usize = SCORE + 24;
     pub const CUR_MP: usize = SCORE + 28;
+    /// `CurrentScore.SkillPoint`, a word inside `TStatus`. After the four
+    /// vitals dwords come five more (server reset, honor, kill points, infamy)
+    /// and the two-byte evil points, which puts it here
+    /// (`Data/PlayerData.pas:165`). The skill window reads the unspent count
+    /// from the record, not only from `0x107`, which is why setting it in the
+    /// packet alone left the window showing zero.
+    pub const SKILL_POINT: usize = SCORE + 50;
     pub const EXP: usize = 176;
     pub const LEVEL: usize = 184;
     /// 16 items of 20 bytes; slot 0 is the class and slot 1 the hair, so
@@ -305,6 +323,12 @@ mod character_offset {
     pub const ITEM_SIZE: usize = 20;
     pub const GOLD: usize = 3184;
     pub const LOCATION: usize = 3792;
+    /// Sixty words: the skills the character knows (`SkillList`).
+    pub const SKILL_LIST: usize = 4596;
+    /// Forty dwords: the action bar (`ItemBar`). This is where the hotbar
+    /// icons live, so a character with an empty one here logs in with a bare
+    /// bar however many skills it knows.
+    pub const ITEM_BAR: usize = 4716;
 }
 
 pub async fn serve(state: Arc<State>, listener: TcpListener) -> anyhow::Result<()> {
@@ -729,8 +753,10 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         ability::OP_USE_SKILL => handle_use_skill(state, session, message),
         OP_DELETE_ITEM => handle_delete_item(session, message),
         OP_CHAT => handle_chat(state, session, message),
+        OP_CHANGE_ITEM_BAR => handle_change_item_bar(session, message),
         OP_GROUP_ITEM => handle_group_item(state, session, message),
         OP_UNGROUP_ITEM => handle_ungroup_item(state, session, message),
+        OP_LEARN_SKILL => handle_learn_skill(state, session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
@@ -835,12 +861,30 @@ fn handle_enter_world(
         return Action::Disconnect;
     };
 
-    let Some(character) = account.characters.iter().find(|c| c.slot == slot).cloned() else {
+    let Some(mut character) = account.characters.iter().find(|c| c.slot == slot).cloned() else {
         warn!(slot, user = %account.username, "empty slot");
         return Action::Disconnect;
     };
 
-    info!(user = %account.username, character = %character.name, slot, "entering the world");
+    // Every class is born knowing its six basic skills, so a character with an
+    // empty skill list is one saved before the list was computed rather than
+    // one that truly knows nothing. Mark the basics learned on the way in so
+    // an old character can cast its basic attack without being remade — the
+    // same `2` markers `SetPlayerSkills` writes.
+    if character.skill_list[..BASIC_SKILL_COUNT].iter().all(|&s| s == 0) {
+        for marker in &mut character.skill_list[..BASIC_SKILL_COUNT] {
+            *marker = BASIC_SKILL_LEARNED;
+        }
+    }
+
+    info!(
+        user = %account.username,
+        character = %character.name,
+        slot,
+        level = character.level,
+        skill_points = character.skill_points,
+        "entering the world"
+    );
 
     let client_id = session.client_id;
 
@@ -958,6 +1002,7 @@ fn world_burst(character: &Character, client_id: u16, skills: &[usize]) -> Vec<V
     let mut frames = vec![
         encode_spawn(character, client_id),
         encode_skill_list(client_id, skills),
+        encode_skills_level(character, client_id),
         encode_signal(OP_CASH, 0, 0, character.gold.min(u32::MAX as u64) as u32),
         zeroed(OP_ACCOUNT_STATUS, client_id, SIGNAL_SIZE),
         zeroed(OP_BUFFS, client_id, BUFFS_SIZE),
@@ -1015,7 +1060,11 @@ fn encode_refresh_point(character: &Character) -> Vec<u8> {
     // attribute and once in its own field.
     let free = character.attributes[5];
     body[12..14].copy_from_slice(&free.to_le_bytes());
-    body[14..16].copy_from_slice(&0u16.to_le_bytes()); // skill points
+    // Skill points. This is the field the skill window actually reads — the
+    // `SkillsPoint` word of `TSendRefreshPoint` (`Mob/BaseMob.pas:2591`).
+    // Leaving it zero here is why the window showed zero however many the
+    // character really had.
+    body[14..16].copy_from_slice(&character.skill_points.to_le_bytes());
     frame::encode(
         &Message { sender: FIXED_INDEX, opcode: OP_REFRESH_POINT, time: 0, body },
         rand::random(),
@@ -1722,6 +1771,74 @@ fn handle_move_item(session: &mut Session, message: &Message) -> Action {
     ])
 }
 
+/// `0x31C`: learn or rank up a skill at a trainer (`LearnSkill`).
+///
+/// The checks are the original's, in order: the skill has to exist and belong
+/// to the class, the character has to be high enough level, have the points it
+/// costs and the gold it costs. Learning bumps the skill's level in the record
+/// — a basic stays marked as it was, an advanced skill climbs a rank — and
+/// spends the points and the gold. The client is then sent the fresh skill
+/// list, the fresh levels, and the new purse.
+fn handle_learn_skill(state: &State, session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < 8 {
+        warn!(size = message.body.len(), "0x31C packet too short");
+        return Action::Ignore;
+    }
+    let skill_id = u32::from_le_bytes(message.body[0..4].try_into().unwrap()) as usize;
+    // Which trainer the request came from. The reply has to name it, or the
+    // trainer window will not redraw and the player clicks a second time.
+    let npc = u32::from_le_bytes(message.body[4..8].try_into().unwrap()) as u16;
+
+    let client_id = session.client_id;
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+    let class = character.class_number() as u32;
+
+    let refuse = |text: &str| Action::Reply(vec![encode_client_message(client_id, text)]);
+
+    let Some(skill) = state.skills.get(skill_id) else {
+        return refuse("Esta habilidade não está disponível.");
+    };
+    if !ability::belongs_to(class, skill_id) {
+        return refuse("Esta habilidade não pertence a sua classe.");
+    }
+    if skill.min_level() > character.level as u32 {
+        return refuse("Não possui level necessário.");
+    }
+    let cost = skill.skill_points() as u16;
+    if cost > character.skill_points {
+        return refuse("Não possui pontos de habilidade necessário.");
+    }
+    let learn_cost = skill.learn_cost() as u64;
+    if learn_cost > character.gold {
+        return refuse("Não possui gold suficiente.");
+    }
+    let Some(slot) = ability::record_slot(class, skill_id) else {
+        return refuse("Esta habilidade não está disponível.");
+    };
+
+    // Advanced skills climb a rank in the record; a basic is already marked
+    // learned and stays so. Either way the points and the gold are spent.
+    if slot >= BASIC_SKILL_COUNT {
+        character.skill_list[slot] = character.skill_list[slot].saturating_add(1);
+    }
+    character.skill_points -= cost;
+    character.gold -= learn_cost;
+    session.dirty = true;
+    info!(skill = skill_id, slot, cost, "skill learned");
+
+    let known = known_skills(state, character);
+    Action::Reply(vec![
+        // The skill list said to come from the trainer, so its window redraws
+        // the newly learned skill; `SendPlayerSkills(NPCIndex)` in the original.
+        encode_skill_list_from(client_id, npc, &known),
+        encode_skills_level(character, client_id),
+        encode_refresh_point(character),
+        encode_refresh_money(character.gold),
+    ])
+}
+
 /// `0x332`: stack one pile onto another (`AgroupItem`).
 ///
 /// Both slots are in the bag. The original merges when the two hold the same
@@ -2287,6 +2404,58 @@ fn handle_chat(state: &State, session: &mut Session, message: &Message) -> Actio
     Action::Ignore
 }
 
+/// `0x31E`: the player rearranged the action bar (`ChangeItemBar`).
+///
+/// The three dwords are the slot that changed, what kind of thing was dropped
+/// on it, and that thing's id. The original stores an encoded value per kind:
+/// a skill becomes `id * 16 + 2`, a usable item is kept as its id, and a drop
+/// of nothing clears the slot; kinds it keeps on the pran rather than the
+/// character (1 and 3) leave the character's bar untouched. It then echoes the
+/// packet straight back, which is how the client confirms the change.
+fn handle_change_item_bar(session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < 12 {
+        warn!(size = message.body.len(), "0x31E packet too short");
+        return Action::Ignore;
+    }
+    let dest = u32::from_le_bytes(message.body[0..4].try_into().unwrap()) as usize;
+    let kind = u32::from_le_bytes(message.body[4..8].try_into().unwrap());
+    let src = u32::from_le_bytes(message.body[8..12].try_into().unwrap());
+
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+    if dest >= character.item_bar.len() {
+        warn!(dest, "0x31E slot out of range");
+        return Action::Ignore;
+    }
+
+    match kind {
+        // Cleared, a skill, or a usable item — the three the original keeps on
+        // the character's own bar (`ChangeItemBar`).
+        0 => character.item_bar[dest] = 0,
+        2 => character.item_bar[dest] = src * 16 + 2,
+        6 => character.item_bar[dest] = src,
+        // Kinds 1 and 3 belong to the pran's bar, which we do not keep yet.
+        other => {
+            debug!(kind = other, "item-bar change for a kind we do not store");
+            return Action::Ignore;
+        }
+    }
+    session.dirty = true;
+
+    // The confirmation the client waits for is the same packet back.
+    let echo = frame::encode(
+        &Message {
+            sender: session.client_id,
+            opcode: OP_CHANGE_ITEM_BAR,
+            time: message.time,
+            body: message.body.clone(),
+        },
+        rand::random(),
+    );
+    Action::Reply(vec![echo])
+}
+
 /// `0x3E04`: make a character in one of the three slots.
 ///
 /// The reply is the whole character list either way, because that is what the
@@ -2477,6 +2646,35 @@ fn encode_skill_list_from(client_id: u16, npc: u16, skills: &[usize]) -> Vec<u8>
     debug_assert_eq!(body.len() + MIN_FRAME, SKILLS_SIZE);
     frame::encode(
         &Message { sender: client_id, opcode: ability::OP_SKILL_LIST, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// The `0x107` body: sixty learned-skill words, unspent points, and `0xCCCC`.
+const SKILLS_LEVEL_SIZE: usize = MIN_FRAME + 60 * 2 + 2 + 2;
+/// The trailer the original writes after the skill points (`Unk := $CCCC`).
+const SKILLS_LEVEL_TRAILER: u16 = 0xCCCC;
+
+/// `0x107` (`SendPlayerSkillsLevel`): the learned state of every skill.
+///
+/// The sixty words are the record's skill list — `2` for a learned basic, a
+/// level for a learned advanced skill, zero for the rest — which is what tells
+/// the client a skill may be cast and greys the others out. Without it the
+/// client draws the whole tree as if available and lets the player press
+/// skills the server then refuses. The word after is how many skill points
+/// are unspent, which the original takes from the score; a fresh character has
+/// one per level.
+fn encode_skills_level(character: &Character, client_id: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(SKILLS_LEVEL_SIZE - MIN_FRAME);
+    for marker in &character.skill_list {
+        body.extend_from_slice(&marker.to_le_bytes());
+    }
+    body.extend_from_slice(&character.skill_points.to_le_bytes());
+    body.extend_from_slice(&SKILLS_LEVEL_TRAILER.to_le_bytes());
+
+    debug_assert_eq!(body.len() + MIN_FRAME, SKILLS_LEVEL_SIZE);
+    frame::encode(
+        &Message { sender: client_id, opcode: OP_SKILLS_LEVEL, time: 0, body },
         rand::random(),
     )
 }
@@ -3000,6 +3198,11 @@ fn encode_effect(client_id: u16, effect: u32) -> Vec<u8> {
 /// (`AddLevel` sends `SendEffect(1)`).
 const EFFECT_LEVEL_UP: u32 = 1;
 
+/// The six basic skills every class is born knowing, and the marker the record
+/// carries for a learned one (`SetPlayerSkills` writes `2`).
+const BASIC_SKILL_COUNT: usize = 6;
+const BASIC_SKILL_LEARNED: u16 = 2;
+
 /// `Tp131` (`0x131`): zero except for one field of all ones.
 fn encode_enter_131() -> Vec<u8> {
     let mut body = Vec::with_capacity(ENTER_131_SIZE - MIN_FRAME);
@@ -3074,6 +3277,9 @@ fn encode_character(character: &Character, client_id: u16) -> Vec<u8> {
     // Same convention as the character list: the client adds 1.
     put16(&mut out, off::LEVEL, character.level.saturating_sub(1));
 
+    // The unspent skill points, which the skill window reads from here.
+    put16(&mut out, off::SKILL_POINT, character.skill_points);
+
     // Everything carried, at the slot it occupies. Written before the
     // appearance below, because slots 0 and 1 of the equipment are the body
     // and the hair rather than real items, and those have to win.
@@ -3092,6 +3298,16 @@ fn encode_character(character: &Character, client_id: u16) -> Vec<u8> {
     // Equip[0] is the class and Equip[1] the hair, in each item's `Index`.
     put16(&mut out, off::EQUIP, character.class_index);
     put16(&mut out, off::EQUIP + off::ITEM_SIZE, character.hair);
+
+    // The skills it knows and the icons on its bar, exactly as stored. The
+    // client reads both straight out of this record, so an empty bar here is
+    // an empty bar on screen.
+    for (i, skill) in character.skill_list.iter().enumerate() {
+        put16(&mut out, off::SKILL_LIST + i * 2, *skill);
+    }
+    for (i, slot) in character.item_bar.iter().enumerate() {
+        put32(&mut out, off::ITEM_BAR + i * 4, *slot);
+    }
 
     out[off::GOLD..off::GOLD + 8].copy_from_slice(&character.gold.to_le_bytes());
     put32(&mut out, off::LOCATION, 0);
@@ -3529,6 +3745,7 @@ mod tests {
             vec![
                 OP_CREATE_MOB,
                 OP_SKILLS,
+                OP_SKILLS_LEVEL,
                 OP_CASH,
                 OP_ACCOUNT_STATUS,
                 OP_BUFFS,
@@ -3552,6 +3769,7 @@ mod tests {
             vec![
                 CREATE_MOB_SIZE,
                 SKILLS_SIZE,
+                SKILLS_LEVEL_SIZE,
                 SIGNAL_SIZE,
                 SIGNAL_SIZE,
                 BUFFS_SIZE,
@@ -3568,18 +3786,18 @@ mod tests {
 
         // The level packet carries level minus one and the constant the
         // original writes beside it.
-        let level = decode(&frames[10]);
+        let level = decode(&frames[11]);
         assert_eq!(u16::from_le_bytes(level.body[0..2].try_into().unwrap()), 29);
         assert_eq!(u16::from_le_bytes(level.body[2..4].try_into().unwrap()), LEVEL_UNK);
 
         // HP and MP must not be zero or the character is born dead.
-        let vitals = decode(&frames[11]);
+        let vitals = decode(&frames[12]);
         assert!(u32::from_le_bytes(vitals.body[0..4].try_into().unwrap()) > 0, "max HP");
         assert!(u32::from_le_bytes(vitals.body[8..12].try_into().unwrap()) > 0, "max MP");
 
         // Some packets identify themselves with a fixed index, not the client id.
-        assert_eq!(decode(&frames[7]).sender, FIXED_INDEX, "0x109");
-        assert_eq!(decode(&frames[8]).sender, FIXED_INDEX, "0x10A");
+        assert_eq!(decode(&frames[8]).sender, FIXED_INDEX, "0x109");
+        assert_eq!(decode(&frames[9]).sender, FIXED_INDEX, "0x10A");
 
         let message = decode(&frames[0]);
         assert_eq!(message.opcode, OP_CREATE_MOB);
@@ -4050,6 +4268,57 @@ mod tests {
         assert!(message_text(&frames[0]).contains("não encontrado"));
     }
 
+    /// The hotbar and the known skills land at the right bytes of the world
+    /// record, which is the only place the client reads them from. Get the
+    /// offset wrong and the bar is empty however much is stored.
+    #[test]
+    fn the_record_carries_the_hotbar_and_known_skills() {
+        let mut character = Character::from(&dev_character("Athus", 0));
+        character.item_bar[3] = 30994;
+        character.skill_list[52] = 15378;
+
+        let record = encode_character(&character, 7);
+
+        use character_offset as off;
+        let bar3 = u32::from_le_bytes(
+            record[off::ITEM_BAR + 3 * 4..off::ITEM_BAR + 3 * 4 + 4].try_into().unwrap(),
+        );
+        assert_eq!(bar3, 30994, "the hotbar icon is not where the client looks");
+
+        let skill52 = u16::from_le_bytes(
+            record[off::SKILL_LIST + 52 * 2..off::SKILL_LIST + 52 * 2 + 2].try_into().unwrap(),
+        );
+        assert_eq!(skill52, 15378, "the known skill is not where the client looks");
+    }
+
+    /// The skill window reads unspent points from the record, so they have to
+    /// land at the right byte or it shows zero however many the character has.
+    #[test]
+    fn the_record_carries_the_skill_points() {
+        let mut character = Character::from(&dev_character("Athus", 0));
+        character.skill_points = 100;
+
+        let record = encode_character(&character, 7);
+        let points = u16::from_le_bytes(
+            record[character_offset::SKILL_POINT..character_offset::SKILL_POINT + 2]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(points, 100, "the skill window would show zero");
+    }
+
+    /// And the point the window actually reads: the `SkillsPoint` word of the
+    /// `0x109` refresh-point packet, which was hardcoded to zero.
+    #[test]
+    fn the_refresh_point_packet_carries_the_skill_points() {
+        let mut character = Character::from(&dev_character("Athus", 0));
+        character.skill_points = 100;
+
+        let body = decode(&encode_refresh_point(&character)).body;
+        let points = u16::from_le_bytes(body[14..16].try_into().unwrap());
+        assert_eq!(points, 100, "0x109 still sends zero skill points");
+    }
+
     /// Two piles of the same stackable item merge into one.
     #[tokio::test]
     async fn stacking_two_piles_adds_them_up() {
@@ -4145,6 +4414,34 @@ mod tests {
         let items = &session.character.as_ref().unwrap().items;
         assert_eq!(items.in_container(inventory::BAG).filter(|i| i.index == POTION).count(), 1);
         assert_eq!(items.get(inventory::BAG, 30).unwrap().refine, 5);
+    }
+
+    /// Dragging a skill onto the bar stores the encoded value the original
+    /// stores, and the change comes back as its own confirmation.
+    #[tokio::test]
+    async fn dragging_a_skill_onto_the_bar_stores_and_echoes_it() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+
+        let mut body = vec![0u8; 12];
+        body[0..4].copy_from_slice(&3u32.to_le_bytes()); // dest slot 3
+        body[4..8].copy_from_slice(&2u32.to_le_bytes()); // kind: a skill
+        body[8..12].copy_from_slice(&1937u32.to_le_bytes()); // skill id
+
+        let change = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_CHANGE_ITEM_BAR,
+            time: 0,
+            body,
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &change).await);
+
+        assert_eq!(
+            session.character.as_ref().unwrap().item_bar[3],
+            1937 * 16 + 2,
+            "a skill on the bar is stored as id*16+2, the way the original does"
+        );
+        assert_eq!(decode(&frames[0]).opcode, OP_CHANGE_ITEM_BAR, "the change is not confirmed");
     }
 
     #[tokio::test]
@@ -5197,6 +5494,46 @@ mod tests {
             time: 0,
             body: ability::UseSkill { skill, target, at: (3452.0, 692.0) }.to_body(),
         }
+    }
+
+    fn learn_message(skill: u32) -> Message {
+        let mut body = vec![0u8; 8];
+        body[0..4].copy_from_slice(&skill.to_le_bytes());
+        Message { sender: TEST_CLIENT_ID, opcode: OP_LEARN_SKILL, time: 0, body }
+    }
+
+    /// Learning an advanced skill ranks it up in the record and spends the
+    /// points and gold it costs.
+    #[tokio::test]
+    async fn learning_a_skill_ranks_it_up_and_spends_points() {
+        let state = cast_state();
+        let mut session = in_world(&state).await;
+        {
+            let c = session.character.as_mut().unwrap();
+            c.skill_points = 5;
+            c.gold = 1000;
+        }
+
+        handle_message(&state, &mut session, &learn_message(SPELL)).await;
+
+        let c = session.character.as_ref().unwrap();
+        // SPELL is the second class's seventh slot, record index six.
+        assert_eq!(c.skill_list[6], 1, "the advanced skill did not climb a rank");
+        // The fixture leaves the cost at zero, so points are untouched here;
+        // what matters is the rank went up and nothing was overspent.
+        assert!(c.skill_points <= 5, "points went up rather than down");
+    }
+
+    /// A skill from another class is refused, points untouched.
+    #[tokio::test]
+    async fn learning_another_class_skill_is_refused() {
+        let state = cast_state();
+        let mut session = in_world(&state).await;
+        session.character.as_mut().unwrap().skill_points = 5;
+
+        let frames = frames_of(handle_message(&state, &mut session, &learn_message(OTHER_SPELL)).await);
+        assert_eq!(decode(&frames[0]).opcode, OP_CLIENT_MESSAGE, "it did not refuse");
+        assert_eq!(session.character.as_ref().unwrap().skill_points, 5, "points were spent on a refusal");
     }
 
     /// The client draws the skill bar from what the server sends on arrival.

@@ -314,6 +314,23 @@ impl World {
         self.players.lock().unwrap().values().filter(|p| p.is_in_world()).count()
     }
 
+    /// The id of the player with this name, if they are in the world. The
+    /// original matches it case-insensitively (`GetPlayerByName`), which is how
+    /// a whisper reaches somebody whose name you typed in the wrong case.
+    pub fn client_id_by_name(&self, name: &str) -> Option<u16> {
+        self.players
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|p| p.is_in_world())
+            .find(|p| {
+                p.character
+                    .as_ref()
+                    .is_some_and(|c| c.name.eq_ignore_ascii_case(name))
+            })
+            .map(|p| p.client_id)
+    }
+
     /// Everyone in the world other than this player, near enough to be seen.
     pub fn visible_to(&self, client_id: u16) -> Vec<Presence> {
         let players = self.players.lock().unwrap();

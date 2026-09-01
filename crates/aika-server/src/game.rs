@@ -63,6 +63,10 @@ pub const OP_BACK_TO_CHARACTER_SELECT: u16 = 0x668;
 pub const OP_REVIVE: u16 = 0x303;
 /// `TClientMessagePacket` (`Data/Packets.pas:152`): a line of text on screen.
 pub const OP_CLIENT_MESSAGE: u16 = 0x984;
+/// `TChatPacket` (`Data/Packets.pas:188`), the packet a player sends to speak
+/// and the one the server echoes back to everyone who should hear it. The
+/// original dispatches it at `$F86` (`ServerSocket.pas:3696`).
+pub const OP_CHAT: u16 = 0xF86;
 /// Walking, the only move type the original relays to other players
 /// (`Data/GlobalDefs.pas:216`). The real client also sends other values.
 const MOVE_NORMAL: u8 = 0;
@@ -718,6 +722,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         OP_REVIVE => handle_revive(state, session, message),
         ability::OP_USE_SKILL => handle_use_skill(state, session, message),
         OP_DELETE_ITEM => handle_delete_item(session, message),
+        OP_CHAT => handle_chat(state, session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
@@ -2048,6 +2053,121 @@ fn handle_rotate(state: &State, session: &mut Session, message: &Message) -> Act
         rand::random(),
     );
     state.world.send_to_visible(session.client_id, relay);
+    Action::Ignore
+}
+
+/// Offsets inside the `0xF86` body, once the 12-byte header is gone
+/// (`TChatPacket`, `Data/Packets.pas:188`).
+mod chat_offset {
+    /// Which channel of chat this is: say, whisper, party, guild, nation.
+    pub const TYPE: usize = 0;
+    /// Six bytes the original never reads (`NotUse`), then the colour, which
+    /// the client picks and we pass through untouched.
+    #[allow(dead_code)]
+    pub const COLOR: usize = 8;
+    /// Who is speaking, sixteen bytes. For a whisper this is instead the
+    /// person being whispered to, on the way in.
+    pub const NICK: usize = 12;
+    /// The line itself, a hundred and twenty-eight bytes (`Fala`). Only the
+    /// tests read it: the handler echoes the body through untouched.
+    #[allow(dead_code)]
+    pub const LINE: usize = 28;
+    /// The whole body, header already removed.
+    pub const SIZE: usize = 156;
+}
+
+/// The kinds of chat, from `Data/GlobalDefs.pas:355`.
+const CHAT_NORMAL: u16 = 0;
+const CHAT_WHISPER: u16 = 1;
+
+/// `0xF86`: a player speaks (`TPacketHandlers.SendClientSay`).
+///
+/// Only ordinary say and whisper are here. Say is the one that makes the world
+/// feel inhabited: the original stamps the speaker's name into the packet and
+/// echoes it, unchanged, to everyone who can see them — themselves included,
+/// which is why you see your own bubble (`SendToVisible` defaults
+/// `sendToSelf` to true). Party, guild and nation chat wait on those systems
+/// and are logged, not dropped silently, so a tester can see the client tried.
+fn handle_chat(state: &State, session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < chat_offset::SIZE {
+        warn!(size = message.body.len(), "0xF86 chat packet too short");
+        return Action::Ignore;
+    }
+    if session.character.is_none() {
+        return Action::Ignore;
+    }
+
+    let kind = u16::from_le_bytes(
+        message.body[chat_offset::TYPE..chat_offset::TYPE + 2].try_into().unwrap(),
+    );
+
+    match kind {
+        CHAT_NORMAL => {
+            let speaker = session.character.as_ref().unwrap().name.clone();
+
+            // The name in the packet is whatever the client put there; stamp
+            // ours over it so nobody can speak under another's name.
+            let mut body = message.body.clone();
+            body[chat_offset::NICK..chat_offset::NICK + 16].fill(0);
+            write_fixed_str(&mut body[chat_offset::NICK..chat_offset::NICK + 16], &speaker);
+
+            let relay = frame::encode(
+                &Message {
+                    sender: session.client_id,
+                    opcode: OP_CHAT,
+                    time: message.time,
+                    body,
+                },
+                rand::random(),
+            );
+            // Everyone in view hears it, and the speaker sees their own bubble.
+            // The original does both through `SendToVisible`; the self copy is
+            // a reply here so it rides the same socket without a second lookup.
+            state.world.send_to_visible(session.client_id, relay.clone());
+            return Action::Reply(vec![relay]);
+        }
+        CHAT_WHISPER => {
+            let target = read_fixed_str(&message.body[chat_offset::NICK..chat_offset::NICK + 16]);
+            let speaker = session.character.as_ref().unwrap().name.clone();
+
+            let Some(to) = state.world.client_id_by_name(&target) else {
+                return Action::Reply(vec![encode_client_message(
+                    session.client_id,
+                    "Personagem não encontrado.",
+                )]);
+            };
+
+            // The reply the speaker sees keeps the target's name; the copy the
+            // target sees carries the speaker's, so each end knows who.
+            let seen_by_target = {
+                let mut body = message.body.clone();
+                body[chat_offset::NICK..chat_offset::NICK + 16].fill(0);
+                write_fixed_str(
+                    &mut body[chat_offset::NICK..chat_offset::NICK + 16],
+                    &speaker,
+                );
+                frame::encode(
+                    &Message { sender: session.client_id, opcode: OP_CHAT, time: message.time, body },
+                    rand::random(),
+                )
+            };
+            state.world.send_to(to, seen_by_target);
+
+            let echo = frame::encode(
+                &Message {
+                    sender: session.client_id,
+                    opcode: OP_CHAT,
+                    time: message.time,
+                    body: message.body.clone(),
+                },
+                rand::random(),
+            );
+            return Action::Reply(vec![echo]);
+        }
+        other => {
+            debug!(kind = other, "chat type not handled yet");
+        }
+    }
     Action::Ignore
 }
 
@@ -3741,6 +3861,94 @@ mod tests {
     fn message_text(frame: &[u8]) -> String {
         let body = decode(frame).body;
         body[4..].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect()
+    }
+
+    /// A `0xF86` the way the client sends one: a kind, a name it claims to be,
+    /// and a line of text.
+    fn chat_message(kind: u16, claimed_nick: &str, line: &str) -> Message {
+        let mut body = vec![0u8; chat_offset::SIZE];
+        body[chat_offset::TYPE..chat_offset::TYPE + 2].copy_from_slice(&kind.to_le_bytes());
+        write_fixed_str(&mut body[chat_offset::NICK..chat_offset::NICK + 16], claimed_nick);
+        write_fixed_str(&mut body[chat_offset::LINE..chat_offset::LINE + 128], line);
+        Message { sender: TEST_CLIENT_ID, opcode: OP_CHAT, time: 0, body }
+    }
+
+    /// The name and the line out of a `0xF86` frame.
+    fn chat_of(frame: &[u8]) -> (String, String) {
+        let body = decode(frame).body;
+        (
+            read_fixed_str(&body[chat_offset::NICK..chat_offset::NICK + 16]),
+            read_fixed_str(&body[chat_offset::LINE..chat_offset::LINE + 128]),
+        )
+    }
+
+    #[tokio::test]
+    async fn saying_something_comes_back_to_the_speaker() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+
+        let frames = frames_of(
+            handle_message(&state, &mut session, &chat_message(CHAT_NORMAL, "Athus", "olá mundo"))
+                .await,
+        );
+
+        assert_eq!(decode(&frames[0]).opcode, OP_CHAT, "the speaker sees their own bubble");
+        assert_eq!(chat_of(&frames[0]), ("Athus".into(), "olá mundo".into()));
+    }
+
+    /// You cannot put words in another player's mouth: the server stamps your
+    /// own name over whatever the packet claims.
+    #[tokio::test]
+    async fn the_server_stamps_the_real_name_over_a_forged_one() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+
+        let frames = frames_of(
+            handle_message(
+                &state,
+                &mut session,
+                &chat_message(CHAT_NORMAL, "AlguemFamoso", "não fui eu"),
+            )
+            .await,
+        );
+
+        let (name, _) = chat_of(&frames[0]);
+        assert_eq!(name, "Athus", "a forged name went out unchanged");
+    }
+
+    #[tokio::test]
+    async fn a_whisper_to_nobody_says_so() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+
+        let frames = frames_of(
+            handle_message(
+                &state,
+                &mut session,
+                &chat_message(CHAT_WHISPER, "Fantasma", "tem alguém aí?"),
+            )
+            .await,
+        );
+
+        assert_eq!(decode(&frames[0]).opcode, OP_CLIENT_MESSAGE);
+        assert!(message_text(&frames[0]).contains("não encontrado"));
+    }
+
+    #[tokio::test]
+    async fn a_truncated_chat_packet_is_ignored() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+
+        let short = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_CHAT,
+            time: 0,
+            body: vec![0u8; 8],
+        };
+        assert!(matches!(
+            handle_message(&state, &mut session, &short).await,
+            Action::Ignore
+        ));
     }
 
     #[tokio::test]

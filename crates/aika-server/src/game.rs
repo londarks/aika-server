@@ -15,6 +15,7 @@ use crate::store::{Account, Character, Item, MAX_CHARACTERS};
 use crate::{ability, combat, creation, dialog, expiry, shop, stats};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
 use aika_data::itemlist::ItemList;
+use aika_data::skills::SkillTable;
 use aika_data::npc::Npc;
 use aika_net::frame::{self, FrameError, FrameReader, Message, MIN_FRAME};
 use std::collections::HashSet;
@@ -94,6 +95,16 @@ pub const OP_STORAGE_OPEN: u16 = 0x310;
 /// `TChangeChestGoldPacket` (`Data/Packets.pas:976`): move gold between the
 /// purse and the chest. The amount is signed — out of the chest is negative.
 pub const OP_CHEST_GOLD: u16 = 0xF59;
+/// `TUseBuffItemPacket` (`Data/Packets.pas:1002`): a bag slot, and nothing
+/// else. This is the packet the client sends for a saddle or a lasting potion
+/// (`UseBuffItem`, `$21B`) — not the ordinary use-item one.
+pub const OP_USE_BUFF_ITEM: u16 = 0x21B;
+/// `TUpdateBuffPacket` (`Data/Packets.pas:1429`): one buff started, and when
+/// it ends (`SendAddBuff`, `$16F`).
+pub const OP_ADD_BUFF: u16 = 0x16F;
+/// `TUseMountSkill` (`Data/Packets.pas:140`): one of the mount's own two
+/// skills (`UseMountSkill`, `$218`).
+pub const OP_MOUNT_SKILL: u16 = 0x218;
 /// Walking, the only move type the original relays to other players
 /// (`Data/GlobalDefs.pas:216`). The real client also sends other values.
 const MOVE_NORMAL: u8 = 0;
@@ -204,6 +215,24 @@ const ITEM_TYPE_HPMP_POTION: u16 = 800;
 /// The item that opens the chest wherever the player is standing
 /// (`ITEM_TYPE_STORAGE_OPEN`, `Data/GlobalDefs.pas:856`).
 const ITEM_TYPE_STORAGE_OPEN: u16 = 226;
+/// The three kinds of item whose whole job is to start a buff
+/// (`Data/GlobalDefs.pas:864`). A lasting potion is used with the ordinary
+/// use-item packet; a saddle and its cousins come in on `0x21B` instead.
+const ITEM_TYPE_POTION_BUFF: u16 = 702;
+const ITEM_TYPE_BUFF: u16 = 715;
+const ITEM_TYPE_BUFF2: u16 = 716;
+
+/// `TSendBuffsPacket`: forty buff ids and forty end times.
+const BUFFS_COUNT: usize = crate::buffs::MAX_BUFFS;
+const BUFFS_TIMES_AT: usize = BUFFS_COUNT * 2;
+/// `TUpdateBuffPacket`: the buff, when it ends, and a spare dword.
+const ADD_BUFF_SIZE: usize = MIN_FRAME + 12;
+/// `TUseMountSkill`: one byte saying which of the two.
+const MOUNT_SKILL_SIZE: usize = MIN_FRAME + 2;
+
+/// The two skills a mount carries, picked by the byte the client sends
+/// (`UseMountSkill`: nought is one of them, one is the other).
+const MOUNT_SKILLS: [usize; 2] = [6986, 6987];
 /// Only prans go in the last two chest slots, and this is what one is
 /// (`MoveItem` checks `ItemType = 10`).
 const ITEM_TYPE_PRAN: u16 = 10;
@@ -473,6 +502,11 @@ struct Session {
     /// original's own guard, and the reason it is kept rather than inferred
     /// from the NPC alone: an item opens the chest with no NPC involved.
     opened_option: u32,
+    /// What is currently working on this character: potions, blessings, and
+    /// the one that says they are on a mount. It lives on the session because
+    /// a buff is measured in minutes and would mean nothing after a logout,
+    /// which is where the original keeps it too.
+    buffs: crate::buffs::Buffs,
 }
 
 async fn handle_connection(state: Arc<State>, stream: TcpStream) -> anyhow::Result<()> {
@@ -844,6 +878,8 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         OP_ACTION => handle_action(state, session, message),
         OP_SERVER_TIME => handle_server_time(session),
         OP_CHEST_GOLD => handle_chest_gold(session, message),
+        OP_USE_BUFF_ITEM => handle_use_buff_item(state, session, message),
+        OP_MOUNT_SKILL => handle_mount_skill(state, session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
@@ -1030,6 +1066,7 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
         // world tick left for this player.
         let mut frames = refresh_mob_visibility(state, session);
         frames.extend(collect_blows(state, session));
+        frames.extend(drop_spent_buffs(state, session));
         return if frames.is_empty() { Action::Ignore } else { Action::Reply(frames) };
     }
 
@@ -2313,6 +2350,20 @@ fn handle_use_item(state: &State, session: &mut Session, message: &Message) -> A
         // not spent doing it — the original returns before the stack is
         // touched. It names the player as the NPC whose window is open,
         // because there is no NPC.
+        // A lasting potion starts a buff and is spent doing it, unlike the
+        // saddle. The item names the skill; the skill is the buff.
+        ITEM_TYPE_POTION_BUFF => {
+            let frames = grant_buff(state, session, def.use_effect() as usize);
+            if frames.is_empty() {
+                return Action::Reply(vec![encode_client_message(
+                    client_id,
+                    "That cannot be used yet.",
+                )]);
+            }
+            let mut frames = frames;
+            frames.extend(spend_one(session, container, slot, &item));
+            return Action::Reply(frames);
+        }
         ITEM_TYPE_STORAGE_OPEN => {
             session.opened_option = OPTION_STORAGE;
             session.opened_npc = Some(client_id);
@@ -2343,8 +2394,23 @@ fn handle_use_item(state: &State, session: &mut Session, message: &Message) -> A
         session_heal(&mut session.cur_mp, effect, max_mp);
     }
 
-    // One off the stack, and the slot goes empty when the last one is used.
-    let character = session.character.as_mut().expect("checked above");
+    let mut frames = spend_one(session, container, slot, &item);
+    let character = session.character.as_ref().expect("checked above");
+    frames.insert(
+        0,
+        encode_hp_mp(character, session.client_id, session.cur_hp, session.cur_mp),
+    );
+    Action::Reply(frames)
+}
+
+/// Takes one off a stack and says what the slot holds afterwards.
+///
+/// The slot goes empty when the last one is used, and either way the client
+/// is told, because it has already drawn the item as gone.
+fn spend_one(session: &mut Session, container: u8, slot: u16, item: &Item) -> Vec<Vec<u8>> {
+    let Some(character) = session.character.as_mut() else {
+        return Vec::new();
+    };
     let left = item.refine.saturating_sub(1);
     let remaining = if left == 0 {
         let _ = character.items.take(container, slot);
@@ -2358,10 +2424,7 @@ fn handle_use_item(state: &State, session: &mut Session, message: &Message) -> A
 
     session.dirty = true;
     info!(item = item.index, container, slot, left, "item used");
-    Action::Reply(vec![
-        encode_hp_mp(character, session.client_id, session.cur_hp, session.cur_mp),
-        encode_refresh_item(container, slot, &remaining, false),
-    ])
+    vec![encode_refresh_item(container, slot, &remaining, false)]
 }
 
 /// Raises a pool without letting it past its ceiling.
@@ -2948,6 +3011,159 @@ fn handle_chest_gold(session: &mut Session, message: &Message) -> Action {
     Action::Reply(frames)
 }
 
+/// `0x16E` (`SendRefreshBuffs`): everything currently working on the player.
+///
+/// Forty slots of skill id and forty of the unix second each one ends at. The
+/// original packs them from the front and leaves the rest zero, which is what
+/// tells the client the row is empty.
+fn encode_buffs(client_id: u16, buffs: &crate::buffs::Buffs, skills: &SkillTable) -> Vec<u8> {
+    let mut body = vec![0u8; BUFFS_SIZE - MIN_FRAME];
+    for (i, (skill, ends_at)) in buffs.running(skills).into_iter().enumerate() {
+        body[i * 2..i * 2 + 2].copy_from_slice(&(skill as u16).to_le_bytes());
+        let at = BUFFS_TIMES_AT + i * 4;
+        body[at..at + 4].copy_from_slice(&crate::buffs::unix(ends_at).to_le_bytes());
+    }
+
+    debug_assert_eq!(body.len() + MIN_FRAME, BUFFS_SIZE);
+    frame::encode(
+        &Message { sender: client_id, opcode: OP_BUFFS, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// `0x16F` (`SendAddBuff`): one buff just started, and when it ends.
+fn encode_add_buff(
+    client_id: u16,
+    skill: usize,
+    ends_at: Option<std::time::SystemTime>,
+) -> Vec<u8> {
+    let mut body = vec![0u8; ADD_BUFF_SIZE - MIN_FRAME];
+    body[0..4].copy_from_slice(&(skill as u32).to_le_bytes());
+    body[4..8].copy_from_slice(&crate::buffs::unix(ends_at).to_le_bytes());
+
+    debug_assert_eq!(body.len() + MIN_FRAME, ADD_BUFF_SIZE);
+    frame::encode(
+        &Message { sender: client_id, opcode: OP_ADD_BUFF, time: 0, body },
+        rand::random(),
+    )
+}
+
+/// Starts a buff and tells the client everything that changes because of it.
+///
+/// `SendAddBuff` sends the one buff, then the whole list, then the points and
+/// the status — the last two because a buff is one of the things
+/// `GetCurrentScore` adds up, so the character sheet has to be redrawn.
+fn grant_buff(state: &State, session: &mut Session, skill: usize) -> Vec<Vec<u8>> {
+    let now = std::time::SystemTime::now();
+    if !session.buffs.add(&state.skills, skill, now) {
+        debug!(skill, "that skill does not last, so it is not a buff");
+        return Vec::new();
+    }
+    let client_id = session.client_id;
+    // What the list says about it, which is `None` for one that does not run
+    // out. A buff that is not in the list at all cannot happen here, since it
+    // was just added, but a missing skill would say "already over".
+    let ends_at = session
+        .buffs
+        .running(&state.skills)
+        .into_iter()
+        .find(|(id, _)| *id == skill)
+        .map(|(_, at)| at)
+        .unwrap_or(Some(now));
+
+    let mut frames = vec![
+        encode_add_buff(client_id, skill, ends_at),
+        encode_buffs(client_id, &session.buffs, &state.skills),
+    ];
+    if let Some(character) = session.character.as_ref() {
+        frames.push(encode_refresh_point(character));
+        frames.push(encode_refresh_status(character, &state.items));
+    }
+    info!(skill, "buff started");
+    frames
+}
+
+/// `0x21B`: use an item whose whole job is to start a buff (`UseBuffItem`).
+///
+/// A saddle comes in here rather than through the ordinary use-item packet,
+/// which is why using one did nothing at all before: the opcode was not
+/// handled and the client had no reply to wait for. The item names a skill in
+/// its `UseEffect`, and that skill is the buff.
+fn handle_use_buff_item(state: &State, session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < 4 {
+        warn!(size = message.body.len(), "0x21B packet too short");
+        return Action::Ignore;
+    }
+    let slot = u32::from_le_bytes(message.body[0..4].try_into().unwrap()) as u16;
+
+    let Some(character) = session.character.as_ref() else {
+        return Action::Ignore;
+    };
+    let Some(item) = character.items.get(inventory::BAG, slot).cloned() else {
+        debug!(slot, "0x21B on an empty slot");
+        return Action::Ignore;
+    };
+    let Some(def) = state.items.get(item.index as usize) else {
+        debug!(item = item.index, "0x21B on an item that is not in the table");
+        return Action::Ignore;
+    };
+    if !matches!(def.item_type(), ITEM_TYPE_BUFF | ITEM_TYPE_BUFF2) {
+        debug!(item = item.index, item_type = def.item_type(), "0x21B on something else");
+        return Action::Ignore;
+    }
+
+    // The saddle is not spent: the original starts the buff and leaves the
+    // item where it is, which is what makes it good for thirty days.
+    let frames = grant_buff(state, session, def.use_effect() as usize);
+    if frames.is_empty() {
+        return Action::Ignore;
+    }
+    Action::Reply(frames)
+}
+
+/// `0x218`: one of the two skills a mount carries (`UseMountSkill`).
+///
+/// The original refuses unless the player is both mounted and has a mount
+/// equipped, and turns the byte it is sent into one of two fixed skill ids.
+fn handle_mount_skill(state: &State, session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < MOUNT_SKILL_SIZE - MIN_FRAME {
+        warn!(size = message.body.len(), "0x218 packet too short");
+        return Action::Ignore;
+    }
+    let which = message.body[0] as usize;
+    let client_id = session.client_id;
+
+    let mounted = session.buffs.has_family(&state.skills, crate::buffs::FAMILY_MOUNTED);
+    let has_mount = session
+        .character
+        .as_ref()
+        .and_then(|c| c.items.get(inventory::EQUIP, MOUNT_SLOT))
+        .is_some();
+    if !mounted || !has_mount {
+        return Action::Reply(vec![encode_client_message(
+            client_id,
+            "O uso dessa habilidade requer estar montado ou com uma montaria equipada",
+        )]);
+    }
+
+    let Some(&skill) = MOUNT_SKILLS.get(which) else {
+        // The original says as much and stops, rather than casting something.
+        debug!(which, "a mount has two skills and that is not one of them");
+        return Action::Reply(vec![encode_client_message(client_id, "Usando skill de montaria")]);
+    };
+
+    // The original builds a `0x320` and hands it to `UseSkill`, so a mount
+    // skill goes through the same casting as any other.
+    let cast = Message {
+        sender: client_id,
+        opcode: ability::OP_USE_SKILL,
+        time: message.time,
+        body: ability::UseSkill { skill: skill as u32, target: client_id as u32, at: (0.0, 0.0) }
+            .to_body(),
+    };
+    handle_use_skill(state, session, &cast)
+}
+
 /// `0x202`: what time is it on the server (`RequestServerTime`).
 ///
 /// The whole of the original is one line: it answers `DateTimeToStr(Now)` as
@@ -3303,6 +3519,34 @@ fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> 
     Action::Reply(frames)
 }
 
+
+/// Takes off whatever has run out, and redraws what depended on it.
+///
+/// `RefreshBuffs` sends fresh health, status and points when anything went,
+/// and nothing at all when nothing did. Nothing runs a clock: this rides the
+/// heartbeat the client sends twice a second, which is close enough for a
+/// buff measured in minutes.
+fn drop_spent_buffs(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+    let now = std::time::SystemTime::now();
+    if session.buffs.expire(&state.skills, now) == 0 {
+        return Vec::new();
+    }
+    let client_id = session.client_id;
+    let mut frames = vec![encode_buffs(client_id, &session.buffs, &state.skills)];
+    if let Some(character) = session.character.as_ref() {
+        let (max_hp, max_mp) = vitals(character);
+        frames.push(encode_hp_mp(
+            character,
+            client_id,
+            session.cur_hp.min(max_hp),
+            session.cur_mp.min(max_mp),
+        ));
+        frames.push(encode_refresh_status(character, &state.items));
+        frames.push(encode_refresh_point(character));
+    }
+    info!("a buff ran out");
+    frames
+}
 
 /// Applies whatever monsters landed on this player since its last packet.
 ///
@@ -5537,6 +5781,170 @@ mod tests {
         assert_eq!(u32::from_le_bytes(message.body[0..4].try_into().unwrap()), 180);
 
         assert!(mine_rx.try_recv().is_err(), "the sender heard its own turn");
+    }
+
+    /// The saddle, the mount, and a potion that lasts, with the skills each
+    /// one names. The chain is the real one: an item points at a skill through
+    /// `UseEffect`, and the skill's family is the buff.
+    const SADDLE: u16 = 4503;
+    const HORSE: u16 = 963;
+    const LASTING_POTION: u16 = 4879;
+    const SADDLE_SKILL: usize = 7259;
+    const POTION_SKILL: usize = 9031;
+
+    fn buff_state() -> State {
+        let mut state = shop_state();
+
+        state.items = {
+            use aika_data::itemlist::{field, ItemList, RECORD_SIZE};
+            let mut raw = vec![0u8; 10000 * RECORD_SIZE];
+            let mut define = |id: u16, item_type: u16, effect: u16| {
+                let r = &mut raw[id as usize * RECORD_SIZE..(id as usize + 1) * RECORD_SIZE];
+                r[field::NAME.start] = b'x';
+                r[field::ITEM_TYPE..field::ITEM_TYPE + 2]
+                    .copy_from_slice(&item_type.to_le_bytes());
+                r[field::USE_EFFECT..field::USE_EFFECT + 2].copy_from_slice(&effect.to_le_bytes());
+            };
+            define(SADDLE, ITEM_TYPE_BUFF, SADDLE_SKILL as u16);
+            define(LASTING_POTION, ITEM_TYPE_POTION_BUFF, POTION_SKILL as u16);
+            define(HORSE, 9, 0);
+            ItemList::decode(&raw).expect("the fixture table is malformed")
+        };
+
+        state.skills = {
+            use aika_data::skills::{field, SkillTable, RECORD_SIZE, SLOTS};
+            let mut raw = vec![0u8; SLOTS * RECORD_SIZE + 4];
+            let mut define = |id: usize, family: u32, seconds: u32| {
+                let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
+                r[field::FAMILY..field::FAMILY + 4].copy_from_slice(&family.to_le_bytes());
+                r[field::DURATION..field::DURATION + 4].copy_from_slice(&seconds.to_le_bytes());
+                r[field::NAME_ENGLISH.start] = b'x';
+            };
+            define(SADDLE_SKILL, crate::buffs::FAMILY_MOUNTED, 3600);
+            define(POTION_SKILL, 383, 10_800);
+            SkillTable::decode(&raw).expect("the fixture table is malformed")
+        };
+        state
+    }
+
+    fn carrying(session: &mut Session, index: u16, slot: u16) {
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                index,
+                container: inventory::BAG,
+                slot,
+                refine: 1,
+                durability_min: 255,
+                ..Item::default()
+            })
+            .unwrap();
+    }
+
+    fn use_buff_item(slot: u16) -> Message {
+        Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_USE_BUFF_ITEM,
+            time: 0,
+            body: (slot as u32).to_le_bytes().to_vec(),
+        }
+    }
+
+    /// The saddle is what puts a rider on a horse, and it does it through a
+    /// packet of its own. Using it was doing nothing at all.
+    #[tokio::test]
+    async fn using_a_saddle_makes_the_player_mounted() {
+        let state = buff_state();
+        let mut session = in_world(&state).await;
+        carrying(&mut session, SADDLE, 7);
+
+        let frames = frames_of(handle_message(&state, &mut session, &use_buff_item(7)).await);
+
+        assert!(
+            session.buffs.has_family(&state.skills, crate::buffs::FAMILY_MOUNTED),
+            "the saddle did not put the player on a mount"
+        );
+        let sent = opcodes(&frames);
+        assert!(sent.contains(&OP_ADD_BUFF), "the client was not told: {sent:?}");
+        assert!(sent.contains(&OP_BUFFS), "the buff list was not sent again");
+
+        // The saddle lasts thirty days: using it must not spend it.
+        assert_eq!(
+            session.character.as_ref().unwrap().items.get(inventory::BAG, 7).map(|i| i.index),
+            Some(SADDLE),
+            "the saddle was eaten"
+        );
+    }
+
+    /// The list the client draws its icons from has to name the buff and say
+    /// when it ends.
+    #[tokio::test]
+    async fn the_buff_list_says_what_is_running_and_until_when() {
+        let state = buff_state();
+        let mut session = in_world(&state).await;
+        carrying(&mut session, SADDLE, 7);
+        handle_message(&state, &mut session, &use_buff_item(7)).await;
+
+        let body = decode(&encode_buffs(session.client_id, &session.buffs, &state.skills)).body;
+        assert_eq!(
+            u16::from_le_bytes(body[0..2].try_into().unwrap()),
+            SADDLE_SKILL as u16,
+            "the first slot does not name the skill"
+        );
+        let ends = u32::from_le_bytes(body[BUFFS_TIMES_AT..BUFFS_TIMES_AT + 4].try_into().unwrap());
+        let now = crate::buffs::unix(Some(std::time::SystemTime::now()));
+        assert!(ends > now, "the buff is already over");
+        assert!(ends - now <= 3600, "an hour's buff lasts longer than an hour");
+    }
+
+    /// A mount's own skills need a mount. The original says so in as many
+    /// words rather than casting nothing.
+    #[tokio::test]
+    async fn a_mount_skill_is_refused_on_foot() {
+        let state = buff_state();
+        let mut session = in_world(&state).await;
+
+        let ask = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_MOUNT_SKILL,
+            time: 0,
+            body: vec![0, 0],
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &ask).await);
+
+        assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
+        assert!(
+            message_text(&frames[0]).contains("montado"),
+            "the player was not told why: {}",
+            message_text(&frames[0])
+        );
+    }
+
+    /// A potion that lasts starts a buff and is spent doing it, which is the
+    /// difference between it and the saddle.
+    #[tokio::test]
+    async fn a_lasting_potion_starts_a_buff_and_is_drunk() {
+        let state = buff_state();
+        let mut session = in_world(&state).await;
+        carrying(&mut session, LASTING_POTION, 7);
+
+        let use_it = Message {
+            sender: TEST_CLIENT_ID,
+            opcode: OP_USE_ITEM,
+            time: 0,
+            body: UseItem { container: inventory::BAG as u32, slot: 7, argument: 0 }.to_body(),
+        };
+        let frames = frames_of(handle_message(&state, &mut session, &use_it).await);
+
+        assert!(session.buffs.has_family(&state.skills, 383), "the potion did nothing");
+        assert!(opcodes(&frames).contains(&OP_ADD_BUFF));
+        assert!(
+            session.character.as_ref().unwrap().items.get(inventory::BAG, 7).is_none(),
+            "the last potion of the stack was not drunk"
+        );
     }
 
     /// A mount is drawn from a field of its own, not from the equip array the

@@ -14,6 +14,7 @@
 //! players see each other.
 
 pub mod ability;
+pub mod buffs;
 pub mod combat;
 pub mod config;
 pub mod creation;

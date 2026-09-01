@@ -3567,6 +3567,64 @@ async fn a_level_fills_the_health_back_up() {
     assert_eq!(session.cur_hp, stats.max_hp, "it levelled and stayed hurt");
 }
 
+/// The same world, but with a curve that really reaches the cap: the ordinary
+/// fixture stops at four levels, which is enough for "a kill bought a level"
+/// and no use at all for "a kill did not buy the hundredth".
+fn to_the_cap_state() -> State {
+    let mut state = progress_state();
+    state.levels = aika_data::exp::ExpTable::decode(&{
+        let mut bytes = Vec::new();
+        for level in 0..=LEVEL_CAP as u64 + 1 {
+            bytes.extend_from_slice(&(level * 20).to_le_bytes());
+        }
+        bytes
+    })
+    .unwrap();
+    state
+}
+
+/// The curve stops at the cap however much experience is thrown at it.
+///
+/// It is not a round number for its own sake: the saddle is an item of `10..99`
+/// and the client is what enforces that range, so the level past the cap is the
+/// level where a character's own mount stops working. `ExpList.bin` holds a
+/// hundred, the item table stops one short, and the item table is the one the
+/// client reads.
+#[tokio::test]
+async fn the_curve_stops_at_the_cap() {
+    let state = to_the_cap_state();
+    let mut session = in_world(&state).await;
+    session.character.as_mut().unwrap().level = LEVEL_CAP;
+    // Far more than the curve asks for the next level, so nothing but the cap
+    // is holding it back.
+    session.character.as_mut().unwrap().exp = 1_000_000;
+    let before = session.character.as_ref().unwrap().exp;
+
+    kill_the_rat(&state, &mut session).await;
+
+    let character = session.character.as_ref().unwrap();
+    assert_eq!(character.level, LEVEL_CAP, "a character levelled past the cap");
+    assert!(character.exp > before, "the experience itself still counts");
+}
+
+/// And a character one short of it lands on it rather than over it, however
+/// many levels the kill was worth.
+#[tokio::test]
+async fn a_kill_worth_many_levels_lands_on_the_cap() {
+    let state = to_the_cap_state();
+    let mut session = in_world(&state).await;
+    session.character.as_mut().unwrap().level = LEVEL_CAP - 1;
+    session.character.as_mut().unwrap().exp = u32::MAX as u64;
+
+    kill_the_rat(&state, &mut session).await;
+
+    assert_eq!(
+        session.character.as_ref().unwrap().level,
+        LEVEL_CAP,
+        "it overshot the cap"
+    );
+}
+
 /// A character whose experience is nowhere near the next level stays put.
 #[tokio::test]
 async fn not_enough_experience_is_not_a_level() {

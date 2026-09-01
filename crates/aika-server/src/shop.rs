@@ -141,6 +141,9 @@ pub enum ShopError {
     /// Priced in something this server does not keep yet.
     PaidInSomethingElse(&'static str),
     NotEnoughGold { needed: u64, held: u64 },
+    /// Priced in an item the player does not have enough of (`BuyNPCItens`,
+    /// the `PRICE_ITEM` branch).
+    NotEnoughCurrency,
     BagFull,
     /// A rented item, or one the table marks as unsellable.
     CannotBeSold,
@@ -161,6 +164,9 @@ impl ShopError {
             }
             ShopError::NotEnoughGold { needed, held } => {
                 format!("You need {needed} gold and have {held}.")
+            }
+            ShopError::NotEnoughCurrency => {
+                "Você não possui a quantidade de itens necessária.".into()
             }
             ShopError::BagFull => "Your bag is full.".into(),
             ShopError::CannotBeSold => "That cannot be sold.".into(),
@@ -251,6 +257,9 @@ pub struct Change {
     pub item: Item,
     /// The purse after the trade.
     pub gold: u64,
+    /// Bag slots whose currency was spent to pay, and what is left in each.
+    /// Empty for a gold purchase; one or more for an item-currency one.
+    pub spent: Vec<(u16, Item)>,
 }
 
 /// The forty ids of a shop window, in slot order.
@@ -285,19 +294,29 @@ pub fn buy(
     // else is one item however many the client asked for.
     let amount = if def.can_group() { request.amount.max(1) } else { 1 };
 
-    let price = match price_of(def, amount) {
+    // What the item costs, and the change made to pay it. Gold is the common
+    // case; an item currency (the "moeda da determinação" and its kin) is paid
+    // out of the bag instead, which the original handles in its own branch.
+    let mut new_gold = gold;
+    let mut spent: Vec<(u16, Item)> = Vec::new();
+    match price_of(def, amount) {
         // The original refuses a gold price of one or less, not just of zero
         // (`PacketHandlers.pas:5042`). An undefined item reads as a row of
         // zeros and lands here, which is how that check keeps items the
         // server does not know about out of the game.
         Price::Gold(price) if price <= 1 => return Err(ShopError::NotForSale),
-        Price::Gold(price) => price,
+        Price::Gold(price) => {
+            if price > gold {
+                return Err(ShopError::NotEnoughGold { needed: price, held: gold });
+            }
+            new_gold = gold - price;
+        }
+        Price::Item { id: currency, amount: needed } => {
+            spent = spend_currency(inventory, currency, needed)?;
+        }
+        // Honor and medals are account-level currencies we do not keep yet.
         Price::Honor(_) => return Err(ShopError::PaidInSomethingElse("honor")),
         Price::Medal(_) => return Err(ShopError::PaidInSomethingElse("medals")),
-        Price::Item { .. } => return Err(ShopError::PaidInSomethingElse("another item")),
-    };
-    if price > gold {
-        return Err(ShopError::NotEnoughGold { needed: price, held: gold });
     }
 
     if inventory.free_slots(crate::inventory::BAG) == 0 {
@@ -315,7 +334,57 @@ pub fn buy(
     let slot = inventory.add(bought.clone())?;
 
     let item = inventory.get(crate::inventory::BAG, slot).cloned().unwrap_or(bought);
-    Ok(Change { slot, item, gold: gold - price })
+    Ok(Change { slot, item, gold: new_gold, spent })
+}
+
+/// Takes `needed` of a currency item out of the bag, across as many stacks as
+/// it sits in, and says what each drained slot holds afterwards.
+///
+/// The original looks in one slot (`GetItemSlot2`) and refuses if that stack
+/// alone is short; draining across stacks is friendlier and cannot pay more
+/// than the player has, so the outcome is the same when the currency is in one
+/// pile, which it almost always is.
+fn spend_currency(
+    inventory: &mut Inventory,
+    currency: u16,
+    needed: u32,
+) -> Result<Vec<(u16, Item)>, ShopError> {
+    let held: u32 = inventory
+        .in_container(crate::inventory::BAG)
+        .filter(|i| i.index == currency)
+        .map(|i| i.refine.max(1) as u32)
+        .sum();
+    if held < needed {
+        return Err(ShopError::NotEnoughCurrency);
+    }
+
+    let mut left = needed;
+    let mut slots: Vec<u16> = inventory
+        .in_container(crate::inventory::BAG)
+        .filter(|i| i.index == currency)
+        .map(|i| i.slot)
+        .collect();
+    slots.sort_unstable();
+
+    let mut changed = Vec::new();
+    for slot in slots {
+        if left == 0 {
+            break;
+        }
+        let mut stack = inventory.get(crate::inventory::BAG, slot).cloned().unwrap();
+        let take = left.min(stack.refine.max(1) as u32) as u16;
+        stack.refine -= take;
+        left -= take as u32;
+
+        if stack.refine == 0 {
+            let _ = inventory.take(crate::inventory::BAG, slot);
+            changed.push((slot, Item { container: crate::inventory::BAG, slot, ..Item::default() }));
+        } else {
+            let _ = inventory.put(stack.clone());
+            changed.push((slot, stack));
+        }
+    }
+    Ok(changed)
 }
 
 /// Sells a bag slot back. Returns the emptied slot and the new purse.
@@ -352,7 +421,7 @@ pub fn sell(
     let paid = resale_value(def, &held, stacks);
     inventory.take(crate::inventory::BAG, slot).map_err(|_| ShopError::EmptySlot)?;
 
-    Ok(Change { slot, item: Item::default(), gold: gold.saturating_add(paid) })
+    Ok(Change { slot, item: Item::default(), gold: gold.saturating_add(paid), spent: Vec::new() })
 }
 
 #[cfg(test)]
@@ -523,6 +592,48 @@ mod tests {
         let sword = buy(&npc, buy_request(1, 20), &mut inv, 1000, &table).unwrap();
         assert_eq!(sword.gold, 500, "a sword is one sword however many were asked for");
         assert_eq!(sword.item.refine, 1, "and it arrives as one of them, not none");
+    }
+
+    /// Item 6003 is priced in two of item 4204, the way the "moeda da
+    /// determinação" items are: paid out of the bag, not out of gold.
+    #[test]
+    fn an_item_priced_in_a_currency_is_paid_from_the_bag() {
+        let npc = merchant(&[6003]);
+        let mut inv = Inventory::new();
+        inv.put(Item {
+            container: BAG,
+            slot: 0,
+            index: 4204, // the currency
+            refine: 5,
+            ..Item::default()
+        })
+        .unwrap();
+
+        let change = buy(&npc, buy_request(0, 1), &mut inv, 0, &item_table()).unwrap();
+
+        assert_eq!(change.gold, 0, "gold must not be touched for a currency purchase");
+        assert_eq!(change.item.index, 6003, "the item was not handed over");
+        assert_eq!(
+            inv.get(BAG, 0).unwrap().refine,
+            3,
+            "two of the currency were not taken"
+        );
+        assert_eq!(change.spent.len(), 1, "the drained currency slot was not reported");
+    }
+
+    /// Not enough of the currency refuses, and takes nothing.
+    #[test]
+    fn buying_a_currency_item_without_the_currency_is_refused() {
+        let npc = merchant(&[6003]);
+        let mut inv = Inventory::new();
+        inv.put(Item { container: BAG, slot: 0, index: 4204, refine: 1, ..Item::default() })
+            .unwrap();
+
+        assert_eq!(
+            buy(&npc, buy_request(0, 1), &mut inv, 0, &item_table()),
+            Err(ShopError::NotEnoughCurrency)
+        );
+        assert_eq!(inv.get(BAG, 0).unwrap().refine, 1, "the currency was taken on a refusal");
     }
 
     #[test]
@@ -697,12 +808,13 @@ mod tests {
         );
     }
 
-    /// A currency the server does not keep has to be refused, not silently
-    /// charged in gold.
+    /// The account-level currencies we do not keep yet — honor and medals —
+    /// are refused rather than silently charged in gold. An item currency is
+    /// not among them: it is paid from the bag, and has its own test.
     #[test]
-    fn a_price_in_another_currency_is_refused_rather_than_charged_in_gold() {
+    fn a_price_in_an_account_currency_is_refused_rather_than_charged_in_gold() {
         let table = item_table();
-        let npc = merchant(&[6000, 6002, 6003]);
+        let npc = merchant(&[6000, 6002]);
         let mut inv = Inventory::new();
 
         assert_eq!(
@@ -712,10 +824,6 @@ mod tests {
         assert_eq!(
             buy(&npc, buy_request(1, 1), &mut inv, 100_000, &table),
             Err(ShopError::PaidInSomethingElse("medals"))
-        );
-        assert_eq!(
-            buy(&npc, buy_request(2, 1), &mut inv, 100_000, &table),
-            Err(ShopError::PaidInSomethingElse("another item"))
         );
         assert!(inv.is_empty(), "something was handed over anyway");
     }

@@ -1613,10 +1613,15 @@ fn handle_buy(state: &State, session: &mut Session, message: &Message) -> Action
                 gold = change.gold,
                 "bought"
             );
-            Action::Reply(vec![
-                encode_refresh_item(inventory::BAG, change.slot, &change.item, true),
-                encode_refresh_money(change.gold),
-            ])
+            let mut frames = Vec::new();
+            // Whatever currency was spent goes back first, so the client
+            // redraws the drained stacks before it draws the new item.
+            for (slot, left) in &change.spent {
+                frames.push(encode_refresh_item(inventory::BAG, *slot, left, false));
+            }
+            frames.push(encode_refresh_item(inventory::BAG, change.slot, &change.item, true));
+            frames.push(encode_refresh_money(change.gold));
+            Action::Reply(frames)
         }
         Err(e) => {
             debug!(npc = npc.id, error = %e, "purchase refused");

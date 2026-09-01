@@ -3067,6 +3067,31 @@ fn handle_revive(state: &State, session: &mut Session, _message: &Message) -> Ac
 /// Only monsters can be hit. Attacking another player needs a duel or a war
 /// to be agreed first, and neither exists yet; hitting an NPC is refused by
 /// the original too.
+/// A skill the caster aimed at themselves, arriving as the cast finishes.
+///
+/// Only the lasting ones do anything here: a skill with a duration becomes a
+/// buff, which is what the mount is. One with none is a swing at yourself and
+/// there is nothing to do with it.
+///
+/// The mana and the cooldown were taken when the bar started, so they are not
+/// taken again — this is the second half of one cast, not a second cast.
+fn finish_self_cast(state: &State, session: &mut Session, skill: usize) -> Action {
+    let Some(def) = state.skills.get(skill) else {
+        debug!(skill, "0x302 naming a skill the table does not have");
+        return Action::Ignore;
+    };
+    if def.duration_secs() == 0 {
+        debug!(skill, "0x302 on self for a skill that does not last");
+        return Action::Ignore;
+    }
+
+    let frames = grant_buff(state, session, skill);
+    if frames.is_empty() {
+        return Action::Ignore;
+    }
+    Action::Reply(frames)
+}
+
 fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Action {
     let Some(request) = combat::Attack::parse(&message.body) else {
         warn!(size = message.body.len(), "0x302 packet too short");
@@ -3081,6 +3106,19 @@ fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Act
     };
     let at = (character.x as f32, character.y as f32);
     let level = character.level;
+
+    // A skill with a cast time finishes here rather than where it started.
+    //
+    // The client sends `0x320` when the bar begins and this when it fills, so
+    // for anything with a `CastTime` the effect belongs to this packet and not
+    // to the other one — `AttackTarget` is where the original applies it too,
+    // told by `ByUseSkill` which of the two it came from. A blessing or a
+    // mount is aimed at the caster, so the target is their own id, and reading
+    // that as "a monster nobody can find" is why the bar filled and nothing
+    // happened.
+    if request.skill != 0 && request.target == session.client_id {
+        return finish_self_cast(state, session, request.skill as usize);
+    }
 
     // The position comes from the world, never from the packet: the client
     // sends where it thinks it is, and a modified one would reach across the

@@ -1732,6 +1732,67 @@ async fn spending_mana_does_not_shrink_the_pool() {
     assert!(at(8) > at(12), "the pool is no bigger than what is in it");
 }
 
+/// A skill with a cast time finishes on `0x302`, not on the `0x320` that
+/// started it. The mount's is 1500 milliseconds, so the client draws a bar and
+/// sends this when it fills, aimed at the caster's own id.
+///
+/// Reading that as a swing at a monster nobody can find is what made the bar
+/// fill and nothing happen. The line was in the log all along, once a minute,
+/// looking like noise: "0x302 at something that is not a monster target=1".
+#[tokio::test]
+async fn a_cast_with_a_bar_finishes_on_the_second_packet() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    assert!(!session.buffs.has_family(&state.skills, crate::buffs::FAMILY_MOUNTED));
+
+    // What the client sends when the bar fills: the skill, aimed at itself.
+    let finished = Message {
+        sender: TEST_CLIENT_ID,
+        opcode: combat::OP_ATTACK,
+        time: 0,
+        body: combat::Attack {
+            target: session.client_id,
+            animation: 0,
+            skill: SADDLE_SKILL as u16,
+            from: (0.0, 0.0),
+            at: (0.0, 0.0),
+        }
+        .to_body(),
+    };
+    let frames = frames_of(handle_message(&state, &mut session, &finished).await);
+
+    assert!(
+        session.buffs.has_family(&state.skills, crate::buffs::FAMILY_MOUNTED),
+        "the cast finished and nothing came of it"
+    );
+    assert!(opcodes(&frames).contains(&OP_ADD_BUFF), "the client was not told");
+}
+
+/// A swing at yourself is not a buff. Only a skill that lasts becomes one.
+#[tokio::test]
+async fn a_skill_that_does_not_last_is_not_a_self_buff() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+
+    let swing = Message {
+        sender: TEST_CLIENT_ID,
+        opcode: combat::OP_ATTACK,
+        time: 0,
+        body: combat::Attack {
+            target: session.client_id,
+            animation: 0,
+            // A skill the fixture table does not define at all.
+            skill: 4242,
+            from: (0.0, 0.0),
+            at: (0.0, 0.0),
+        }
+        .to_body(),
+    };
+    handle_message(&state, &mut session, &swing).await;
+
+    assert!(session.buffs.is_empty(), "a skill with no duration became a buff");
+}
+
 /// A buff has to come off when the player clicks it off. A mount's does
 /// not run out on its own, so without this it never goes at all — which
 /// left a rider mounted with no horse and unable to equip another.

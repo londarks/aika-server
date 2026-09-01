@@ -67,6 +67,12 @@ pub const OP_CLIENT_MESSAGE: u16 = 0x984;
 /// and the one the server echoes back to everyone who should hear it. The
 /// original dispatches it at `$F86` (`ServerSocket.pas:3696`).
 pub const OP_CHAT: u16 = 0xF86;
+/// `TAgroupItemPacket` (`Data/Packets.pas:887`): stack one pile onto another
+/// (`AgroupItem`, `$332`).
+pub const OP_GROUP_ITEM: u16 = 0x332;
+/// `TUngroupItemPacket` (`Data/Packets.pas:895`): split a pile in two
+/// (`UngroupItem`, `$333`).
+pub const OP_UNGROUP_ITEM: u16 = 0x333;
 /// Walking, the only move type the original relays to other players
 /// (`Data/GlobalDefs.pas:216`). The real client also sends other values.
 const MOVE_NORMAL: u8 = 0;
@@ -723,6 +729,8 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         ability::OP_USE_SKILL => handle_use_skill(state, session, message),
         OP_DELETE_ITEM => handle_delete_item(session, message),
         OP_CHAT => handle_chat(state, session, message),
+        OP_GROUP_ITEM => handle_group_item(state, session, message),
+        OP_UNGROUP_ITEM => handle_ungroup_item(state, session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
             // size alongside, to help identify the packet.
@@ -1706,6 +1714,109 @@ fn handle_move_item(session: &mut Session, message: &Message) -> Action {
     Action::Reply(vec![
         encode_refresh_item(to.0, to.1, &there, false),
         encode_refresh_item(from.0, from.1, &here, false),
+    ])
+}
+
+/// `0x332`: stack one pile onto another (`AgroupItem`).
+///
+/// Both slots are in the bag. The original merges when the two hold the same
+/// item — it adds the source's count onto the destination and empties the
+/// source — and does nothing otherwise. We add one guard the original leaves
+/// to the client: the item has to be one that stacks at all, so dragging two
+/// identical swords together cannot silently add their refine levels.
+fn handle_group_item(state: &State, session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < 8 {
+        warn!(size = message.body.len(), "0x332 packet too short");
+        return Action::Ignore;
+    }
+    let src = u32::from_le_bytes(message.body[0..4].try_into().unwrap()) as u16;
+    let dest = u32::from_le_bytes(message.body[4..8].try_into().unwrap()) as u16;
+
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+
+    let (Some(src_item), Some(dest_item)) = (
+        character.items.get(inventory::BAG, src).cloned(),
+        character.items.get(inventory::BAG, dest).cloned(),
+    ) else {
+        return Action::Ignore;
+    };
+
+    // Same item, and one that stacks. The original checks only the first;
+    // the table check keeps refine levels of gear from being added up.
+    let groups = state.items.get(src_item.index as usize).is_some_and(|d| d.can_group());
+    if src_item.index == 0 || src_item.index != dest_item.index || !groups {
+        return Action::Ignore;
+    }
+
+    let mut merged = dest_item;
+    merged.refine = merged.refine.saturating_add(src_item.refine.max(1));
+    let _ = character.items.put(merged.clone());
+    let _ = character.items.take(inventory::BAG, src);
+    session.dirty = true;
+
+    Action::Reply(vec![
+        encode_refresh_item(inventory::BAG, src, &slot_item(&character.items, inventory::BAG, src), false),
+        encode_refresh_item(inventory::BAG, dest, &merged, false),
+    ])
+}
+
+/// `0x333`: split a pile in two (`UngroupItem`).
+///
+/// Only the bag can be split, and only for a count smaller than the pile — you
+/// cannot split off the whole thing, and an item that expires cannot be split
+/// at all. The taken-off count goes into the first free slot; a full bag
+/// refuses with the same message the original sends.
+fn handle_ungroup_item(state: &State, session: &mut Session, message: &Message) -> Action {
+    if message.body.len() < 12 {
+        warn!(size = message.body.len(), "0x333 packet too short");
+        return Action::Ignore;
+    }
+    let slot = u32::from_le_bytes(message.body[0..4].try_into().unwrap()) as u16;
+    let amount = u32::from_le_bytes(message.body[4..8].try_into().unwrap()) as u16;
+    let slot_type = u32::from_le_bytes(message.body[8..12].try_into().unwrap()) as u8;
+
+    // The original splits the bag only; equipment, storage and pran gear just
+    // return without doing anything.
+    if slot_type != inventory::BAG {
+        return Action::Ignore;
+    }
+
+    let client_id = session.client_id;
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+
+    let Some(source) = character.items.get(inventory::BAG, slot).cloned() else {
+        return Action::Ignore;
+    };
+    // Nothing to split off, or a whole-stack "split", or an item that expires.
+    let expires = state
+        .items
+        .get(source.index as usize)
+        .is_some_and(|d| d.duration() != 0);
+    if amount == 0 || amount >= source.refine || expires {
+        return Action::Ignore;
+    }
+
+    let Some(free) = character.items.first_free(inventory::BAG) else {
+        return Action::Reply(vec![encode_client_message(client_id, "Inventário cheio.")]);
+    };
+
+    let mut taken = source.clone();
+    taken.slot = free;
+    taken.refine = amount;
+    let mut left = source;
+    left.refine -= amount;
+
+    let _ = character.items.put(left.clone());
+    let _ = character.items.put(taken.clone());
+    session.dirty = true;
+
+    Action::Reply(vec![
+        encode_refresh_item(inventory::BAG, slot, &left, false),
+        encode_refresh_item(inventory::BAG, free, &taken, false),
     ])
 }
 
@@ -3932,6 +4043,103 @@ mod tests {
 
         assert_eq!(decode(&frames[0]).opcode, OP_CLIENT_MESSAGE);
         assert!(message_text(&frames[0]).contains("não encontrado"));
+    }
+
+    /// Two piles of the same stackable item merge into one.
+    #[tokio::test]
+    async fn stacking_two_piles_adds_them_up() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        {
+            let items = &mut session.character.as_mut().unwrap().items;
+            for (slot, count) in [(30u16, 7u16), (31u16, 5u16)] {
+                items
+                    .put(Item {
+                        container: inventory::BAG,
+                        slot,
+                        index: POTION,
+                        refine: count,
+                        ..Item::default()
+                    })
+                    .unwrap();
+            }
+        }
+
+        let mut body = vec![0u8; 8];
+        body[0..4].copy_from_slice(&30u32.to_le_bytes()); // src
+        body[4..8].copy_from_slice(&31u32.to_le_bytes()); // dest
+        let group = Message { sender: TEST_CLIENT_ID, opcode: OP_GROUP_ITEM, time: 0, body };
+        handle_message(&state, &mut session, &group).await;
+
+        let items = &session.character.as_ref().unwrap().items;
+        assert!(items.get(inventory::BAG, 30).is_none(), "the source pile was not emptied");
+        assert_eq!(items.get(inventory::BAG, 31).unwrap().refine, 12, "the piles did not add up");
+    }
+
+    /// A pile splits into two, and the taken-off half lands in a free slot.
+    #[tokio::test]
+    async fn splitting_a_pile_leaves_both_halves() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                container: inventory::BAG,
+                slot: 30,
+                index: POTION,
+                refine: 10,
+                ..Item::default()
+            })
+            .unwrap();
+
+        let mut body = vec![0u8; 12];
+        body[0..4].copy_from_slice(&30u32.to_le_bytes()); // slot
+        body[4..8].copy_from_slice(&4u32.to_le_bytes()); // take four off
+        body[8..12].copy_from_slice(&(inventory::BAG as u32).to_le_bytes());
+        let split = Message { sender: TEST_CLIENT_ID, opcode: OP_UNGROUP_ITEM, time: 0, body };
+        handle_message(&state, &mut session, &split).await;
+
+        let items = &session.character.as_ref().unwrap().items;
+        assert_eq!(items.get(inventory::BAG, 30).unwrap().refine, 6, "the source was not reduced");
+        let taken = items
+            .in_container(inventory::BAG)
+            .find(|i| i.slot != 30 && i.index == POTION)
+            .expect("the taken-off half went nowhere");
+        assert_eq!(taken.refine, 4, "the split-off count is wrong");
+    }
+
+    /// You cannot split off the whole pile — that is a no-op, not a duplicate.
+    #[tokio::test]
+    async fn splitting_the_whole_pile_does_nothing() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                container: inventory::BAG,
+                slot: 30,
+                index: POTION,
+                refine: 5,
+                ..Item::default()
+            })
+            .unwrap();
+
+        let mut body = vec![0u8; 12];
+        body[0..4].copy_from_slice(&30u32.to_le_bytes());
+        body[4..8].copy_from_slice(&5u32.to_le_bytes()); // the whole thing
+        body[8..12].copy_from_slice(&(inventory::BAG as u32).to_le_bytes());
+        let split = Message { sender: TEST_CLIENT_ID, opcode: OP_UNGROUP_ITEM, time: 0, body };
+        handle_message(&state, &mut session, &split).await;
+
+        let items = &session.character.as_ref().unwrap().items;
+        assert_eq!(items.in_container(inventory::BAG).filter(|i| i.index == POTION).count(), 1);
+        assert_eq!(items.get(inventory::BAG, 30).unwrap().refine, 5);
     }
 
     #[tokio::test]

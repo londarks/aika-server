@@ -1,0 +1,22 @@
+[package]
+name = "aika-overlay"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+
+# The file has to be called `d3d9.dll` for the client to load it, so the
+# library name is the export name and not the package name.
+[lib]
+name = "d3d9"
+crate-type = ["cdylib"]
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }

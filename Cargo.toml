@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/aika-net", "crates/aika-server", "crates/aika-data"]
+# The overlay is a 32-bit Windows library loaded by the game client, not part
+# of the server. Building it with the workspace would compile it for the host's
+# 64 bits, where it is of no use to anything, so it keeps its own workspace and
+# is built with an explicit `--target`.
+exclude = ["crates/aika-overlay"]
 
 [workspace.package]
 edition = "2021"

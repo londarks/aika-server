@@ -21,3 +21,7 @@ crates/aika-data/testdata/ItemList.bin
 # Data copied from the original pack (NPCs, item table): read by our server,
 # never redistributed, and never referenced by an absolute path.
 /assets/
+
+# The overlay builds for another target, out of the workspace, so its output
+# does not land under the /target above.
+/crates/aika-overlay/target/

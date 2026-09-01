@@ -109,13 +109,24 @@ impl Buffs {
     /// Every buff still running, as the skill and the moment it ends, which
     /// is `None` for one that does not. Sorted, so the packet is the same
     /// twice in a row for the same state.
+    ///
+    /// One whose moment has passed is left out rather than reported with
+    /// nothing left. It is dropped for good on the next heartbeat, but the
+    /// list can be asked for in between — and an entry saying zero is drawn as
+    /// a buff with an empty timer sitting in the bar, which is what put those
+    /// two dead icons on screen.
     pub fn running(&self, skills: &SkillTable) -> Vec<(usize, Option<SystemTime>)> {
+        let now = SystemTime::now();
         let mut out: Vec<_> = self
             .started
             .iter()
             .filter_map(|(&id, &started)| {
                 let def = skills.get(id)?;
-                Some((id, ends_at(started, def.duration_secs())))
+                let ends = ends_at(started, def.duration_secs());
+                match ends {
+                    Some(at) if at <= now => None,
+                    _ => Some((id, ends)),
+                }
             })
             .collect();
         out.sort_by_key(|(id, _)| *id);

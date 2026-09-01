@@ -1715,7 +1715,7 @@ async fn the_buff_list_counts_down_rather_than_naming_a_moment() {
 #[tokio::test]
 async fn spending_mana_does_not_shrink_the_pool() {
     let state = shop_state();
-    let mut session = in_world(&state).await;
+    let session = in_world(&state).await;
     let character = session.character.as_ref().unwrap();
     let (max_hp, max_mp) = vitals(character);
 

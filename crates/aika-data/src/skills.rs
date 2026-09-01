@@ -235,6 +235,13 @@ impl Skill {
         u32le(&self.raw, field::DURATION)
     }
 
+    /// How long the client draws a bar for before the cast lands, in
+    /// milliseconds. Above zero and the skill reaches the server twice: once
+    /// when the bar starts and once when it fills.
+    pub fn cast_time_ms(&self) -> u32 {
+        u32le(&self.raw, field::CAST_TIME)
+    }
+
     pub fn self_animation(&self) -> u32 {
         u32le(&self.raw, field::SELF_ANIMATION)
     }

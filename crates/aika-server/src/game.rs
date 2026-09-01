@@ -2838,6 +2838,12 @@ fn cast_skill(
 
     session.cur_mp = session.cur_mp.saturating_sub(cast.mana);
     session.cooldowns.start(cast.family, cast.cooldown, now);
+    debug!(
+        skill = cast.skill,
+        cast_ms = state.skills.get(cast.skill).map(|s| s.cast_time_ms()).unwrap_or(0),
+        target = request.target,
+        "cast started"
+    );
 
     // Casting stands the player up, the same way walking does (`UseSkill`
     // clears `CurrentAction` too).
@@ -3104,14 +3110,41 @@ fn handle_revive(state: &State, session: &mut Session, _message: &Message) -> Ac
 /// taken again — this is the second half of one cast, not a second cast.
 fn finish_self_cast(state: &State, session: &mut Session, skill: usize) -> Action {
     let Some(def) = state.skills.get(skill) else {
-        debug!(skill, "0x302 naming a skill the table does not have");
+        debug!(skill, "cast finished, but the table has no such skill");
         return Action::Ignore;
     };
     if def.duration_secs() == 0 {
-        debug!(skill, "0x302 on self for a skill that does not last");
-        return Action::Ignore;
+        // Nothing to hold on to, but the client is waiting to be let go of:
+        // the animation still goes out below.
+        debug!(skill, "cast finished on self with nothing lasting to show for it");
+        return play_self_cast(state, session, skill, def.self_animation() as u16);
     }
+    debug!(skill, "cast finished");
+    let animation = def.self_animation() as u16;
 
+    let mut frames = grant_buff(state, session, skill);
+    if let Action::Reply(played) = play_self_cast(state, session, skill, animation) {
+        frames.splice(0..0, played);
+    }
+    Action::Reply(frames)
+}
+
+/// The animation everyone watching plays when a cast lands on its caster.
+///
+/// The original builds a fresh `0x302` rather than echoing the one it got, and
+/// fills the animation from the skill's own `SelfAnimation`: the client sends
+/// nothing useful in that field, so a cast finished without this leaves the
+/// caster standing still while the spell goes off.
+///
+/// It goes out even for a skill that leaves nothing behind. The client is
+/// waiting to be told the cast is over, and a cast it is never let go of is a
+/// client that stops moving.
+fn play_self_cast(
+    state: &State,
+    session: &mut Session,
+    skill: usize,
+    animation: u16,
+) -> Action {
     // Where the caster stands comes from the world, not from the packet.
     let at = session
         .character
@@ -3119,19 +3152,9 @@ fn finish_self_cast(state: &State, session: &mut Session, skill: usize) -> Actio
         .map(|c| (c.x as f32, c.y as f32))
         .unwrap_or((0.0, 0.0));
 
-    let mut frames = grant_buff(state, session, skill);
-    if frames.is_empty() {
-        return Action::Ignore;
-    }
-
-    // And the animation, which is the packet everyone watching plays. The
-    // original builds a fresh `0x302` rather than echoing the one it got, and
-    // fills the animation from the skill's own `SelfAnimation` -- the client
-    // sends nothing useful in that field, so a cast finished without this
-    // leaves the caster standing still while the spell goes off.
     let played = combat::Attack {
         target: session.client_id,
-        animation: def.self_animation() as u16,
+        animation,
         skill: skill as u16,
         from: at,
         at,
@@ -3146,8 +3169,7 @@ fn finish_self_cast(state: &State, session: &mut Session, skill: usize) -> Actio
         rand::random(),
     );
     state.world.send_to_visible(session.client_id, relay.clone());
-    frames.insert(0, relay);
-    Action::Reply(frames)
+    Action::Reply(vec![relay])
 }
 
 fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Action {
@@ -3269,8 +3291,8 @@ fn reward_for(state: &State, session: &mut Session, target: &crate::mob::Mob) ->
     // experience says it should.
     let gained = state.levels.levels_gained(character.level, character.exp);
     let mut frames = Vec::new();
-    if gained > 0 {
-        character.level = character.level.saturating_add(gained);
+    if gained > 0 && character.level < LEVEL_CAP {
+        character.level = character.level.saturating_add(gained).min(LEVEL_CAP);
         info!(character = %character.name, level = character.level, "levelled up");
 
         // Health and mana come back full: a level is the one moment the game
@@ -3444,6 +3466,15 @@ fn encode_effect(client_id: u16, effect: u32) -> Vec<u8> {
 /// The effect number the client plays when a character gains a level
 /// (`AddLevel` sends `SendEffect(1)`).
 const EFFECT_LEVEL_UP: u32 = 1;
+
+/// The highest level a character reaches.
+///
+/// `ExpList.bin` holds a hundred, but the item table stops at ninety-nine: a
+/// saddle is `10..99`, and the best earned gear of every class is the tier at
+/// ninety-six. A character that levels past it finds its own mount refused,
+/// because that range is enforced by the client and the client will not budge.
+/// So the curve is allowed to run out one short of the file.
+const LEVEL_CAP: u16 = 99;
 
 /// The six basic skills every class is born knowing, and the marker the record
 /// carries for a learned one (`SetPlayerSkills` writes `2`).

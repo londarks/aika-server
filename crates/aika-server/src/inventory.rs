@@ -70,6 +70,32 @@ pub fn page_item_for(container: u8, slot: u16) -> Option<u16> {
     }
 }
 
+/// The equipment slot ammunition goes in, and the one every weapon goes in,
+/// whatever kind of weapon it is.
+pub const AMMO_SLOT: u16 = 15;
+pub const WEAPON_SLOT: u16 = 6;
+
+/// Which equipment slot an item belongs in, or `None` for one that is not
+/// equipment at all (`TItemFunctions.GetItemEquipSlot`,
+/// `Functions/ItemFunctions.pas:605`).
+///
+/// For most gear the slot *is* the item type — armour of type 3 goes in slot
+/// 3 — which reads like a coincidence and is not: the table was built that
+/// way. Weapons are the exception, a whole range of types that all go in the
+/// hand, and ammunition another.
+///
+/// The original returns zero for anything else, and zero is its way of saying
+/// "this belongs in the bag" rather than "slot 0"; slot 0 is the body and slot
+/// 1 the hair, and neither is an item anybody may move.
+pub fn equip_slot_for(item_type: u16) -> Option<u16> {
+    match item_type {
+        50 | 52 | 102 | 103 => Some(AMMO_SLOT),
+        1000..=1011 | 1019 => Some(WEAPON_SLOT),
+        1..=16 => Some(item_type),
+        _ => None,
+    }
+}
+
 /// Whether a slot holds a page-unlocking item, which cannot itself be dragged
 /// anywhere: the original leaves the range that reaches them unhandled and
 /// falls out of `MoveItem`.

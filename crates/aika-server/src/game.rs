@@ -2043,6 +2043,15 @@ fn check_move(
         return Err("that slot holds the thing that unlocks a page");
     }
 
+    // Slot 0 is the body and slot 1 the hair. They are drawn from the
+    // equipment array but they are not items, and the original refuses any
+    // move that names them (`srcSlot > 1`, `destSlot > 1`).
+    for side in [from, to] {
+        if side.0 == inventory::EQUIP && side.1 < 2 {
+            return Err("the body and the hair are not items");
+        }
+    }
+
     // Putting something in needs the window open. Taking something out does
     // not: the original has that check commented out on the source side, and
     // a player pulling from their own chest robs nobody.
@@ -2060,6 +2069,23 @@ fn check_move(
         let owner = if side.0 == inventory::STORAGE { &account.storage } else { &character.items };
         owner.get(side.0, side.1).cloned()
     };
+
+    // An item goes in the slot its type says and in no other. The original
+    // works this out in `GetItemEquipSlot`, and the client normally respects
+    // it; when it does not, the damage is real — a saddle dropped into the
+    // mount slot is drawn as the mount, and the client hangs for ever trying
+    // to draw a horse out of something that is not one.
+    if to.0 == inventory::EQUIP {
+        let Some(moving) = held(from) else {
+            return Err("there is nothing to equip");
+        };
+        let item_type = state.items.get(moving.index as usize).map_or(0, |d| d.item_type());
+        match inventory::equip_slot_for(item_type) {
+            Some(slot) if slot == to.1 => {}
+            Some(_) => return Err("that is not the slot this item goes in"),
+            None => return Err("that is not equipment"),
+        }
+    }
 
     // A locked page is not a place to take from or put into.
     for side in [from, to] {
@@ -4903,6 +4929,14 @@ mod tests {
             r[field::DURABILITY] = 60;
         };
         define(1000, 500, false);
+        // A sword is a weapon and a horse is a mount, and the slot each one
+        // goes in comes from that. Leaving them typeless made them fixtures
+        // of something that could not exist.
+        raw[1000 * RECORD_SIZE + field::ITEM_TYPE..1000 * RECORD_SIZE + field::ITEM_TYPE + 2]
+            .copy_from_slice(&1002u16.to_le_bytes());
+        raw[963 * RECORD_SIZE + field::NAME.start] = b'x';
+        raw[963 * RECORD_SIZE + field::ITEM_TYPE..963 * RECORD_SIZE + field::ITEM_TYPE + 2]
+            .copy_from_slice(&9u16.to_le_bytes());
 
         // a health potion: the type and the effect are what makes it drinkable
         let r = &mut raw[POTION as usize * RECORD_SIZE..(POTION as usize + 1) * RECORD_SIZE];
@@ -5984,6 +6018,84 @@ mod tests {
         assert_eq!(at(spawn_offset::EQUIP + 7 * 2), 0, "the mount leaked into the equip array");
     }
 
+    /// A saddle is not a mount, and the mount slot is not a place to put one.
+    ///
+    /// This is what happened for real: the saddle went into slot 9, the spawn
+    /// then told everyone the player was riding a saddle, and the client hung
+    /// trying to draw a horse out of it.
+    #[tokio::test]
+    async fn a_saddle_cannot_be_worn_as_a_mount() {
+        let state = buff_state();
+        let mut session = in_world(&state).await;
+        carrying(&mut session, SADDLE, 7);
+
+        handle_message(
+            &state,
+            &mut session,
+            &drag((inventory::BAG, 7), (inventory::EQUIP, MOUNT_SLOT)),
+        )
+        .await;
+
+        let items = &session.character.as_ref().unwrap().items;
+        assert!(
+            items.get(inventory::EQUIP, MOUNT_SLOT).is_none(),
+            "a saddle was worn as a mount, and the client cannot draw that"
+        );
+        assert_eq!(
+            items.get(inventory::BAG, 7).map(|i| i.index),
+            Some(SADDLE),
+            "and it was lost on the way"
+        );
+    }
+
+    /// Nor does a helmet go on a foot. The slot an item goes in is its type,
+    /// and the server no longer takes the client's word for it.
+    #[tokio::test]
+    async fn gear_only_goes_in_the_slot_its_type_names() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                index: 1000,
+                container: inventory::BAG,
+                slot: 7,
+                durability_min: 255,
+                ..Item::default()
+            })
+            .unwrap();
+
+        // A sword in the boots.
+        handle_message(&state, &mut session, &drag((inventory::BAG, 7), (inventory::EQUIP, 5)))
+            .await;
+        assert!(
+            session.character.as_ref().unwrap().items.get(inventory::EQUIP, 5).is_none(),
+            "a sword was worn as a pair of boots"
+        );
+
+        // And in the hand, where it belongs.
+        handle_message(
+            &state,
+            &mut session,
+            &drag((inventory::BAG, 7), (inventory::EQUIP, inventory::WEAPON_SLOT)),
+        )
+        .await;
+        assert_eq!(
+            session
+                .character
+                .as_ref()
+                .unwrap()
+                .items
+                .get(inventory::EQUIP, inventory::WEAPON_SLOT)
+                .map(|i| i.index),
+            Some(1000),
+            "a sword could not be drawn"
+        );
+    }
+
     /// Getting on a horse has to reach everyone who can see the rider, which
     /// is what the respawn after an equipment move is for.
     #[tokio::test]
@@ -6740,7 +6852,8 @@ mod tests {
             time: 0,
             body: MoveItem {
                 to_container: inventory::EQUIP as u16,
-                to_slot: 8,
+                // A sword goes in the hand and nowhere else.
+                to_slot: inventory::WEAPON_SLOT,
                 from_container: inventory::BAG as u16,
                 from_slot: 0,
             }
@@ -6749,7 +6862,11 @@ mod tests {
         handle_message(&state, &mut session, &drag).await;
 
         let items = &session.character.as_ref().unwrap().items;
-        assert_eq!(items.get(inventory::EQUIP, 8).unwrap().index, 1000, "not equipped");
+        assert_eq!(
+            items.get(inventory::EQUIP, inventory::WEAPON_SLOT).unwrap().index,
+            1000,
+            "not equipped"
+        );
         assert!(items.get(inventory::BAG, 0).is_none(), "still in the bag too");
     }
 

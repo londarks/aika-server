@@ -2607,6 +2607,13 @@ fn reward_for(state: &State, session: &mut Session, target: &crate::mob::Mob) ->
             session.cur_hp,
             session.cur_mp,
         ));
+
+        // The burst everyone on screen sees. The original plays it on the
+        // player for everyone who can see them, so it goes out to the world
+        // and comes back to the killer in the same reply.
+        let effect = encode_effect(client_id, EFFECT_LEVEL_UP);
+        state.world.send_to_visible(client_id, effect.clone());
+        frames.push(effect);
     }
 
     frames.push(encode_level(session.character.as_ref().expect("checked above"), client_id));
@@ -2732,16 +2739,30 @@ fn encode_mob_spawn(mob: &crate::mob::Mob) -> Vec<u8> {
 
 /// `TSendClientIndexPacket` (`0x117`): the id of the mob the player is.
 fn encode_client_index(client_id: u16) -> Vec<u8> {
+    encode_effect(client_id, 0)
+}
+
+/// The same packet as an effect over somebody's head (`TPlayer.SendEffect`).
+///
+/// `Index` is who it plays on and `Effect` which one; effect 1 is the burst a
+/// character gives off when it gains a level. The original sends it to
+/// everyone who can see the player, themselves included, so a level-up is
+/// visible to the whole screen and not just the one who earned it.
+fn encode_effect(client_id: u16, effect: u32) -> Vec<u8> {
     let mut body = Vec::with_capacity(CLIENT_INDEX_SIZE - MIN_FRAME);
     body.extend_from_slice(&(client_id as u32).to_le_bytes());
-    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&effect.to_le_bytes());
 
     debug_assert_eq!(body.len() + MIN_FRAME, CLIENT_INDEX_SIZE);
     frame::encode(
-        &Message { sender: 0, opcode: OP_CLIENT_INDEX, time: 0, body },
+        &Message { sender: client_id, opcode: OP_CLIENT_INDEX, time: 0, body },
         rand::random(),
     )
 }
+
+/// The effect number the client plays when a character gains a level
+/// (`AddLevel` sends `SendEffect(1)`).
+const EFFECT_LEVEL_UP: u32 = 1;
 
 /// `Tp131` (`0x131`): zero except for one field of all ones.
 fn encode_enter_131() -> Vec<u8> {

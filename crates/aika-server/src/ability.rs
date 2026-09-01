@@ -215,29 +215,51 @@ pub const TIERS: u32 = 9;
 ///
 /// `ClassInfo` is one byte holding two things: the class in the tens and
 /// the tier in the units, which is why `GetMobClass` is a `div 10`
-/// (`Mob/BaseMob.pas:2120`). A Guerreiro is 1, and 2 and 3 are the same
+/// (`Mob/BaseMob.pas:2064`). A Guerreiro is 1, and 2 and 3 are the same
 /// class further along.
 ///
-/// # This is ours, and the only thing here that is
+/// # What the live game did
 ///
-/// The original never advances it. The six templates set 1, 11, 21, 31, 41
-/// and 51, the login loads the column, the save writes it back, and no
-/// handler, quest or operator command in the whole source assigns it — so a
-/// character on the original stayed at its first tier unless somebody edited
-/// the database by hand. That is not a rule to copy, it is a hole.
+/// Promotion was a chain of quests, not a level. At level 50, with a Pran
+/// equipped and standing in your own nation, a trainer started it; finishing
+/// it renamed the class -- a Templaria came back a Paladino -- and only then
+/// could the character pass level 50 at all. The tier-two skills open at 51,
+/// one level the other side of that gate, which is why the table puts them
+/// there.
 ///
-/// The level to fill it with is not invented either: it is read off the
-/// table, which lays every class out the same way. Slots one to twenty-four
-/// carry the tier-one skills and slot twenty-five is where the tier-two ones
-/// begin, at level 51 for five classes and 55 for the Guerreiro. So the tier
-/// is simply the highest one whose skills the character is already allowed
-/// to learn, which needs no threshold written down anywhere and cannot
-/// disagree with what the trainer offers.
+/// # What the original server did, which is nothing
 ///
-/// Nothing is gated on the result. The original tests class ownership with
-/// `MatchClassInfo`, which compares tens digits, so a tier-one character can
-/// already learn a tier-two skill the moment the level allows; the tier is
-/// the name the client puts on the character, and it is left that way.
+/// It never advances the digit. The six templates set 1, 11, 21, 31, 41 and
+/// 51, the login loads the column, the save writes it back, and no handler,
+/// quest or operator command in the whole source assigns it. The quest system
+/// it does have is half a system: `GetQuest` accepts and `FinishQuest` hands
+/// out rewards and prans, and neither so much as reads `ClassInfo`. So a
+/// character there stayed at its first tier however far it levelled unless
+/// somebody edited the database by hand. That is a hole rather than a rule,
+/// and it is why a level 99 is still called what it was called at level 1.
+///
+/// # What this does until the quests exist
+///
+/// There is no chain here to gate it on and no Pran to require, so the level
+/// carries the promotion on its own for now. The level is not a number
+/// invented for the purpose: every class lays its sixty slots out the same
+/// way, slots one to twenty-four holding the tier-one skills and slot
+/// twenty-five beginning the tier-two ones, so the tier is the highest one
+/// whose skills the character may already learn. That is the same test
+/// [`known_by`] uses to decide what a trainer offers, which is the point --
+/// the name on the character and the list in the skill window cannot drift
+/// apart, and there is no threshold written down to go stale.
+///
+/// When quests and prans land, this is the function to replace: finishing the
+/// chain is what should raise the tier, and the tier is what should let a
+/// character past level 50.
+///
+/// # Nothing is gated on the result
+///
+/// The original tests class ownership with `MatchClassInfo`, which compares
+/// tens digits, so a tier-one character can already learn a tier-two skill
+/// the moment the level allows. The tier is the name the client puts on the
+/// character, and it is left meaning exactly that.
 pub fn tier(table: &SkillTable, class_number: u32, level: u32) -> u32 {
     let group = (class_number.max(1) - 1) * 10;
     (1..=SLOTS_PER_CLASS)

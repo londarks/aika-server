@@ -343,6 +343,7 @@ pub fn create(
         skill_list: [0; 60],
         item_bar: [0; 40],
         skill_points: crate::store::skill_points_for(1),
+        tier: crate::promotion::FIRST_TIER,
     };
 
     // Everything a class is born with comes from its template. Without one

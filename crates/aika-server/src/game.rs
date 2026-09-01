@@ -12,7 +12,7 @@
 use crate::state::State;
 use crate::inventory::{self, Inventory};
 use crate::store::{Account, Character, Item, MAX_CHARACTERS};
-use crate::{ability, combat, creation, dialog, expiry, shop, stats};
+use crate::{ability, combat, creation, dialog, expiry, promotion, shop, stats};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
 use crate::effects::Effects;
 use aika_data::itemlist::ItemList;
@@ -984,7 +984,7 @@ fn handle_request_login(state: &State, session: &mut Session, message: &Message)
         );
     }
 
-    let frame = encode_char_list(&account, session.client_id, state.uptime_ms(), &state.skills);
+    let frame = encode_char_list(&account, session.client_id, state.uptime_ms());
     state.world.set_account(session.client_id, account.id);
     session.account = Some(account);
     Action::Reply(vec![frame])
@@ -1052,7 +1052,7 @@ fn handle_enter_world(
         encode_signal(OP_SIGNAL_LOAD, client_id, time, 1),
         encode_signal(OP_SIGNAL_LOAD, client_id, time, 1),
         encode_enter_131(),
-        encode_send_to_world(&account, &character, client_id, time, &state.skills),
+        encode_send_to_world(&account, &character, client_id, time),
         zeroed(OP_ENTER_12C, 0, ENTER_12C_SIZE),
     ];
 
@@ -1835,6 +1835,48 @@ fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> A
                 encode_skill_list_from(session.client_id, npc_id, &skills),
             ])
         }
+        dialog::option::QUESTS => {
+            // The promotion chain was quests, and this is standing in for it
+            // until there are quests: an NPC that offers them promotes a
+            // character waiting at its tier's wall. See `crate::promotion`.
+            let (Some(character), Some(_)) = (session.character.as_ref(), session.account.as_ref())
+            else {
+                return Action::Ignore;
+            };
+            match promotion::Promotion::offered(character.tier, character.level) {
+                Ok(next) => {
+                    session.character.as_mut().expect("checked above").tier = next.tier;
+                    session.dirty = true;
+                    let character = session.character.as_ref().expect("checked above");
+                    let account = session.account.as_ref().expect("checked above");
+                    info!(
+                        character = %character.name,
+                        npc = npc_id,
+                        tier = next.tier,
+                        cap = next.level_cap,
+                        "promoted"
+                    );
+                    let text = format!("You may now reach level {}.", next.level_cap);
+                    // The class name is part of the character record, so the
+                    // client only repaints it when the whole record arrives.
+                    let refreshed = encode_send_to_world(
+                        account,
+                        character,
+                        session.client_id,
+                        state.uptime_ms(),
+                    );
+                    Action::Reply(vec![
+                        encode_menu_close(),
+                        refreshed,
+                        encode_client_message(session.client_id, &text),
+                    ])
+                }
+                Err(refusal) => Action::Reply(vec![
+                    encode_menu_close(),
+                    encode_client_message(session.client_id, &refusal.message()),
+                ]),
+            }
+        }
         dialog::option::CLOSE => {
             session.opened_npc = None;
             Action::Reply(vec![encode_menu_close()])
@@ -2584,7 +2626,7 @@ async fn handle_create_character(
             info!(user = %username, name = %request.name, error = %e, "character refused");
             return Action::Reply(vec![
                 encode_client_message(session.client_id, &e.message()),
-                encode_char_list(account, session.client_id, state.uptime_ms(), &state.skills),
+                encode_char_list(account, session.client_id, state.uptime_ms()),
             ]);
         }
     };
@@ -2607,7 +2649,7 @@ async fn handle_create_character(
                 );
                 return Action::Reply(vec![
                     encode_client_message(session.client_id, "The character could not be saved."),
-                    encode_char_list(account, session.client_id, state.uptime_ms(), &state.skills),
+                    encode_char_list(account, session.client_id, state.uptime_ms()),
                 ]);
             }
         }
@@ -2627,7 +2669,7 @@ async fn handle_create_character(
     // the one the store holds.
     let account = state.store.get(&username).unwrap_or_else(|| account.clone());
     session.account = Some(account.clone());
-    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms(), &state.skills)])
+    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
 }
 
 
@@ -2676,7 +2718,6 @@ async fn handle_delete_character(
             account,
             session.client_id,
             state.uptime_ms(),
-            &state.skills,
         )]);
     };
 
@@ -2684,7 +2725,7 @@ async fn handle_delete_character(
     if session.character.as_ref().is_some_and(|c| c.id == doomed.id) {
         return Action::Reply(vec![
             encode_client_message(session.client_id, "You cannot delete the character you are playing."),
-            encode_char_list(account, session.client_id, state.uptime_ms(), &state.skills),
+            encode_char_list(account, session.client_id, state.uptime_ms()),
         ]);
     }
 
@@ -2698,7 +2739,7 @@ async fn handle_delete_character(
             );
             return Action::Reply(vec![
                 encode_client_message(session.client_id, "The character could not be deleted."),
-                encode_char_list(account, session.client_id, state.uptime_ms(), &state.skills),
+                encode_char_list(account, session.client_id, state.uptime_ms()),
             ]);
         }
     }
@@ -2708,7 +2749,7 @@ async fn handle_delete_character(
 
     let account = state.store.get(&username).unwrap_or_else(|| account.clone());
     session.account = Some(account.clone());
-    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms(), &state.skills)])
+    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
 }
 
 
@@ -3291,10 +3332,14 @@ fn reward_for(state: &State, session: &mut Session, target: &crate::mob::Mob) ->
     // character whose experience is edited in the database lands where that
     // experience says it should.
     let gained = state.levels.levels_gained(character.level, character.exp);
+    // A character stops at its own tier's wall, not at the end of the curve.
+    // Experience keeps piling up while it waits there, so being promoted late
+    // does not cost anything that was earned in the meantime.
+    let cap = promotion::level_cap(character.tier);
     let mut frames = Vec::new();
-    if gained > 0 && character.level < LEVEL_CAP {
-        character.level = character.level.saturating_add(gained).min(LEVEL_CAP);
-        info!(character = %character.name, level = character.level, "levelled up");
+    if gained > 0 && character.level < cap {
+        character.level = character.level.saturating_add(gained).min(cap);
+        info!(character = %character.name, level = character.level, cap, "levelled up");
 
         // Health and mana come back full: a level is the one moment the game
         // hands them over, and arriving at a new level nearly dead is a
@@ -3468,14 +3513,6 @@ fn encode_effect(client_id: u16, effect: u32) -> Vec<u8> {
 /// (`AddLevel` sends `SendEffect(1)`).
 const EFFECT_LEVEL_UP: u32 = 1;
 
-/// The highest level a character reaches.
-///
-/// `ExpList.bin` holds a hundred, but the item table stops at ninety-nine: a
-/// saddle is `10..99`, and the best earned gear of every class is the tier at
-/// ninety-six. A character that levels past it finds its own mount refused,
-/// because that range is enforced by the client and the client will not budge.
-/// So the curve is allowed to run out one short of the file.
-const LEVEL_CAP: u16 = 99;
 
 /// The six basic skills every class is born knowing, and the marker the record
 /// carries for a learned one (`SetPlayerSkills` writes `2`).
@@ -3506,12 +3543,10 @@ fn encode_send_to_world(
     character: &Character,
     client_id: u16,
     time: u32,
-    skills: &SkillTable,
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(4 + CHARACTER_SIZE);
     body.extend_from_slice(&account.id.to_le_bytes());
-    let tier = crate::ability::tier(skills, character.class_number() as u32, character.level as u32);
-    body.extend_from_slice(&encode_character(character, client_id, tier as u16));
+    body.extend_from_slice(&encode_character(character, client_id));
 
     debug_assert_eq!(body.len() + MIN_FRAME, SEND_TO_WORLD_SIZE);
     frame::encode(
@@ -3522,7 +3557,7 @@ fn encode_send_to_world(
 
 /// `TCharacter`. Only the fields the client needs to build the character;
 /// the rest (inventory, skills, quests, titles) stays zeroed for now.
-fn encode_character(character: &Character, client_id: u16, tier: u16) -> Vec<u8> {
+fn encode_character(character: &Character, client_id: u16) -> Vec<u8> {
     use character_offset as off;
     let mut out = vec![0u8; CHARACTER_SIZE];
 
@@ -3538,7 +3573,7 @@ fn encode_character(character: &Character, client_id: u16, tier: u16) -> Vec<u8>
     put32(&mut out, off::CHAR_INDEX, character.slot as u32 + 1);
     write_fixed_str(&mut out[off::NAME..off::NAME + 16], &character.name);
     out[off::NATION] = character.nation as u8;
-    out[off::CLASS_INFO] = character.class_info(tier) as u8;
+    out[off::CLASS_INFO] = character.class_info() as u8;
 
     for (i, value) in character.attributes.iter().enumerate() {
         put16(&mut out, off::ATTRIBUTES + i * 2, *value);
@@ -3654,12 +3689,7 @@ impl RequestLogin {
 
 /// `TSendToCharListPacket` (`Data/Packets.pas:233`): account id, two zeroed
 /// two zeroed fields and three character entries.
-pub fn encode_char_list(
-    account: &Account,
-    client_id: u16,
-    time: u32,
-    skills: &SkillTable,
-) -> Vec<u8> {
+pub fn encode_char_list(account: &Account, client_id: u16, time: u32) -> Vec<u8> {
     let mut body = Vec::with_capacity(CHAR_LIST_SIZE - MIN_FRAME);
     body.extend_from_slice(&account.id.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes()); // Unk
@@ -3667,7 +3697,7 @@ pub fn encode_char_list(
 
     for slot in 0..MAX_CHARACTERS {
         let character = account.characters.iter().find(|c| c.slot == slot);
-        body.extend_from_slice(&encode_char_list_entry(character, skills));
+        body.extend_from_slice(&encode_char_list_entry(character));
     }
 
     debug_assert_eq!(body.len() + MIN_FRAME, CHAR_LIST_SIZE);
@@ -3680,10 +3710,7 @@ pub fn encode_char_list(
 /// `TCharacterListData` (`Data/Packets.pas:215`), 104 bytes: the entry on the
 /// selection screen, far smaller than the world's `TCharacter`. An empty
 /// entry is all zeroes.
-fn encode_char_list_entry(
-    character: Option<&Character>,
-    skills: &SkillTable,
-) -> [u8; CHAR_ENTRY_SIZE] {
+fn encode_char_list_entry(character: Option<&Character>) -> [u8; CHAR_ENTRY_SIZE] {
     let mut out = [0u8; CHAR_ENTRY_SIZE];
     let Some(character) = character else {
         return out;
@@ -3691,8 +3718,7 @@ fn encode_char_list_entry(
 
     write_fixed_str(&mut out[0..16], &character.name);
     out[16..18].copy_from_slice(&character.nation.to_le_bytes());
-    let tier = crate::ability::tier(skills, character.class_number() as u32, character.level as u32);
-    out[18..20].copy_from_slice(&character.class_info(tier as u16).to_le_bytes());
+    out[18..20].copy_from_slice(&character.class_info().to_le_bytes());
     out[20..24].copy_from_slice(&character.sizes);
 
     // The selection screen dresses the character the same way the world

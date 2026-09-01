@@ -7,6 +7,7 @@
 use super::*;
 use crate::config::{Config, DevAccount, DevCharacter};
 use crate::world::World;
+use crate::promotion;
 
 fn state_with(characters: Vec<DevCharacter>) -> State {
     let cfg = Config {
@@ -874,7 +875,7 @@ fn the_record_carries_the_hotbar_and_known_skills() {
     character.item_bar[3] = 30994;
     character.skill_list[52] = 15378;
 
-    let record = encode_character(&character, 7, 1);
+    let record = encode_character(&character, 7);
 
     use character_offset as off;
     let bar3 = u32::from_le_bytes(
@@ -895,7 +896,7 @@ fn the_record_carries_the_skill_points() {
     let mut character = Character::from(&dev_character("Athus", 0));
     character.skill_points = 100;
 
-    let record = encode_character(&character, 7, 1);
+    let record = encode_character(&character, 7);
     let points = u16::from_le_bytes(
         record[character_offset::SKILL_POINT..character_offset::SKILL_POINT + 2]
             .try_into()
@@ -1412,7 +1413,7 @@ async fn what_a_character_carries_reaches_the_client_in_the_world_packet() {
     character.gold = 4242;
 
     let character = session.character.as_ref().unwrap().clone();
-    let record = encode_character(&character, TEST_CLIENT_ID, 1);
+    let record = encode_character(&character, TEST_CLIENT_ID);
 
     use character_offset as off;
     let at = off::INVENTORY + 2 * off::ITEM_SIZE;
@@ -1438,12 +1439,12 @@ async fn an_unimplemented_option_says_so_instead_of_going_quiet() {
     let frames = frames_of(handle_message(
         &state,
         &mut session,
-        &open_npc(2050, dialog::option::QUESTS),
+        &open_npc(2050, dialog::option::TALK),
     ).await);
 
-    // quests keep the window open, so nothing closes it
+    // talking keeps the window open, so nothing closes it
     assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE]);
-    assert_eq!(message_text(&frames[0]), "Quest is not available yet.");
+    assert_eq!(message_text(&frames[0]), "Talk is not available yet.");
 
     // repair does not, so it closes first
     let frames = frames_of(handle_message(&state, &mut session, &open_npc(2050, 31)).await);
@@ -1540,7 +1541,7 @@ async fn a_new_character_arrives_carrying_its_starting_gear() {
     handle_message(&state, &mut session, &create_message("Novato", 0)).await;
 
     let created = session.account.as_ref().unwrap().characters[0].clone();
-    let record = encode_character(&created, TEST_CLIENT_ID, 1);
+    let record = encode_character(&created, TEST_CLIENT_ID);
 
     use character_offset as off;
     let last_bag = off::INVENTORY + 125 * off::ITEM_SIZE;
@@ -3497,7 +3498,7 @@ async fn what_a_character_wears_reaches_the_spawn_and_the_selection_screen() {
     assert_eq!(worn(7), 0, "an empty slot stays empty");
 
     // and the selection screen dresses it the same way
-    let entry = encode_char_list_entry(Some(&character), &SkillTable::default());
+    let entry = encode_char_list_entry(Some(&character));
     let at = 24 + 2 * 2;
     assert_eq!(u16::from_le_bytes(entry[at..at + 2].try_into().unwrap()), 3314);
 }
@@ -3574,7 +3575,7 @@ fn to_the_cap_state() -> State {
     let mut state = progress_state();
     state.levels = aika_data::exp::ExpTable::decode(&{
         let mut bytes = Vec::new();
-        for level in 0..=LEVEL_CAP as u64 + 1 {
+        for level in 0..=promotion::level_cap(promotion::LAST_TIER) as u64 + 1 {
             bytes.extend_from_slice(&(level * 20).to_le_bytes());
         }
         bytes
@@ -3594,16 +3595,17 @@ fn to_the_cap_state() -> State {
 async fn the_curve_stops_at_the_cap() {
     let state = to_the_cap_state();
     let mut session = in_world(&state).await;
-    session.character.as_mut().unwrap().level = LEVEL_CAP;
+    session.character.as_mut().unwrap().level = promotion::level_cap(promotion::LAST_TIER);
     // Far more than the curve asks for the next level, so nothing but the cap
     // is holding it back.
     session.character.as_mut().unwrap().exp = 1_000_000;
+    session.character.as_mut().unwrap().tier = promotion::LAST_TIER;
     let before = session.character.as_ref().unwrap().exp;
 
     kill_the_rat(&state, &mut session).await;
 
     let character = session.character.as_ref().unwrap();
-    assert_eq!(character.level, LEVEL_CAP, "a character levelled past the cap");
+    assert_eq!(character.level, promotion::level_cap(promotion::LAST_TIER), "a character levelled past the cap");
     assert!(character.exp > before, "the experience itself still counts");
 }
 
@@ -3613,15 +3615,110 @@ async fn the_curve_stops_at_the_cap() {
 async fn a_kill_worth_many_levels_lands_on_the_cap() {
     let state = to_the_cap_state();
     let mut session = in_world(&state).await;
-    session.character.as_mut().unwrap().level = LEVEL_CAP - 1;
+    session.character.as_mut().unwrap().level = promotion::level_cap(promotion::LAST_TIER) - 1;
     session.character.as_mut().unwrap().exp = u32::MAX as u64;
+    session.character.as_mut().unwrap().tier = promotion::LAST_TIER;
 
     kill_the_rat(&state, &mut session).await;
 
     assert_eq!(
         session.character.as_ref().unwrap().level,
-        LEVEL_CAP,
+        promotion::level_cap(promotion::LAST_TIER),
         "it overshot the cap"
+    );
+}
+
+/// A character that has not been promoted stops at its own tier's wall,
+/// nowhere near the end of the curve. This is the whole point of the tier:
+/// before it, everything levelled straight to 99.
+#[tokio::test]
+async fn an_unpromoted_character_stops_at_the_first_wall() {
+    let state = to_the_cap_state();
+    let mut session = in_world(&state).await;
+    let wall = promotion::level_cap(promotion::FIRST_TIER);
+    session.character.as_mut().unwrap().level = wall - 1;
+    session.character.as_mut().unwrap().exp = u32::MAX as u64;
+
+    kill_the_rat(&state, &mut session).await;
+
+    let character = session.character.as_ref().unwrap();
+    assert_eq!(character.level, wall, "it levelled through the wall");
+    assert_eq!(character.tier, promotion::FIRST_TIER, "and it promoted itself");
+}
+
+/// The quest option is what lifts the wall, standing in for the chain the
+/// original never wired up.
+#[tokio::test]
+async fn the_quest_option_promotes_a_character_at_the_wall() {
+    let state = shop_state();
+    let mut session = in_world(&state).await;
+    session.character.as_mut().unwrap().level = promotion::level_cap(promotion::FIRST_TIER);
+
+    let frames = frames_of(
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::QUESTS)).await,
+    );
+
+    let character = session.character.as_ref().unwrap();
+    assert_eq!(character.tier, promotion::FIRST_TIER + 1);
+    assert_eq!(promotion::level_cap(character.tier), 89, "and the wall moved");
+    assert!(session.dirty, "a promotion that is not saved is not a promotion");
+
+    // The class name lives in the character record, so the client only
+    // repaints it when the whole record arrives.
+    assert!(
+        opcodes(&frames).contains(&OP_SEND_TO_WORLD),
+        "the client was never told, so it still draws the old class"
+    );
+}
+
+/// And short of the wall it says how far off you are, rather than going
+/// quiet or promoting anyway.
+#[tokio::test]
+async fn short_of_the_wall_the_promotion_is_refused_with_the_level() {
+    let state = shop_state();
+    let mut session = in_world(&state).await;
+    session.character.as_mut().unwrap().level = 49;
+
+    let frames = frames_of(
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::QUESTS)).await,
+    );
+
+    assert_eq!(session.character.as_ref().unwrap().tier, promotion::FIRST_TIER);
+    let text: Vec<String> = frames
+        .iter()
+        .zip(opcodes(&frames))
+        .filter(|(_, op)| *op == OP_CLIENT_MESSAGE)
+        .map(|(frame, _)| message_text(frame))
+        .collect();
+    assert!(
+        text.iter().any(|t| t == "Come back when you have reached level 50."),
+        "said {text:?} instead"
+    );
+}
+
+/// Twice promoted, there is nothing left to give, and it says so instead of
+/// handing out a fourth tier the data has no skills for.
+#[tokio::test]
+async fn a_fully_promoted_character_is_offered_nothing_further() {
+    let state = shop_state();
+    let mut session = in_world(&state).await;
+    session.character.as_mut().unwrap().level = 99;
+    session.character.as_mut().unwrap().tier = promotion::LAST_TIER;
+
+    let frames = frames_of(
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::QUESTS)).await,
+    );
+
+    assert_eq!(session.character.as_ref().unwrap().tier, promotion::LAST_TIER);
+    let text: Vec<String> = frames
+        .iter()
+        .zip(opcodes(&frames))
+        .filter(|(_, op)| *op == OP_CLIENT_MESSAGE)
+        .map(|(frame, _)| message_text(frame))
+        .collect();
+    assert!(
+        text.iter().any(|t| t == "There is nothing further for you here."),
+        "said {text:?} instead"
     );
 }
 

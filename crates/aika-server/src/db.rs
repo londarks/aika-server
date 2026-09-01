@@ -163,21 +163,56 @@ impl Database {
         // database that already has the column is a "duplicate column" error,
         // which is the one error we swallow — both dialects raise it, and it
         // means the work is already done.
+        // The class tier is the one column that cannot simply default. A
+        // character made before it levelled with nothing stopping it, so its
+        // level is the only record of how far it got, and defaulting it to 1
+        // would hand a level 99 a cap of 50. Seeded only on the run that adds
+        // the column: doing it every start would demote anybody promoted at
+        // the wall itself, whose level still reads as the tier below.
+        let tier_column_is_new = self.add_column("characters", &format!(
+            "class_tier INTEGER NOT NULL DEFAULT {}",
+            crate::promotion::FIRST_TIER
+        )).await?;
+        if tier_column_is_new {
+            for tier in crate::promotion::FIRST_TIER..=crate::promotion::LAST_TIER {
+                sqlx::query("UPDATE characters SET class_tier = ? WHERE level > ? AND level <= ?")
+                    .bind(tier as i64)
+                    .bind(if tier == crate::promotion::FIRST_TIER {
+                        0
+                    } else {
+                        crate::promotion::level_cap(tier - 1) as i64
+                    })
+                    .bind(crate::promotion::level_cap(tier) as i64)
+                    .execute(&self.pool)
+                    .await
+                    .context("seeding the class tier from the level")?;
+            }
+        }
+
         for (table, column) in [
             ("characters", "skill_list BLOB"),
             ("characters", "item_bar BLOB"),
             ("characters", "skill_points INTEGER NOT NULL DEFAULT 0"),
             ("accounts", "storage_gold INTEGER NOT NULL DEFAULT 0"),
         ] {
-            let sql = format!("ALTER TABLE {table} ADD COLUMN {column}");
-            if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
-                let text = e.to_string().to_ascii_lowercase();
-                if !text.contains("duplicate column") {
-                    return Err(anyhow::Error::new(e).context(format!("adding {column}")));
-                }
-            }
+            self.add_column(table, column).await?;
         }
         Ok(())
+    }
+
+    /// Adds one column, saying whether it was actually added.
+    ///
+    /// Re-running this on a database that already has it raises a "duplicate
+    /// column" error, which is the one error swallowed -- both dialects raise
+    /// it and it means the work is already done. The answer matters for a
+    /// column that has to be filled in from the rows that are already there.
+    async fn add_column(&self, table: &str, column: &str) -> Result<bool> {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column}");
+        match sqlx::query(&sql).execute(&self.pool).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.to_string().to_ascii_lowercase().contains("duplicate column") => Ok(false),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("adding {column}"))),
+        }
     }
 
     pub async fn account_count(&self) -> Result<i64> {
@@ -232,11 +267,11 @@ impl Database {
     pub async fn insert_character(&self, account_id: i64, character: &Character) -> Result<i64> {
         let row = sqlx::query(
             "INSERT INTO characters
-                 (account_id, slot, name, nation, class_index, hair, level, exp, gold,
+                 (account_id, slot, name, nation, class_index, hair, level, exp, gold, class_tier,
                   x, y, speed_move, height, torso, legs, body,
                   strength, agility, intellect, constitution, luck, free_points,
                   skill_list, item_bar, skill_points, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              RETURNING id",
         )
         .bind(account_id)
@@ -248,6 +283,7 @@ impl Database {
         .bind(character.level as i64)
         .bind(character.exp as i64)
         .bind(character.gold as i64)
+        .bind(character.tier as i64)
         .bind(character.x as i64)
         .bind(character.y as i64)
         .bind(character.speed_move as i64)
@@ -315,7 +351,7 @@ impl Database {
     async fn load_characters(&self, account_id: i64) -> Result<Vec<Character>> {
         // Named for the same reason the account columns are.
         let rows = sqlx::query(
-            "SELECT id, slot, name, nation, class_index, hair, level, exp, gold,
+            "SELECT id, slot, name, nation, class_index, hair, level, exp, gold, class_tier,
                     x, y, speed_move, height, torso, legs, body,
                     strength, agility, intellect, constitution, luck, free_points,
                     skill_list, item_bar, skill_points
@@ -341,6 +377,7 @@ impl Database {
                 level: row.try_get::<i64, _>("level")? as u16,
                 exp: row.try_get::<i64, _>("exp")? as u64,
                 gold: row.try_get::<i64, _>("gold")? as u64,
+                tier: row.try_get::<i64, _>("class_tier")? as u16,
                 x: row.try_get::<i64, _>("x")? as u32,
                 y: row.try_get::<i64, _>("y")? as u32,
                 speed_move: row.try_get::<i64, _>("speed_move")? as u8,
@@ -532,7 +569,7 @@ impl Database {
     pub async fn save_character(&self, character: &Character) -> Result<()> {
         sqlx::query(
             "UPDATE characters
-             SET x = ?, y = ?, level = ?, exp = ?, gold = ?,
+             SET x = ?, y = ?, level = ?, exp = ?, gold = ?, class_tier = ?,
                  strength = ?, agility = ?, intellect = ?,
                  constitution = ?, luck = ?, free_points = ?
              WHERE id = ?",
@@ -542,6 +579,7 @@ impl Database {
         .bind(character.level as i64)
         .bind(character.exp as i64)
         .bind(character.gold as i64)
+        .bind(character.tier as i64)
         .bind(character.attributes[0] as i64)
         .bind(character.attributes[1] as i64)
         .bind(character.attributes[2] as i64)

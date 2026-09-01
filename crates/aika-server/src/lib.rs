@@ -26,6 +26,7 @@ pub mod game;
 pub mod http;
 pub mod inventory;
 pub mod mob;
+pub mod promotion;
 pub mod login;
 pub mod state;
 pub mod shop;

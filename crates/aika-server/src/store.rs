@@ -103,6 +103,10 @@ pub struct Character {
     /// Unspent skill points. One is earned per level; learning a skill spends
     /// what that skill costs. The client shows this in the skill window.
     pub skill_points: u16,
+    /// How far along the class the character is: the units digit of
+    /// `ClassInfo`, and what decides how far it may level. See
+    /// [`crate::promotion`].
+    pub tier: u16,
 }
 
 /// How many skill points a character of a given level has earned in total
@@ -150,11 +154,11 @@ impl Character {
     /// not a code at all, and the client fell back to naming everybody a
     /// Fighter.
     ///
-    /// The tier is the second digit and comes from [`crate::ability::tier`],
-    /// which reads it off the skill table rather than storing it. It used to
-    /// be a hardcoded 1, which is what the original ships and never changes.
-    pub fn class_info(&self, tier: u16) -> u16 {
-        (self.class_number() - 1) * 10 + tier
+    /// The tier is the second digit. It is stored rather than worked out,
+    /// which is what the original does -- it is the same `classinfo` column --
+    /// and it is what [`crate::promotion`] moves. It used to be a hardcoded 1.
+    pub fn class_info(&self) -> u16 {
+        (self.class_number() - 1) * 10 + self.tier.max(crate::promotion::FIRST_TIER)
     }
 
     /// The same class counted from zero, which is how the skill table groups
@@ -185,6 +189,7 @@ impl From<&DevCharacter> for Character {
             skill_list: [0; 60],
             item_bar: [0; 40],
             skill_points: skill_points_for(dev.level),
+            tier: crate::promotion::FIRST_TIER,
         }
     }
 }
@@ -719,7 +724,7 @@ mod class_tests {
         for (index, code) in
             [(10, 1), (20, 11), (30, 21), (40, 31), (50, 41), (60, 51)]
         {
-            assert_eq!(with_index(index).class_info(1), code, "class index {index}");
+            assert_eq!(with_index(index).class_info(), code, "class index {index}");
         }
     }
 
@@ -729,7 +734,7 @@ mod class_tests {
     fn the_three_numbers_of_one_class_agree() {
         let atirador = with_index(30);
         assert_eq!(atirador.class_number(), 3);
-        assert_eq!(atirador.class_info(1), 21);
+        assert_eq!(atirador.class_info(), 21);
         assert_eq!(atirador.skill_class(), 2);
 
         assert_eq!(with_index(10).skill_class(), 0, "the first class is group zero");

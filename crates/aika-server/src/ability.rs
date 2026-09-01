@@ -11,18 +11,15 @@
 //! which slot and which rank without a lookup, and whether a client may cast
 //! something is a range check rather than a search.
 //!
-//! # Known skills are derived, not stored
+//! # What a character knows, and what it is offered
 //!
-//! In the original a character *learns* skills: `0x31C` spends skill points
-//! and gold at a trainer, and the list is saved with the account. That is not
-//! built yet, so for now a character knows every skill its class and level
-//! allow, worked out from the table each time it is asked.
+//! A character learns skills: `0x31C` spends points and gold at a trainer, and
+//! the ranks are kept in the record's own sixty-word list and saved with it.
 //!
-//! This is a deliberate placeholder and it shows in one visible way: nobody
-//! can be missing a spell they should have, and nobody has to visit a
-//! trainer. When `0x31C` lands, `known_by` becomes a database read and this
-//! function becomes what the trainer offers rather than what the character
-//! has.
+//! [`known_by`] is not that list. It is every skill the class and the level
+//! allow, worked out from the table, which is what a trainer has to *offer* —
+//! the tree the client draws in its skill window. What the character has
+//! actually learned is `Character::skill_list`.
 
 use aika_data::skills::SkillTable;
 use std::collections::HashMap;
@@ -128,18 +125,20 @@ pub const IDS_PER_CLASS: usize = SLOTS_PER_CLASS * RANKS_PER_SLOT;
 /// The six basic slots, which the client draws apart from the rest.
 pub const BASIC_SLOTS: usize = 6;
 
-/// Where a class's skills start.
+/// Where a class's skills start: one past a whole multiple of 960.
 ///
-/// The first class begins at 1 and the rest at whole multiples of 960. That
-/// off-by-one is the original's, not a mistake here: `GetSkillIndex` opens
-/// with `Result := 1` and only overwrites it when the class is not the first
-/// (`Functions/SkillFunctions.pas:85`).
+/// The same arithmetic for every class, the first included. It used to be a
+/// special case — 1 for the first class and a bare multiple for the rest —
+/// and that was wrong in two places at once in a way that hid itself: the
+/// multiple was one too low for classes two to six, and [`skill_index`] added
+/// a one that put them back. The two cancelled for five classes out of six and
+/// left the first class a whole rank out, so a Guerreiro was handed rank two
+/// of every skill it owned.
+///
+/// The table says it plainly: every rank-one id is one more than a multiple of
+/// sixteen. `Attack` is 1, 961, 1921, 2881, 3841, 4801.
 pub fn class_block(class_number: u32) -> usize {
-    if class_number <= 1 {
-        1
-    } else {
-        (class_number as usize - 1) * IDS_PER_CLASS
-    }
+    (class_number.max(1) as usize - 1) * IDS_PER_CLASS + 1
 }
 
 /// The id of one skill: which class, which of its sixty slots, which rank.
@@ -149,12 +148,9 @@ pub fn class_block(class_number: u32) -> usize {
 /// them, and the rank picks one. Checked against the six character templates
 /// the original ships, which carry the ids this produces.
 pub fn skill_index(class_number: u32, slot: usize, rank: u32) -> usize {
-    let mut id = class_block(class_number);
-    if slot > 1 {
-        id += (slot - 1) * RANKS_PER_SLOT;
-    }
-    // Rank 1 and rank 2 land on the same id. That is what the original does.
-    id + if rank > 1 { rank as usize - 1 } else { 1 }
+    let slot = slot.max(1) - 1;
+    let rank = rank.max(1) as usize - 1;
+    class_block(class_number) + slot * RANKS_PER_SLOT + rank
 }
 
 /// Whether an id is one of this class's, which is what stops a client asking
@@ -175,7 +171,7 @@ pub fn record_slot(class_number: u32, id: usize) -> Option<usize> {
     if !belongs_to(class_number, id) {
         return None;
     }
-    let offset = id.checked_sub(class_block(class_number) + 1)?;
+    let offset = id.checked_sub(class_block(class_number))?;
     let slot = offset / RANKS_PER_SLOT;
     (slot < SLOTS_PER_CLASS).then_some(slot)
 }
@@ -365,7 +361,7 @@ mod tests {
 
         for slot in 1..=10usize {
             for rank in 1..=RANKS_PER_SLOT as u32 {
-                let id = class_block(CLASS) + (slot - 1) * RANKS_PER_SLOT + rank as usize;
+                let id = skill_index(CLASS, slot, rank);
                 let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
                 let put = |r: &mut [u8], at: usize, v: u32| {
                     r[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -401,10 +397,13 @@ mod tests {
     /// carry. Getting this wrong hands out somebody else's spells.
     #[test]
     fn the_grid_matches_the_templates() {
-        // Guerreiro: the first class starts at 1, not at 0
+        // Guerreiro. One rule for every class, this one included: a rank-one
+        // id is one past a multiple of sixteen. It used to be asserted as
+        // 2, 18, 34 here and 1921, 1937 below -- two rules, and the one for
+        // the first class handed a Guerreiro rank two of everything.
         assert_eq!(
             (1..=6).map(|s| skill_index(1, s, 1)).collect::<Vec<_>>(),
-            vec![2, 18, 34, 50, 66, 82]
+            vec![1, 17, 33, 49, 65, 81]
         );
         // Atirador
         assert_eq!(
@@ -421,9 +420,9 @@ mod tests {
     #[test]
     fn a_class_owns_nine_hundred_and_sixty_consecutive_ids() {
         assert_eq!(IDS_PER_CLASS, 960);
-        assert!(belongs_to(CLASS, 1920) && belongs_to(CLASS, 2879));
-        assert!(!belongs_to(CLASS, 1919), "the class before it");
-        assert!(!belongs_to(CLASS, 2880), "the class after it");
+        assert!(belongs_to(CLASS, 1921) && belongs_to(CLASS, 2880));
+        assert!(!belongs_to(CLASS, 1920), "the class before it");
+        assert!(!belongs_to(CLASS, 2881), "the class after it");
     }
 
     /// Ranks are consecutive within a slot, so a rank is a step and not a
@@ -438,10 +437,23 @@ mod tests {
     fn ranks_sit_next_to_each_other_inside_a_slot() {
         let first = skill_index(CLASS, 1, 1);
 
-        assert_eq!(skill_index(CLASS, 1, 2), first, "ranks one and two share an id");
-        assert_eq!(skill_index(CLASS, 1, 3), first + 1);
-        assert_eq!(skill_index(CLASS, 1, 16), first + 14);
+        // Every rank has an id of its own. It was believed that ranks one and
+        // two shared one; the table says otherwise, and says it plainly —
+        // ids 161 to 176 are Berserker ranks one to sixteen, and 177 is the
+        // next skill at rank one.
+        assert_eq!(skill_index(CLASS, 1, 2), first + 1);
+        assert_eq!(skill_index(CLASS, 1, 3), first + 2);
+        assert_eq!(skill_index(CLASS, 1, 16), first + 15);
         assert_eq!(skill_index(CLASS, 2, 1), first + RANKS_PER_SLOT);
+
+        // And the two are inverses, which they were not before.
+        for rank in 1..=RANKS_PER_SLOT as u32 {
+            assert_eq!(
+                record_slot(CLASS, skill_index(CLASS, 3, rank)),
+                Some(2),
+                "slot three, rank {rank}, does not come back as slot three"
+            );
+        }
     }
 
     /// The bar carries forty, and a level too low to have a slot leaves it

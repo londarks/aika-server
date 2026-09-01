@@ -14,6 +14,7 @@ use crate::inventory::{self, Inventory};
 use crate::store::{Account, Character, Item, MAX_CHARACTERS};
 use crate::{ability, combat, creation, dialog, shop, stats};
 use crate::world::{Outbox, DISTANCE_TO_FORGET, DISTANCE_TO_WATCH};
+use aika_data::itemlist::ItemList;
 use aika_data::npc::Npc;
 use aika_net::frame::{self, FrameError, FrameReader, Message, MIN_FRAME};
 use std::collections::HashSet;
@@ -1015,7 +1016,7 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
     state.world.enter(session.client_id, character.clone());
 
     let skills = known_skills(state, &character);
-    let mut frames = world_burst(&character, session.client_id, &skills);
+    let mut frames = world_burst(&character, session.client_id, &skills, &state.items);
 
     // The city is drawn by the client; the people in it are not. Without this
     // the player arrives in an empty town.
@@ -1061,7 +1062,12 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
 /// right size and a zeroed body, which is what an empty list looks like
 /// anyway. Three packets from the original are still missing because their
 /// size is unknown: `0x138` (cash inventory), `0x936` and `0x91A` (nation).
-fn world_burst(character: &Character, client_id: u16, skills: &[usize]) -> Vec<Vec<u8>> {
+fn world_burst(
+    character: &Character,
+    client_id: u16,
+    skills: &[usize],
+    items: &ItemList,
+) -> Vec<Vec<u8>> {
     let (hp, mp) = vitals(character);
 
     let mut frames = vec![
@@ -1074,7 +1080,7 @@ fn world_burst(character: &Character, client_id: u16, skills: &[usize]) -> Vec<V
         zeroed(OP_ACTIVE_TITLE, client_id, ACTIVE_TITLE_SIZE),
         zeroed(OP_RELICS, FIXED_INDEX, RELICS_SIZE),
         encode_refresh_point(character),
-        encode_refresh_status(character),
+        encode_refresh_status(character, items),
         zeroed(OP_ALL_ATTRIBUTES, client_id, ALL_ATTRIBUTES_SIZE),
         encode_level(character, client_id),
         encode_hp_mp(character, client_id, hp, mp),
@@ -1136,12 +1142,48 @@ fn encode_refresh_point(character: &Character) -> Vec<u8> {
     )
 }
 
-/// `0x10A` `TSendRefreshStatus`: combat stats.
-fn encode_refresh_status(character: &Character) -> Vec<u8> {
+/// Where each stat sits in the `0x10A` body, from `TSendRefreshStatus`
+/// (`Data/Packets.pas:533`). The gaps between them are the record's own
+/// `Null1`, `Null2` and `Null3`, which the original never writes.
+mod status_offset {
+    pub const ATTACK: usize = 0;
+    pub const DEFENCE: usize = 2;
+    pub const MAGIC_ATTACK: usize = 4;
+    pub const MAGIC_DEFENCE: usize = 6;
+    pub const SPEED_MOVE: usize = 20;
+    pub const CRITICAL: usize = 30;
+    pub const DODGE: usize = 34;
+    pub const ACCURACY: usize = 36;
+    pub const DOUBLE_ATTACK: usize = 38;
+    pub const RESISTANCE: usize = 40;
+}
+
+/// `0x10A` `TSendRefreshStatus`: the numbers the character sheet shows.
+///
+/// This is the packet the window opened with C reads, and every field of it
+/// but the speed used to go out as zero — so a player in full armour was told
+/// they had no attack, no defence and no critical. The values are
+/// `GetCurrentScore`'s, worked out in [`stats::of`].
+fn encode_refresh_status(character: &Character, items: &ItemList) -> Vec<u8> {
+    let stats = stats::of(character, items);
     let mut body = vec![0u8; REFRESH_STATUS_SIZE - MIN_FRAME];
-    // Movement speed is the only field we have a real value for; the rest of
-    // the combat stats come from tables we have not read yet.
-    body[20..22].copy_from_slice(&(character.speed_move as u16).to_le_bytes());
+    let mut put = |at: usize, value: u32| {
+        body[at..at + 2].copy_from_slice(&(value.min(u16::MAX as u32) as u16).to_le_bytes());
+    };
+
+    put(status_offset::ATTACK, stats.attack);
+    put(status_offset::DEFENCE, stats.defence);
+    put(status_offset::MAGIC_ATTACK, stats.magic_attack);
+    put(status_offset::MAGIC_DEFENCE, stats.magic_defence);
+    // Not the character's stored speed: the original starts from forty and
+    // adds what effects say, and never reads the field.
+    put(status_offset::SPEED_MOVE, stats::BASE_SPEED_MOVE as u32);
+    put(status_offset::CRITICAL, stats.critical);
+    put(status_offset::DODGE, stats.dodge);
+    put(status_offset::ACCURACY, stats.accuracy);
+    put(status_offset::DOUBLE_ATTACK, stats.double_attack);
+    put(status_offset::RESISTANCE, stats.resistance);
+
     frame::encode(
         &Message { sender: FIXED_INDEX, opcode: OP_REFRESH_STATUS, time: 0, body },
         rand::random(),
@@ -1860,12 +1902,63 @@ fn handle_move_item(state: &State, session: &mut Session, message: &Message) -> 
         (_, inventory::STORAGE) => bag.move_into(from, chest, to),
         _ => bag.move_item(from, to),
     };
+    let equipped = moved.is_ok() && (from.0 == inventory::EQUIP || to.0 == inventory::EQUIP);
     match moved {
         Ok(()) => session.dirty = true,
         Err(e) => debug!(?from, ?to, error = %e, "item not moved"),
     }
 
-    refresh_both(session, from, to)
+    let mut frames = match refresh_both(session, from, to) {
+        Action::Reply(frames) => frames,
+        other => return other,
+    };
+    if equipped {
+        frames.extend(restat(state, session, from, to));
+    }
+    Action::Reply(frames)
+}
+
+/// Slots whose contents are drawn on the character. Changing one of them is
+/// the difference between `ReSpawn` and `UpdatePoint` in the original: both
+/// recompute the numbers, but only these make everyone redraw the player.
+const WORN_ON_THE_BODY: std::ops::RangeInclusive<u16> = 2..=9;
+
+/// What the original sends after a piece of gear moves: the recomputed
+/// numbers, and a fresh spawn when the piece is one that shows.
+///
+/// Without this the character sheet keeps whatever it was told on the way into
+/// the world, so taking a sword off left the window still claiming its attack.
+fn restat(
+    state: &State,
+    session: &mut Session,
+    from: (u8, u16),
+    to: (u8, u16),
+) -> Vec<Vec<u8>> {
+    let client_id = session.client_id;
+    let Some(character) = session.character.as_ref() else {
+        return Vec::new();
+    };
+
+    let (max_hp, max_mp) = vitals(character);
+    session.cur_hp = session.cur_hp.min(max_hp);
+    session.cur_mp = session.cur_mp.min(max_mp);
+    let character = session.character.as_ref().expect("checked above");
+
+    let mut frames = vec![
+        encode_refresh_status(character, &state.items),
+        encode_refresh_point(character),
+        encode_hp_mp(character, client_id, session.cur_hp, session.cur_mp),
+    ];
+
+    let shows = [from, to]
+        .iter()
+        .any(|side| side.0 == inventory::EQUIP && WORN_ON_THE_BODY.contains(&side.1));
+    if shows {
+        let spawn = encode_spawn(character, client_id);
+        state.world.send_to_visible(client_id, spawn.clone());
+        frames.push(spawn);
+    }
+    frames
 }
 
 /// Says why a move is refused, or nothing when it is allowed.
@@ -5413,6 +5506,86 @@ mod tests {
         assert!(mine_rx.try_recv().is_err(), "the sender heard its own turn");
     }
 
+    /// The character sheet reads its numbers out of `0x10A` and nowhere else,
+    /// so what is in the packet is what the player sees. Every field but the
+    /// speed used to go out as zero.
+    #[test]
+    fn the_character_sheet_carries_what_the_gear_is_worth() {
+        let state = shop_state();
+        let mut character = Character::from(&dev_character("Athus", 0));
+        character.attributes = [20, 40, 5, 30, 25, 0];
+        character
+            .items
+            .put(Item {
+                index: 1000,
+                container: inventory::EQUIP,
+                slot: 6,
+                durability_min: 255,
+                ..Item::default()
+            })
+            .unwrap();
+
+        let frame = encode_refresh_status(&character, &state.items);
+        let body = decode(&frame).body;
+        let at = |offset: usize| u16::from_le_bytes(body[offset..offset + 2].try_into().unwrap());
+
+        use status_offset as off;
+        let stats = stats::of(&character, &state.items);
+        assert!(stats.attack > 0, "the fixture sword is worth nothing, so this proves nothing");
+        assert_eq!(at(off::ATTACK), stats.attack as u16, "attack went out as zero");
+        assert_eq!(at(off::MAGIC_ATTACK), stats.magic_attack as u16);
+        assert_eq!(at(off::DEFENCE), stats.defence as u16);
+        assert_eq!(at(off::MAGIC_DEFENCE), stats.magic_defence as u16);
+        assert_eq!(at(off::CRITICAL), stats.critical as u16);
+        assert_eq!(at(off::DODGE), stats.dodge as u16);
+        assert_eq!(at(off::ACCURACY), stats.accuracy as u16);
+        assert_eq!(at(off::DOUBLE_ATTACK), stats.double_attack as u16);
+        assert_eq!(at(off::RESISTANCE), stats.resistance as u16);
+        assert_eq!(at(off::SPEED_MOVE), stats::BASE_SPEED_MOVE);
+    }
+
+    /// Taking a sword off has to reach the window, or it keeps claiming the
+    /// attack of a weapon that is back in the bag.
+    #[tokio::test]
+    async fn equipping_something_sends_the_sheet_again() {
+        let state = shop_state();
+        let mut session = in_world(&state).await;
+        session
+            .character
+            .as_mut()
+            .unwrap()
+            .items
+            .put(Item {
+                index: 1000,
+                container: inventory::BAG,
+                slot: 7,
+                durability_min: 255,
+                ..Item::default()
+            })
+            .unwrap();
+
+        let frames =
+            frames_of(handle_message(&state, &mut session, &drag((inventory::BAG, 7), (inventory::EQUIP, 6))).await);
+
+        let sent = opcodes(&frames);
+        assert!(sent.contains(&OP_REFRESH_STATUS), "the sheet was not sent again: {sent:?}");
+        assert!(sent.contains(&OP_HP_MP), "health and mana were not sent again");
+        assert!(
+            sent.contains(&OP_CREATE_MOB),
+            "a weapon shows on the character, so everyone has to redraw it"
+        );
+
+        let status = frames
+            .iter()
+            .find(|f| decode(f).opcode == OP_REFRESH_STATUS)
+            .map(|f| decode(f).body)
+            .expect("checked above");
+        let attack =
+            u16::from_le_bytes(status[status_offset::ATTACK..status_offset::ATTACK + 2].try_into().unwrap());
+        let character = session.character.as_ref().unwrap();
+        assert_eq!(attack, stats::of(character, &state.items).attack as u16);
+    }
+
     /// A `0x70F` the way the client sends one.
     fn drag(from: (u8, u16), to: (u8, u16)) -> Message {
         Message {
@@ -5887,7 +6060,7 @@ mod tests {
         );
 
         // the copy the player gets of itself is the ordinary kind
-        let own = decode(&world_burst(&character, session.client_id, &[])[0]);
+        let own = decode(&world_burst(&character, session.client_id, &[], &state.items)[0]);
         assert_eq!(own.body[spawn_offset::SPAWN_TYPE], SPAWN_NORMAL);
     }
 
@@ -6813,6 +6986,9 @@ mod tests {
                     index: 1000,
                     container: inventory::EQUIP,
                     slot: 6,
+                    // A weapon with no durability left counts for nothing,
+                    // which is the original refusing to arm a broken sword.
+                    durability_min: 255,
                     ..Item::default()
                 })
                 .unwrap();

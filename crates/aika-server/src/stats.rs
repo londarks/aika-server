@@ -22,13 +22,31 @@ use aika_data::itemlist::ItemList;
 /// which are appearance and not armour.
 const GEAR_SLOTS: std::ops::Range<u16> = 2..16;
 
-/// How much a point of strength is worth in attack, and constitution in
-/// defence. Placeholders, in the sense that the original derives them from
-/// tables we have not read; the shape — attributes matter, gear matters more
-/// — is right.
-const STRENGTH_TO_ATTACK: u32 = 2;
-const INTELLECT_TO_MAGIC: u32 = 2;
-const CONSTITUTION_TO_DEFENCE: u32 = 1;
+/// Attack comes from the weapon and from nothing else
+/// (`GetEquipDamage(Equip[6])`), and armour from slots two to seven with the
+/// weapon skipped (`GetEquipsDefense`). Rings and the rest carry their worth
+/// as effects, which is a system this server does not keep yet.
+const WEAPON_SLOT: u16 = 6;
+const ARMOUR_SLOTS: std::ops::RangeInclusive<u16> = 2..=7;
+
+/// What a point of each attribute is worth, straight out of `GetCurrentScore`
+/// (`Mob/BaseMob.pas:3457`). They were guesses before — two points of attack
+/// to a point of strength — because the file that owns them had not been read.
+/// Every one of them is truncated, as the original truncates, except the
+/// resistance, which it rounds.
+const STRENGTH_TO_ATTACK: f32 = 2.6;
+const AGILITY_TO_ATTACK: f32 = 2.6;
+const INTELLECT_TO_MAGIC: f32 = 3.2;
+const AGILITY_TO_CRITICAL: f32 = 0.13;
+const AGILITY_TO_ACCURACY: f32 = 0.5;
+const AGILITY_TO_DODGE: f32 = 0.021;
+const STRENGTH_TO_DOUBLE: f32 = 0.21;
+const LUCK_TO_RESISTANCE: f32 = 0.1;
+
+/// Movement speed, which the original does not read off the character at all:
+/// it starts from forty and adds what effects say (`IncSpeedMove(SpeedMove,
+/// 40 + GetMobAbility(EF_RUNSPEED))`).
+pub const BASE_SPEED_MOVE: u16 = 40;
 
 /// Health and mana a level is worth, on top of what the character starts
 /// with.
@@ -44,25 +62,92 @@ pub struct Stats {
     pub magic_attack: u32,
     pub defence: u32,
     pub magic_defence: u32,
+    /// The five the character sheet shows beside the four above and that
+    /// nothing computed before, so the window drew them all as zero.
+    pub critical: u32,
+    pub accuracy: u32,
+    pub dodge: u32,
+    pub double_attack: u32,
+    pub resistance: u32,
     pub max_hp: u32,
     pub max_mp: u32,
 }
 
 /// Adds up what a character is wearing and what it is made of.
+///
+/// The arithmetic is `GetCurrentScore`'s: the weapon's own attack plus
+/// strength and agility, the armour's defence, and five more worked out from
+/// agility, strength and luck alone. What is missing from it is the effects —
+/// `GetMobAbility` reads the buffs, pran and relic bonuses this server does
+/// not keep — so every line here is the original's minus its effect term.
 pub fn of(character: &Character, items: &ItemList) -> Stats {
     let gear = gear_of(&character.items, items);
+    let weapon = weapon_of(&character.items, items);
+    let armour = armour_of(&character.items, items);
 
-    let [strength, _agility, intellect, constitution, _luck, _free] = character.attributes;
+    let [strength, agility, intellect, _constitution, luck, _free] = character.attributes;
+    let (strength, agility, intellect, luck) =
+        (strength as f32, agility as f32, intellect as f32, luck as f32);
     let level = character.level as u32;
 
     Stats {
-        attack: gear.attack + strength as u32 * STRENGTH_TO_ATTACK,
-        magic_attack: gear.magic_attack + intellect as u32 * INTELLECT_TO_MAGIC,
-        defence: gear.defence + constitution as u32 * CONSTITUTION_TO_DEFENCE,
-        magic_defence: gear.magic_defence + intellect as u32 * CONSTITUTION_TO_DEFENCE,
+        attack: weapon.0 + (strength * STRENGTH_TO_ATTACK) as u32
+            + (agility * AGILITY_TO_ATTACK) as u32,
+        magic_attack: weapon.1 + (intellect * INTELLECT_TO_MAGIC) as u32,
+        defence: armour.0,
+        magic_defence: armour.1,
+        critical: (agility * AGILITY_TO_CRITICAL) as u32,
+        accuracy: (agility * AGILITY_TO_ACCURACY) as u32,
+        dodge: (agility * AGILITY_TO_DODGE) as u32,
+        double_attack: (strength * STRENGTH_TO_DOUBLE) as u32,
+        resistance: (luck * LUCK_TO_RESISTANCE).round() as u32,
+        // Health and mana are still ours: the original grows them from tables
+        // this has not read.
         max_hp: BASE_HP + level * HP_PER_LEVEL + gear.hp,
         max_mp: BASE_MP + level * MP_PER_LEVEL + gear.mp,
     }
+}
+
+/// The physical and magical attack of the weapon in hand, or nothing when
+/// there is none.
+///
+/// One slot, not a sum across the gear: the original passes `Equip[6]` alone.
+/// A piece with no durability left is skipped, which is the original's
+/// `if Equip.MIN = 0 then Exit`.
+fn weapon_of(inventory: &Inventory, items: &ItemList) -> (u32, u32) {
+    let Some(worn) = inventory.get(crate::inventory::EQUIP, WEAPON_SLOT) else {
+        return (0, 0);
+    };
+    if worn.durability_min == 0 {
+        return (0, 0);
+    }
+    let Some(def) = items.get(worn.index as usize) else {
+        return (0, 0);
+    };
+    (def.attack() as u32, def.magic_attack() as u32)
+}
+
+/// The physical and magical defence of the armour, which is slots two to
+/// seven with the weapon skipped.
+fn armour_of(inventory: &Inventory, items: &ItemList) -> (u32, u32) {
+    let mut defence = (0, 0);
+    for slot in ARMOUR_SLOTS {
+        if slot == WEAPON_SLOT {
+            continue;
+        }
+        let Some(worn) = inventory.get(crate::inventory::EQUIP, slot) else {
+            continue;
+        };
+        if worn.durability_min == 0 {
+            continue;
+        }
+        let Some(def) = items.get(worn.index as usize) else {
+            continue;
+        };
+        defence.0 += def.defense() as u32;
+        defence.1 += def.magic_defense() as u32;
+    }
+    defence
 }
 
 /// What the worn gear alone is worth.
@@ -149,7 +234,15 @@ mod tests {
     fn wearing(character: &mut Character, slot: u16, index: u16) {
         character
             .items
-            .put(Item { index, container: crate::inventory::EQUIP, slot, ..Item::default() })
+            .put(Item {
+                index,
+                container: crate::inventory::EQUIP,
+                slot,
+                // Worn gear has durability left; without it the original
+                // counts the piece for nothing.
+                durability_min: 255,
+                ..Item::default()
+            })
             .unwrap();
     }
 
@@ -179,16 +272,57 @@ mod tests {
         assert_eq!(gear_of(&c.items, &items), Gear::default());
     }
 
+    /// The arithmetic is `GetCurrentScore`'s and is pinned here rather than
+    /// described, because every one of these numbers was a guess before.
     #[test]
-    fn attributes_and_gear_both_count() {
+    fn the_numbers_are_the_originals() {
         let items = item_table();
-        let mut c = character([20, 10, 5, 30, 10, 0], 10);
+        let mut c = character([20, 40, 5, 30, 25, 0], 10);
         wearing(&mut c, 6, 1000);
+        wearing(&mut c, 2, 2000);
 
         let s = of(&c, &items);
-        assert_eq!(s.attack, 120 + 20 * STRENGTH_TO_ATTACK);
-        assert_eq!(s.defence, 30 * CONSTITUTION_TO_DEFENCE);
-        assert_eq!(s.max_hp, BASE_HP + 10 * HP_PER_LEVEL);
+        assert_eq!(s.attack, 120 + 52 + 104, "weapon, then strength and agility at 2.6");
+        assert_eq!(s.magic_attack, 16, "five intellect at 3.2");
+        assert_eq!(s.defence, 80, "the breastplate, and nothing from the attributes");
+        assert_eq!(s.critical, 5, "forty agility at 0.13");
+        assert_eq!(s.accuracy, 20, "forty agility at a half");
+        assert_eq!(s.dodge, 0, "forty agility at 0.021 truncates to nothing");
+        assert_eq!(s.double_attack, 4, "twenty strength at 0.21");
+        assert_eq!(s.resistance, 3, "twenty-five luck at a tenth, rounded");
+        assert_eq!(s.max_hp, BASE_HP + 10 * HP_PER_LEVEL + 50);
+    }
+
+    /// Attack is the weapon's alone. A sword worn on the head is not a sword.
+    #[test]
+    fn only_the_weapon_slot_carries_attack() {
+        let items = item_table();
+        let mut c = character([0, 0, 0, 0, 0, 0], 1);
+        wearing(&mut c, 8, 1000);
+
+        assert_eq!(of(&c, &items).attack, 0, "a sword in the wrong slot armed the character");
+
+        wearing(&mut c, 6, 1000);
+        assert_eq!(of(&c, &items).attack, 120);
+    }
+
+    /// A piece worn down to nothing is worth nothing, which is the original's
+    /// `if Equip.MIN = 0 then Exit`.
+    #[test]
+    fn a_broken_piece_is_worth_nothing() {
+        let items = item_table();
+        let mut c = character([0, 0, 0, 0, 0, 0], 1);
+        c.items
+            .put(Item {
+                index: 1000,
+                container: crate::inventory::EQUIP,
+                slot: 6,
+                durability_min: 0,
+                ..Item::default()
+            })
+            .unwrap();
+
+        assert_eq!(of(&c, &items).attack, 0, "a broken weapon still hit");
     }
 
     /// A caster and a warrior of the same level are not the same, which is
@@ -197,8 +331,11 @@ mod tests {
     fn a_caster_and_a_warrior_differ() {
         let items = item_table();
 
+        // The warrior is the tougher one because it is the one in armour:
+        // constitution buys no defence in the original, gear does.
         let mut warrior = character([15, 9, 5, 16, 0, 0], 10);
         wearing(&mut warrior, 6, 1000);
+        wearing(&mut warrior, 2, 2000);
         let mut caster = character([7, 9, 16, 8, 10, 0], 10);
         wearing(&mut caster, 6, 3000);
 

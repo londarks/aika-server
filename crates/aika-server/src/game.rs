@@ -3842,9 +3842,13 @@ fn reward_the_pran(state: &State, session: &mut Session, experience: u64) -> Vec
             // there until somebody evolves it.
             if !session.pran_told_to_evolve {
                 session.pran_told_to_evolve = true;
+                // The original's own words. Text a player reads is content
+                // rather than code: the client is Portuguese, the game is,
+                // and the sentence exists in the source already -- inventing
+                // an English one would be both a translation and a guess.
                 frames.push(encode_client_message(
                     client_id,
-                    "Your pran must evolve before it can grow further.",
+                    "A sua pran precisa evoluir para ganhar exp.",
                 ));
             }
             return frames;
@@ -3861,7 +3865,7 @@ fn reward_the_pran(state: &State, session: &mut Session, experience: u64) -> Vec
                 },
                 rand::random(),
             );
-            frames.push(encode_client_message(client_id, "Your pran gained a level."));
+            frames.push(encode_client_message(client_id, "Sua pran subiu de nível."));
             frames.push(described);
         }
         pran::Growth::Grew { .. } => {}

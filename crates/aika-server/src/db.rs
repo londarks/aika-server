@@ -230,6 +230,9 @@ impl Database {
             ("characters", "item_bar BLOB"),
             ("characters", "skill_points INTEGER NOT NULL DEFAULT 0"),
             ("accounts", "storage_gold INTEGER NOT NULL DEFAULT 0"),
+            // Added once prans could be drawn: the eight indices the spawn
+            // carries, the first of which is what the client draws one as.
+            ("prans", "equipment BLOB"),
         ] {
             self.add_column(table, column).await?;
         }

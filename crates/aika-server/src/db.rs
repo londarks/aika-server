@@ -89,6 +89,33 @@ impl Dialect {
             Dialect::MySql => "INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY",
         }
     }
+
+    /// Text with a length, for the two things `TEXT` cannot do on MySQL.
+    ///
+    /// It cannot be indexed -- "BLOB/TEXT column used in key specification
+    /// without a key length" -- and it cannot have a default -- "BLOB, TEXT,
+    /// GEOMETRY or JSON column can't have a default value". SQLite has neither
+    /// rule and no length to give either way, so the difference is spelled
+    /// here rather than worked around at each column.
+    ///
+    /// There is a third reason, and it is why every text column here uses
+    /// this and none uses plain `TEXT`: MySQL hands a `TEXT` back over the
+    /// untyped driver as a blob, and reading it into a `String` fails with
+    /// "Rust type `String` is not compatible with SQL type `BLOB`". A
+    /// `VARCHAR` comes back as text. Every string this server keeps is a name
+    /// or a hash and fits comfortably, so there is no column that wants the
+    /// other kind.
+    ///
+    /// 191 because an index entry is capped in bytes rather than characters,
+    /// and `utf8mb4` spends four of them on the worst case: 191 x 4 is 764,
+    /// under the 767 an older MySQL allows on a single-column key. Names here
+    /// are sixteen characters and accounts are shorter, so nothing is lost.
+    fn short_text(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "TEXT   ",
+            Dialect::MySql => "VARCHAR(191)",
+        }
+    }
 }
 
 /// The schema in the one spelling both understand, bar the key.
@@ -97,14 +124,28 @@ impl Dialect {
 /// will read the other. Written here as SQLite's and rewritten on the way
 /// out, so there is one schema rather than two to keep in step.
 fn schema_for(dialect: Dialect) -> String {
-    SCHEMA.replace(Dialect::Sqlite.self_counting_key(), dialect.self_counting_key())
+    let schema = SCHEMA
+        .replace(SELF_COUNTING_KEY, dialect.self_counting_key())
+        .replace(SHORT_TEXT, dialect.short_text());
+
+    match dialect {
+        Dialect::Sqlite => schema,
+        // MySQL has no `IF NOT EXISTS` on an index and will not learn one.
+        // Running it twice raises "duplicate key name", which `migrate`
+        // swallows for exactly this reason.
+        Dialect::MySql => schema.replace("CREATE INDEX IF NOT EXISTS", "CREATE INDEX"),
+    }
 }
+
+/// The two placeholders the schema is written with.
+const SELF_COUNTING_KEY: &str = "INTEGER PRIMARY KEY AUTOINCREMENT";
+const SHORT_TEXT: &str = "SHORT_TEXT";
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS accounts (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    username       TEXT    NOT NULL UNIQUE,
-    password_hash  TEXT    NOT NULL,
+    username       SHORT_TEXT NOT NULL UNIQUE,
+    password_hash  SHORT_TEXT NOT NULL,
     nation         INTEGER NOT NULL DEFAULT 0,
     account_status INTEGER NOT NULL DEFAULT 0,
     ban_days       INTEGER NOT NULL DEFAULT 0,
@@ -116,7 +157,7 @@ CREATE TABLE IF NOT EXISTS characters (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id   INTEGER NOT NULL,
     slot         INTEGER NOT NULL,
-    name         TEXT    NOT NULL UNIQUE,
+    name         SHORT_TEXT NOT NULL UNIQUE,
     nation       INTEGER NOT NULL DEFAULT 0,
     class_index  INTEGER NOT NULL,
     hair         INTEGER NOT NULL,
@@ -179,7 +220,7 @@ CREATE TABLE IF NOT EXISTS prans (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id    INTEGER NOT NULL,
     item_id       INTEGER NOT NULL,
-    name          TEXT NOT NULL DEFAULT '',
+    name          SHORT_TEXT NOT NULL DEFAULT '',
     level         INTEGER NOT NULL DEFAULT 1,
     class         INTEGER NOT NULL,
     hp            INTEGER NOT NULL,
@@ -296,10 +337,17 @@ impl Database {
     async fn migrate(&self) -> Result<()> {
         let schema = schema_for(self.dialect);
         for statement in schema.split(';').filter(|s| !s.trim().is_empty()) {
-            sqlx::query(statement)
-                .execute(&self.pool)
-                .await
-                .with_context(|| format!("applying schema: {}", statement.trim()))?;
+            if let Err(e) = sqlx::query(statement).execute(&self.pool).await {
+                // An index that is already there. SQLite says so with
+                // `IF NOT EXISTS` and MySQL has no way to ask, so the only
+                // way to be told is to be told off.
+                let text = e.to_string().to_ascii_lowercase();
+                if text.contains("duplicate key name") {
+                    continue;
+                }
+                return Err(anyhow::Error::new(e)
+                    .context(format!("applying schema: {}", statement.trim())));
+            }
         }
 
         // Columns added after the first release. A database made before them
@@ -1240,6 +1288,9 @@ mod tests {
         let mysql = schema_for(Dialect::MySql);
 
         assert!(sqlite.contains("INTEGER PRIMARY KEY AUTOINCREMENT"));
+        assert!(!sqlite.contains("SHORT_TEXT"), "a placeholder was left in");
+        assert!(!mysql.contains("SHORT_TEXT"), "a placeholder was left in");
+        assert!(mysql.contains("VARCHAR(191)"), "a key on TEXT will be refused");
         assert!(!sqlite.contains("AUTO_INCREMENT"));
         assert!(mysql.contains("AUTO_INCREMENT PRIMARY KEY"));
         assert!(!mysql.contains("AUTOINCREMENT PRIMARY"), "sqlite spelling left in");

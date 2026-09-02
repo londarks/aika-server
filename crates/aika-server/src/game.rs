@@ -3120,7 +3120,6 @@ fn cast_skill(
     if killed {
         info!(monster = %target.name, skill = cast.skill, "killed with a skill");
         frames.extend(reward_for(state, session, &target));
-        frames.extend(reward_the_pran(state, session, target.experience as u64));
         session.visible_mobs.remove(&target.id);
     }
     Action::Reply(frames)
@@ -3515,9 +3514,15 @@ fn handle_attack(state: &State, session: &mut Session, message: &Message) -> Act
 /// What a kill is worth: experience, whatever levels that buys, and whatever
 /// the monster was carrying.
 fn reward_for(state: &State, session: &mut Session, target: &crate::mob::Mob) -> Vec<Vec<u8>> {
+    // The companion is paid here rather than at either of the places a kill is
+    // noticed. There are two of them -- a swing and a spell -- and paying the
+    // pran at one of them is exactly the mistake that was made: every monster
+    // killed with a weapon fed nobody.
+    let mut frames = reward_the_pran(state, session, target.experience as u64);
+
     let client_id = session.client_id;
     let Some(character) = session.character.as_mut() else {
-        return Vec::new();
+        return frames;
     };
 
     character.exp = character.exp.saturating_add(target.experience as u64);
@@ -3531,7 +3536,8 @@ fn reward_for(state: &State, session: &mut Session, target: &crate::mob::Mob) ->
     // Experience keeps piling up while it waits there, so being promoted late
     // does not cost anything that was earned in the meantime.
     let cap = promotion::level_cap(character.tier);
-    let mut frames = Vec::new();
+    // Anything the companion earned goes out with the rest.
+
     if gained > 0 && character.level < cap {
         character.level = character.level.saturating_add(gained).min(cap);
         info!(character = %character.name, level = character.level, cap, "levelled up");

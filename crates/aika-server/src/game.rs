@@ -464,6 +464,22 @@ mod character_offset {
     /// icons live, so a character with an empty one here logs in with a bare
     /// bar however many skills it knows.
     pub const ITEM_BAR: usize = 4716;
+    /// The names of the account's two companions, sixteen bytes each.
+    ///
+    /// They are in the *character* record, which is the last place anybody
+    /// looks for them: `Move(Pran1.Name, Packet.Character.PranName[0], 16)`
+    /// (`Mob/Player.pas:3421`). So a client learns what a pran is called when
+    /// it enters the world, and nowhere else -- the pran's own packet has no
+    /// name field the client trusts for this, and until this was filled in the
+    /// client asked the player to name an already-named pran, refused to let
+    /// it out of the chest, and could not be argued out of either.
+    ///
+    /// The offset is counted from the end rather than from the start. This is
+    /// the last field of `TCharacter` bar a trailing dword, and counting 260
+    /// fields forward through a record whose own offset comments disagree with
+    /// each other is how you get this wrong.
+    pub const PRAN_NAMES: usize = super::CHARACTER_SIZE - 4 - 2 * PRAN_NAME_SIZE;
+    pub const PRAN_NAME_SIZE: usize = 16;
 }
 
 pub async fn serve(state: Arc<State>, listener: TcpListener) -> anyhow::Result<()> {
@@ -4053,7 +4069,7 @@ fn encode_send_to_world(
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(4 + CHARACTER_SIZE);
     body.extend_from_slice(&account.id.to_le_bytes());
-    body.extend_from_slice(&encode_character(character, client_id));
+    body.extend_from_slice(&encode_character(character, client_id, &account.prans));
 
     debug_assert_eq!(body.len() + MIN_FRAME, SEND_TO_WORLD_SIZE);
     frame::encode(
@@ -4064,7 +4080,7 @@ fn encode_send_to_world(
 
 /// `TCharacter`. Only the fields the client needs to build the character;
 /// the rest (inventory, skills, quests, titles) stays zeroed for now.
-fn encode_character(character: &Character, client_id: u16) -> Vec<u8> {
+fn encode_character(character: &Character, client_id: u16, prans: &[pran::Pran]) -> Vec<u8> {
     use character_offset as off;
     let mut out = vec![0u8; CHARACTER_SIZE];
 
@@ -4081,6 +4097,15 @@ fn encode_character(character: &Character, client_id: u16) -> Vec<u8> {
     write_fixed_str(&mut out[off::NAME..off::NAME + 16], &character.name);
     out[off::NATION] = character.nation as u8;
     out[off::CLASS_INFO] = character.class_info() as u8;
+
+    // What the companions are called. Nothing else tells the client, and a
+    // client that does not know asks the player to name one that already has
+    // a name -- then refuses to let it out of the chest until it is answered,
+    // which it cannot be.
+    for (slot, pran) in prans.iter().take(2).enumerate() {
+        let at = off::PRAN_NAMES + slot * off::PRAN_NAME_SIZE;
+        write_fixed_str(&mut out[at..at + off::PRAN_NAME_SIZE], &pran.name);
+    }
 
     for (i, value) in character.attributes.iter().enumerate() {
         put16(&mut out, off::ATTRIBUTES + i * 2, *value);

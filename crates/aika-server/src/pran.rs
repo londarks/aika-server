@@ -447,6 +447,87 @@ pub fn world_body(pran: &Pran) -> Vec<u8> {
 
     out
 }
+/// What a pran looks like, which is decided by its level and not by its class.
+///
+/// The original writes the four out in its own comments, in the switch that
+/// hands a pran a share of what its owner killed (`Mob/BaseMob.pas:6177`):
+///
+/// ```text
+///  0..3   pran fada                     the fairy, with no body of its own
+///  4      pran fada ~ pran crianca      a wall
+///  5..18  pran crianca
+///  19     pran crianca ~ adolescente    a wall
+///  20..48 pran adolescente
+///  49     adolescente ~ pran adulta     a wall
+///  50..69 pran adulta
+/// ```
+///
+/// This is the thing that took longest to see. The class looks like it should
+/// decide the shape -- 61 to 64 per element, four codes for four forms -- and
+/// it does not. Setting a pran to class 62 and leaving it at level 1 changes
+/// nothing anybody can see: it is still drawn as a fairy, because the level
+/// still says fairy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Form {
+    Fairy,
+    Child,
+    Teenager,
+    Adult,
+}
+
+/// The last level of each form, in order. Reaching one is a wall.
+///
+/// A pran standing on it earns nothing until it evolves -- the original says
+/// so in as many words: "A sua pran precisa evoluir para ganhar exp". The
+/// class is what has to move; the level cannot pass until it does.
+pub const WALLS: [u8; 3] = [4, 19, 49];
+
+/// The highest level a pran reaches at all.
+pub const LEVEL_CAP: u8 = 69;
+
+impl Form {
+    pub fn of_level(level: u8) -> Self {
+        match level {
+            0..=4 => Form::Fairy,
+            5..=19 => Form::Child,
+            20..=49 => Form::Teenager,
+            _ => Form::Adult,
+        }
+    }
+
+    /// The tier a pran of this form has to have reached, counted from one.
+    /// A fairy is the first tier, an adult the fourth.
+    pub fn tier(self) -> u8 {
+        match self {
+            Form::Fairy => 1,
+            Form::Child => 2,
+            Form::Teenager => 3,
+            Form::Adult => 4,
+        }
+    }
+}
+
+/// Whether a pran is standing at a wall it cannot pass.
+///
+/// True when the level has reached one of the three and the class is still the
+/// one below it. The original tests exactly this and stops the experience:
+/// at 4 while the class is 61, 71 or 81; at 19 while it is 62, 72 or 82; at
+/// 49 while it is 63, 73 or 83.
+pub fn must_evolve(level: u8, class: u8) -> bool {
+    let Some(element) = Element::of(class) else {
+        return false;
+    };
+    let tier = class - element.first_class() + 1;
+    WALLS.iter().enumerate().any(|(at, wall)| level == *wall && tier == at as u8 + 1)
+}
+
+/// The class a pran of this class becomes when it evolves, or `None` when
+/// there is nothing further.
+pub fn evolved(class: u8) -> Option<u8> {
+    let element = Element::of(class)?;
+    let tier = class - element.first_class() + 1;
+    (tier < WALLS.len() as u8 + 1).then_some(class + 1)
+}
 /// The stone each of the three quests hands out, and so which element it
 /// hatches.
 ///
@@ -646,6 +727,63 @@ mod tests {
     #[test]
     fn a_short_rename_packet_is_not_one() {
         assert_eq!(Rename::parse(&[0u8; Rename::BODY_SIZE - 1]), None);
+    }
+    /// The four forms and the three walls between them, as the original's own
+    /// comments lay them out.
+    #[test]
+    fn the_level_decides_the_form() {
+        assert_eq!(Form::of_level(1), Form::Fairy);
+        assert_eq!(Form::of_level(4), Form::Fairy, "still a fairy at the wall");
+        assert_eq!(Form::of_level(5), Form::Child);
+        assert_eq!(Form::of_level(18), Form::Child);
+        assert_eq!(Form::of_level(19), Form::Child, "still a child at the wall");
+        assert_eq!(Form::of_level(20), Form::Teenager);
+        assert_eq!(Form::of_level(48), Form::Teenager);
+        assert_eq!(Form::of_level(49), Form::Teenager);
+        assert_eq!(Form::of_level(50), Form::Adult);
+        assert_eq!(Form::of_level(LEVEL_CAP), Form::Adult);
+    }
+
+    /// A hatchling is a fairy, and the class alone does not change that. This
+    /// is the one that cost an evening: setting the class to 62 and leaving
+    /// the level at 1 changes nothing anybody can see.
+    #[test]
+    fn a_class_without_the_level_is_still_a_fairy() {
+        assert_eq!(Form::of_level(1), Form::Fairy);
+        assert_eq!(Form::of_level(1).tier(), 1);
+        // the child needs both halves
+        assert_eq!(Form::of_level(5).tier(), 2);
+    }
+
+    /// The wall is where the level has caught up with the class and stops.
+    #[test]
+    fn a_pran_at_a_wall_has_to_evolve_before_it_grows() {
+        assert!(must_evolve(4, 61), "a fairy at four");
+        assert!(must_evolve(4, 71));
+        assert!(must_evolve(19, 62), "a child at nineteen");
+        assert!(must_evolve(49, 63), "an adolescent at forty-nine");
+
+        assert!(!must_evolve(3, 61), "short of the wall");
+        assert!(!must_evolve(4, 62), "already evolved past it");
+        assert!(!must_evolve(19, 63));
+        assert!(!must_evolve(4, 0), "not a pran class at all");
+    }
+
+    /// Every wall must be passable, and the last form must have no wall after
+    /// it, or a pran either stops early or evolves into a class with no skills.
+    #[test]
+    fn every_wall_leads_somewhere_and_the_last_form_has_none() {
+        for element in [Element::Fire, Element::Water, Element::Air] {
+            let mut class = element.first_class();
+            for wall in WALLS {
+                assert!(must_evolve(wall, class), "class {class} does not stop at {wall}");
+                class = evolved(class).expect("a wall with nothing past it");
+                assert!(stone_tier(class).is_some(), "class {class} fits no stone");
+            }
+            assert_eq!(class, element.first_class() + 3, "four forms, three walls");
+            assert_eq!(evolved(class), None, "the adult evolved again");
+            assert!(!must_evolve(LEVEL_CAP, class), "the adult is walled in");
+        }
     }
     #[test]
     fn the_element_is_the_tens_digit() {

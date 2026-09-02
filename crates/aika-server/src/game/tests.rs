@@ -2256,6 +2256,33 @@ async fn the_character_record_says_what_the_prans_are_called() {
     assert!(off::PRAN_NAMES + 2 * off::PRAN_NAME_SIZE < CHARACTER_SIZE);
 }
 
+/// A companion says how old it is when it comes out.
+///
+/// Nothing else carries a level. The description packet has every other thing
+/// about a pran and not that, and the client shows level 1 until it is told --
+/// so a grown pran arrived with a grown body and a hatchling's panel, which is
+/// exactly how it looked. The original only sends this on a gain, because a
+/// pran that comes out already grown is a case it never had to answer.
+#[tokio::test]
+async fn a_companion_says_what_level_it_is_when_it_comes_out() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+    session.account.as_mut().unwrap().prans[0].level = 7;
+    handle_message(&state, &mut session, &take_stone_off()).await;
+
+    let frames = frames_of(handle_message(&state, &mut session, &wear_stone()).await);
+    let aged = frames
+        .iter()
+        .map(|frame| decode(frame))
+        .find(|m| m.opcode == crate::pran::OP_LEVEL)
+        .expect("it came out without saying how old it is");
+
+    // one higher than it is held, the way this protocol carries a level
+    assert_eq!(u32::from_le_bytes(aged.body[0..4].try_into().unwrap()), 8);
+}
+
 /// The companion arrives after the character it belongs to.
 ///
 /// The original spawns it at the very end of arriving, once

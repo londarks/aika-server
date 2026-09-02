@@ -3974,12 +3974,31 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
         &Message {
             sender: dialog::FIXED_INDEX,
             opcode: pran::OP_WORLD,
-            time: 0,
+            time: PACKET_TIME,
             body: pran::world_body(pran),
         },
         rand::random(),
     );
-    let mut frames = Vec::with_capacity(3);
+
+    // And its level, which nothing else carries.
+    //
+    // The description above says everything about a pran except how old it
+    // is, and the client will not work that out from the experience -- it
+    // shows level 1 until it is told otherwise, and draws the panel for a
+    // level 1. A companion with a grown body and a hatchling's panel is what
+    // that looks like, and it looked like that on every login: the original
+    // only ever sends this on a gain, so a pran that comes out already grown
+    // is a case it never had to answer.
+    let aged = frame::encode(
+        &Message {
+            sender: dialog::FIXED_INDEX,
+            opcode: pran::OP_LEVEL,
+            time: PACKET_TIME,
+            body: pran::level_body(pran.level, pran.exp),
+        },
+        rand::random(),
+    );
+    let mut frames = Vec::with_capacity(4);
 
     // The first form of each element has no body at all: it is an effect on
     // the player, one per element, and that is the whole of how it shows.
@@ -3991,6 +4010,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
             frames.push(encode_effect(client_id, element.fairy_effect()));
         }
         frames.push(described);
+        frames.push(aged);
         return frames;
     }
 
@@ -4009,6 +4029,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     let speed_move = stats::of(owner, &state.items, &Effects::none()).speed_move;
     frames.push(encode_pran_spawn(&pran, owner, pran_id, at, speed_move));
     frames.push(described);
+    frames.push(aged);
     session.pran_body = Some(pran_id);
     frames
 }

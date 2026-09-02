@@ -2224,6 +2224,33 @@ async fn a_grown_pran_is_drawn_as_a_body_beside_its_owner() {
     }
 }
 
+/// The body goes out before the description of it.
+///
+/// `SendPranSpawn(n); SendPranToWorld(n);` in that order, in both of the two
+/// places the original does this. Order has cost this protocol real evenings
+/// before, so it is pinned rather than trusted.
+#[tokio::test]
+async fn the_companion_is_spawned_before_it_is_described() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+    session.account.as_mut().unwrap().prans[0].class = 62;
+    handle_message(&state, &mut session, &take_stone_off()).await;
+
+    let frames = frames_of(handle_message(&state, &mut session, &wear_stone()).await);
+    let order: Vec<u16> = opcodes(&frames)
+        .into_iter()
+        .filter(|op| *op == crate::pran::OP_SPAWN || *op == crate::pran::OP_WORLD)
+        .collect();
+
+    assert_eq!(
+        order,
+        vec![crate::pran::OP_SPAWN, crate::pran::OP_WORLD],
+        "the client was told what it is before it was given one"
+    );
+}
+
 /// And the body it was given is the body that is taken away. The original
 /// picks by class on the way out and by level on the way back, which leaves a
 /// companion standing in the field for anything the two disagree about.

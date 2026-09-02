@@ -3844,7 +3844,13 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     };
 
     let pran = &account.prans[at];
-    let mut frames = vec![frame::encode(
+
+    // Built here, sent last. The original spawns the body and *then* describes
+    // it -- `SendPranSpawn(n); SendPranToWorld(n);`, in that order, in both of
+    // the two places it does this: on arrival (`Mob/Player.pas:5190`) and in
+    // the move handler for everything after. We had the two the other way
+    // round, which is the kind of difference this protocol has punished before.
+    let described = frame::encode(
         &Message {
             sender: dialog::FIXED_INDEX,
             opcode: pran::OP_WORLD,
@@ -3852,7 +3858,8 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
             body: pran::world_body(pran),
         },
         rand::random(),
-    )];
+    );
+    let mut frames = Vec::with_capacity(3);
 
     // The first form of each element has no body at all: it is an effect on
     // the player, one per element, and that is the whole of how it shows.
@@ -3863,6 +3870,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
         if let Some(element) = pran.element() {
             frames.push(encode_effect(client_id, element.fairy_effect()));
         }
+        frames.push(described);
         return frames;
     }
 
@@ -3880,6 +3888,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     );
     let speed_move = stats::of(owner, &state.items, &Effects::none()).speed_move;
     frames.push(encode_pran_spawn(&pran, owner, pran_id, at, speed_move));
+    frames.push(described);
     session.pran_body = Some(pran_id);
     frames
 }

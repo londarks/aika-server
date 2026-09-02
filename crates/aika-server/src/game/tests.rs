@@ -1948,6 +1948,22 @@ async fn a_pran_is_named_once_and_keeps_it() {
     let frames = frames_of(handle_message(&state, &mut session, &name_pran("Bob")).await);
     assert_eq!(session.account.as_ref().unwrap().prans[0].name, "Alice", "it was renamed");
     assert!(!opcodes(&frames).contains(&crate::pran::OP_RENAME));
+
+    // The refusal carries what it is called. Without that the client asks
+    // again, and again -- it only asks when it thinks there is no name, and
+    // an unnamed pran is one it will not let out of the chest.
+    assert!(
+        opcodes(&frames).contains(&crate::pran::OP_WORLD),
+        "the client was refused and left believing the pran has no name"
+    );
+    let told = frames
+        .iter()
+        .map(|frame| decode(frame))
+        .find(|m| m.opcode == crate::pran::OP_WORLD)
+        .unwrap();
+    let name = &told.body[crate::pran::at::NAME..crate::pran::at::CLASS];
+    let name = &name[..name.iter().position(|b| *b == 0).unwrap()];
+    assert_eq!(name, b"Alice");
 }
 
 /// A name the original would refuse is refused here, with a reason rather

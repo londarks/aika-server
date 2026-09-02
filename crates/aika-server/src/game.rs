@@ -3659,7 +3659,32 @@ async fn handle_rename_pran(
         return Action::Ignore;
     };
     let Some(unnamed) = account.prans.iter_mut().find(|p| p.name.is_empty()) else {
-        return refuse("All of your prans already have a name.");
+        // The client only asks when it believes the pran has no name, and
+        // nothing ever tells it otherwise: the name travels in `0x907`, which
+        // goes out when a pran is summoned and at no other time. A player who
+        // logs back in with a named pran still in the chest asks again, is
+        // refused, and asks again -- and an unnamed pran is one the client
+        // will not let out of the chest, so the loop has no exit.
+        //
+        // The refusal is the original's. Saying what it is called alongside is
+        // ours, and it is the smallest thing that ends the loop: it can only
+        // fire where the client has already proved it is out of date.
+        let mut frames = vec![encode_client_message(
+            client_id,
+            "All of your prans already have a name.",
+        )];
+        if let Some(pran) = account.prans.first() {
+            frames.push(frame::encode(
+                &Message {
+                    sender: dialog::FIXED_INDEX,
+                    opcode: pran::OP_WORLD,
+                    time: 0,
+                    body: pran::world_body(pran),
+                },
+                rand::random(),
+            ));
+        }
+        return Action::Reply(frames);
     };
 
     unnamed.name = asked.name.clone();

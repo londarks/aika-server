@@ -71,6 +71,10 @@ skill_data = "assets/skills/SkillData.bin"
 template_dir = "assets/templates"
 # What each level costs, and what monsters leave behind.
 exp_list = "assets/ExpList.bin"
+
+# The companion has a curve of its own, in plain dwords rather than the
+# eight-byte entries the character curve uses.
+pran_exp_list = "assets/PranExpList.bin"
 drop_dir = "assets/drops"
 
 # What the launcher receives when it checks the client version. It must match

@@ -86,6 +86,10 @@ pub struct GameConfig {
     /// `ExpList.bin`. Empty means nobody ever gains a level.
     #[serde(default)]
     pub exp_list: String,
+    /// The companion's own curve, which is not the character's: plain
+    /// dwords rather than the eight-byte entries `ExpList.bin` uses.
+    #[serde(default)]
+    pub pran_exp_list: String,
     /// Directory of drop tables. Empty means monsters leave nothing.
     #[serde(default)]
     pub drop_dir: String,
@@ -247,6 +251,7 @@ impl Default for GameConfig {
             skill_data: String::new(),
             template_dir: String::new(),
             exp_list: String::new(),
+            pran_exp_list: String::new(),
             drop_dir: String::new(),
         }
     }

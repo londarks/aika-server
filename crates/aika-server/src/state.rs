@@ -22,6 +22,8 @@ pub struct State {
     /// What everything costs and what it does. Empty when no table was
     /// configured, which makes every lookup miss rather than panic.
     pub items: ItemList,
+    /// What a companion's level costs. See [`crate::pran::ExpCurve`].
+    pub pran_levels: crate::pran::ExpCurve,
     /// Every skill at every rank. Empty when none was configured, which
     /// refuses every cast rather than panicking.
     pub skills: SkillTable,
@@ -64,6 +66,7 @@ impl State {
         let skills = load_skills(&cfg.game.skill_data);
         let templates = load_templates(&cfg.game.template_dir);
         let levels = load_levels(&cfg.game.exp_list);
+        let pran_levels = load_pran_levels(&cfg.game.pran_exp_list);
         let drops = load_drops(&cfg.game.drop_dir);
 
         // Needs both halves, which is why it is here and not in the
@@ -76,7 +79,7 @@ impl State {
         }
 
         Ok(Self {
-            cfg, store, world, items, skills, templates, levels, drops,
+            cfg, store, world, items, skills, templates, levels, drops, pran_levels,
             db: Some(db), started: Instant::now(),
         })
     }
@@ -95,9 +98,10 @@ impl State {
         let skills = load_skills(&cfg.game.skill_data);
         let templates = load_templates(&cfg.game.template_dir);
         let levels = load_levels(&cfg.game.exp_list);
+        let pran_levels = load_pran_levels(&cfg.game.pran_exp_list);
         let drops = load_drops(&cfg.game.drop_dir);
         Ok(Self {
-            cfg, store, world, items, skills, templates, levels, drops,
+            cfg, store, world, items, skills, templates, levels, drops, pran_levels,
             db: None, started: Instant::now(),
         })
     }
@@ -323,6 +327,27 @@ fn load_templates(dir: &str) -> [Option<Template>; 6] {
 }
 
 /// Reads the experience curve, if one was configured.
+/// The companion's curve: plain little-endian dwords, one per level.
+///
+/// Nothing levels a pran without it, which is a quiet failure rather than
+/// a loud one -- so it says so.
+fn load_pran_levels(path: &str) -> crate::pran::ExpCurve {
+    if path.is_empty() {
+        return crate::pran::ExpCurve::default();
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let curve = crate::pran::ExpCurve::decode(&bytes);
+            info!(path, levels = curve.levels(), "pran experience curve loaded");
+            curve
+        }
+        Err(e) => {
+            warn!(path, error = %e, "no pran curve, so no companion will ever grow");
+            crate::pran::ExpCurve::default()
+        }
+    }
+}
+
 fn load_levels(path: &str) -> ExpTable {
     if path.is_empty() {
         return ExpTable::default();

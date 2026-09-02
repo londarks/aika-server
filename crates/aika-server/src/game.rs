@@ -520,6 +520,13 @@ pub(crate) struct Session {
     /// NPCs already placed on this player's screen. Same reason as `visible`:
     /// sending a spawn twice makes the client draw two of them.
     visible_npcs: HashSet<u16>,
+    /// Which of the account's companions is out, if any. A pran in the
+    /// chest earns nothing, which is the original's rule: it hands out a
+    /// share inside a switch on `SpawnedPran`.
+    pran_out: Option<usize>,
+    /// Whether the player has already been told the pran is at a wall, so
+    /// they are told once rather than on every kill.
+    pran_told_to_evolve: bool,
     /// The id a companion with a body is being drawn under, if one is out.
     ///
     /// Kept because dismissing has to undo whatever summoning did, and by
@@ -3113,6 +3120,7 @@ fn cast_skill(
     if killed {
         info!(monster = %target.name, skill = cast.skill, "killed with a skill");
         frames.extend(reward_for(state, session, &target));
+        frames.extend(reward_the_pran(state, session, target.experience as u64));
         session.visible_mobs.remove(&target.id);
     }
     Action::Reply(frames)
@@ -3770,6 +3778,81 @@ async fn handle_rename_pran(
     }
     Action::Reply(frames)
 }
+/// A companion's share of what its owner just killed.
+///
+/// A fifth of it, and only while the pran is out: the original hands it over
+/// in the switch on `SpawnedPran`, so a pran left in the chest earns nothing
+/// (`Mob/BaseMob.pas:6177`).
+///
+/// The level goes back on its own packet. That is the whole reason a pran
+/// never changed shape here: `OP_WORLD` describes everything about one
+/// except its level, and the client does not work the level out from the
+/// experience -- it waits to be told, and reads level 1 until it is.
+fn reward_the_pran(state: &State, session: &mut Session, experience: u64) -> Vec<Vec<u8>> {
+    if session.pran_out.is_none() {
+        return Vec::new();
+    }
+    let share = pran::share_of_kill(experience);
+    if share == 0 {
+        return Vec::new();
+    }
+
+    let client_id = session.client_id;
+    let Some(account) = session.account.as_mut() else {
+        return Vec::new();
+    };
+    let Some(at) = session.pran_out else {
+        return Vec::new();
+    };
+    let Some(pran) = account.prans.get_mut(at) else {
+        return Vec::new();
+    };
+
+    let grew = pran::add_exp(pran, share, &state.pran_levels);
+    session.dirty = true;
+
+    let mut frames = vec![frame::encode(
+        &Message {
+            sender: dialog::FIXED_INDEX,
+            opcode: pran::OP_LEVEL,
+            time: PACKET_TIME,
+            body: pran::level_body(pran.level, pran.exp),
+        },
+        rand::random(),
+    )];
+
+    match grew {
+        pran::Growth::MustEvolve => {
+            // Once, not on every kill: the pran is at a wall and will stay
+            // there until somebody evolves it.
+            if !session.pran_told_to_evolve {
+                session.pran_told_to_evolve = true;
+                frames.push(encode_client_message(
+                    client_id,
+                    "Your pran must evolve before it can grow further.",
+                ));
+            }
+            return frames;
+        }
+        pran::Growth::Grew { levels } if levels > 0 => {
+            info!(name = %pran.name, level = pran.level, "the pran grew");
+            session.pran_told_to_evolve = false;
+            let described = frame::encode(
+                &Message {
+                    sender: dialog::FIXED_INDEX,
+                    opcode: pran::OP_WORLD,
+                    time: PACKET_TIME,
+                    body: pran::world_body(pran),
+                },
+                rand::random(),
+            );
+            frames.push(encode_client_message(client_id, "Your pran gained a level."));
+            frames.push(described);
+        }
+        pran::Growth::Grew { .. } => {}
+    }
+    frames
+}
 /// Whatever the worn summon stone should be showing right now.
 ///
 /// Called wherever equipment slot ten can have changed: entering the world,
@@ -3806,6 +3889,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     // pran should not be sent a packet about one. Clearing is the caller's to
     // do, and only where a stone has just left.
     let Some(stone) = worn else {
+        session.pran_out = None;
         return Vec::new();
     };
     let is_stone = state
@@ -3859,6 +3943,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
         }
     };
 
+    session.pran_out = Some(at);
     let pran = &account.prans[at];
 
     // Built here, sent last. The original spawns the body and *then* describes
@@ -3923,6 +4008,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
 /// So this undoes what was actually done. Summoning records the id it drew
 /// under, and dismissing removes exactly that or clears the effect.
 fn dismiss_pran(session: &mut Session) -> Vec<Vec<u8>> {
+    session.pran_out = None;
     match session.pran_body.take() {
         Some(pran_id) => vec![encode_remove_mob(pran_id as u16, 0)],
         None => vec![encode_effect(session.client_id, EFFECT_NONE)],

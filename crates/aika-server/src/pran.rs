@@ -228,6 +228,9 @@ pub struct Pran {
     /// when it makes one. Leave it zero and the client falls back to a
     /// bare human body.
     pub equipment: [u16; EQUIPMENT_SLOTS],
+    /// How far each of the ten has been raised. A hatchling has the first
+    /// three at one and the rest at nothing.
+    pub skill_levels: [u8; SKILLS],
     /// The ten skills, by id, zero for one it does not know.
     pub skills: [u32; SKILLS],
     /// Which three it has on its bar.
@@ -258,6 +261,7 @@ impl Default for Pran {
             chest: 0,
             leg: 0,
             equipment: [0; EQUIPMENT_SLOTS],
+            skill_levels: [0; SKILLS],
             skills: [0; SKILLS],
             bar: [0; 3],
             created_at: 0,
@@ -325,6 +329,13 @@ impl Pran {
             chest: 100,
             leg: 100,
             equipment,
+            skill_levels: {
+                let mut levels = [0u8; SKILLS];
+                for level in levels.iter_mut().take(SKILLS_AT_BIRTH) {
+                    *level = 1;
+                }
+                levels
+            },
             skills,
             created_at: now,
             updated_at: now,
@@ -446,6 +457,166 @@ pub fn world_body(pran: &Pran) -> Vec<u8> {
     }
 
     out
+}
+/// `0x116`, which is the only packet that tells the client a pran's level.
+///
+/// This is the one that mattered. The pran's own description packet
+/// (`OP_WORLD`) has no level field at all -- name, class, food, devotion,
+/// hit points, experience, defences, gear, and no level -- and the client
+/// does not work one out from the experience either. It waits to be told.
+/// Until it is, the window reads level 1 whatever the experience says, and
+/// the shape it draws is the shape of level 1.
+pub const OP_LEVEL: u16 = 0x116;
+
+/// `TRefreshPranLevelExpPacket`: a level and an experience, and the level
+/// goes out one higher than it is held.
+///
+/// `SendPranLevelAndExp(Pran.Level + 1, Pran.Exp)`, at all four call sites.
+/// The same off-by-one the character's own level travels with, which this
+/// project already knows to convert at the edge and never to store.
+pub fn level_body(level: u8, exp: u32) -> Vec<u8> {
+    let mut out = vec![0u8; 12];
+    out[0..4].copy_from_slice(&(level as u32 + 1).to_le_bytes());
+    out[4..12].copy_from_slice(&(exp as u64).to_le_bytes());
+    out
+}
+
+/// The highest level a pran reaches, as the original holds it.
+///
+/// `MAX_PRAN_LEVEL: word = 20` (`Data/GlobalDefs.pas:135`), which sits oddly
+/// beside a growth table of 150 entries and forms that run to 69. It is a
+/// typed constant rather than a real one, so it was meant to be raised. What
+/// `AddPranExp` actually enforces is this number, so this is the number.
+pub const MAX_LEVEL: u8 = 20;
+
+/// The experience each level costs, read from `Data/PranExpList.bin`.
+///
+/// Plain little-endian dwords, one per level, no header and no terminator:
+/// `SetLength(PranExpList, FSize div sizeof(DWORD))` and one read
+/// (`Functions/Load.pas:809`). Six hundred bytes, so a hundred and fifty
+/// levels, of which the game uses seventy.
+#[derive(Debug, Default, Clone)]
+pub struct ExpCurve {
+    thresholds: Vec<u32>,
+}
+
+impl ExpCurve {
+    pub fn decode(bytes: &[u8]) -> Self {
+        Self {
+            thresholds: bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().expect("four bytes")))
+                .collect(),
+        }
+    }
+
+    /// What a pran needs to be this level. Past the end of the table the
+    /// last entry stands, so a missing file cannot hand out infinite levels.
+    pub fn threshold(&self, level: u8) -> u32 {
+        self.thresholds.get(level as usize).copied().unwrap_or(u32::MAX)
+    }
+
+    pub fn levels(&self) -> usize {
+        self.thresholds.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.thresholds.is_empty()
+    }
+}
+
+/// What came of giving a companion a share of a kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Growth {
+    /// Standing at a wall it cannot pass, so nothing was earned at all. The
+    /// original says so out loud: "A sua pran precisa evoluir para ganhar
+    /// exp".
+    MustEvolve,
+    /// Earned, and grew this many levels doing it.
+    Grew { levels: u8 },
+}
+
+/// A companion's share of what its owner killed: a fifth.
+///
+/// `PranExpAcquired := (ExpAcquired div 5)` -- the same line in all six
+/// branches of the switch that hands it out.
+pub fn share_of_kill(experience: u64) -> u32 {
+    (experience / 5).min(u32::MAX as u64) as u32
+}
+
+/// Gives a companion experience, levelling it as far as that reaches.
+///
+/// Two things stop it. The wall for its form, which it can reach but not
+/// pass without evolving, and [`MAX_LEVEL`]. At either it keeps the
+/// experience it is standing on rather than a number past the end of what
+/// it may hold.
+pub fn add_exp(pran: &mut Pran, gained: u32, curve: &ExpCurve) -> Growth {
+    if must_evolve(pran.level, pran.class) {
+        return Growth::MustEvolve;
+    }
+
+    // The wall ahead, not the one underfoot. A pran that has evolved is
+    // standing on the wall it just passed, and looking for the first wall at
+    // or above its level would find that one and hold it there for ever.
+    if let Some(wall) = WALLS.iter().copied().find(|wall| pran.level < *wall) {
+        // The band tops out one level short of the next threshold, and a
+        // kill that would carry it past lands it exactly on the wall.
+        if pran.exp as u64 + gained as u64 > curve.threshold(wall + 1) as u64 {
+            let levels = wall - pran.level;
+            pran.exp = curve.threshold(wall);
+            for _ in 0..levels {
+                level_up(pran);
+            }
+            return Growth::Grew { levels };
+        }
+    }
+
+    pran.exp = pran.exp.saturating_add(gained);
+    let mut levels = 0;
+    while pran.level + 1 < MAX_LEVEL && pran.exp > curve.threshold(pran.level + 1) {
+        level_up(pran);
+        levels += 1;
+    }
+    if pran.level + 1 == MAX_LEVEL && pran.exp > curve.threshold(pran.level + 1) {
+        pran.exp = curve.threshold(pran.level + 1);
+    }
+    Growth::Grew { levels }
+}
+
+/// One level: more of everything, and full again.
+///
+/// `AddPranLevel`. The two increments are the original's own constants, and
+/// a level fills a pran up the way a level fills a character up.
+fn level_up(pran: &mut Pran) {
+    if pran.level >= MAX_LEVEL {
+        return;
+    }
+    pran.level += 1;
+    pran.max_hp = pran.max_hp.saturating_add(HP_PER_LEVEL);
+    pran.max_mp = pran.max_mp.saturating_add(MP_PER_LEVEL);
+    pran.hp = pran.max_hp;
+    pran.mp = pran.max_mp;
+    raise_skills(pran);
+}
+
+/// Which of the ten skills a level raises.
+///
+/// Three bands, all of them read off `Level + 1` rather than the level, and
+/// the middle one skips the fourth skill for reasons the original does not
+/// give (`AddPranLevel`).
+fn raise_skills(pran: &mut Pran) {
+    let shown = pran.level as usize + 1;
+    let raise: Vec<usize> = match shown {
+        5..=30 => (0..=(pran.level as usize / 5) + 2).collect(),
+        35..=50 => (0..SKILLS).filter(|i| *i != 3).collect(),
+        55..=70 => (4..SKILLS).collect(),
+        _ => Vec::new(),
+    };
+    for at in raise {
+        if let Some(level) = pran.skill_levels.get_mut(at) {
+            *level = level.saturating_add(1);
+        }
+    }
 }
 /// What a pran looks like, which is decided by its level and not by its class.
 ///
@@ -728,6 +899,106 @@ mod tests {
     fn a_short_rename_packet_is_not_one() {
         assert_eq!(Rename::parse(&[0u8; Rename::BODY_SIZE - 1]), None);
     }
+    /// The shipped curve, so the numbers under these tests are the real ones.
+    fn curve() -> ExpCurve {
+        let mut raw = Vec::new();
+        // 0, 855, 2106, 3864, 6253, 9410 ... the first six of the file, then a
+        // straight climb, which is enough for anything below the second wall.
+        for (at, value) in [0u32, 855, 2106, 3864, 6253, 9410].into_iter().enumerate() {
+            let _ = at;
+            raw.extend_from_slice(&value.to_le_bytes());
+        }
+        for level in 6..150u32 {
+            raw.extend_from_slice(&(9410 + (level - 5) * 4000).to_le_bytes());
+        }
+        ExpCurve::decode(&raw)
+    }
+
+    /// A fifth of the kill, which is the same line in all six branches.
+    #[test]
+    fn a_companion_takes_a_fifth_of_the_kill() {
+        assert_eq!(share_of_kill(100), 20);
+        assert_eq!(share_of_kill(4), 0, "a kill too small to divide");
+    }
+
+    /// The level packet is the only one that carries a level, and it carries
+    /// it one higher than it is held.
+    #[test]
+    fn the_level_packet_sends_one_more_than_the_level() {
+        let body = level_body(4, 6253);
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 5);
+        assert_eq!(u64::from_le_bytes(body[4..12].try_into().unwrap()), 6253);
+    }
+
+    #[test]
+    fn experience_carries_a_hatchling_up_through_the_fairy() {
+        let curve = curve();
+        let mut pran = Pran::hatch(Element::Fire, &stone_of(1), 0);
+        let hp = pran.max_hp;
+
+        assert_eq!(add_exp(&mut pran, 2200, &curve), Growth::Grew { levels: 1 });
+        assert_eq!(pran.level, 2, "past 855 is level two");
+        assert_eq!(pran.max_hp, hp + HP_PER_LEVEL, "a level did not add health");
+        assert_eq!(pran.hp, pran.max_hp, "and did not fill it up");
+    }
+
+    /// The fairy stops at four however big the kill, keeping the experience of
+    /// the wall rather than a number past it.
+    #[test]
+    fn a_fairy_lands_on_its_wall_and_stops() {
+        let curve = curve();
+        let mut pran = Pran::hatch(Element::Fire, &stone_of(1), 0);
+
+        assert_eq!(add_exp(&mut pran, 1_000_000, &curve), Growth::Grew { levels: 3 });
+        assert_eq!(pran.level, WALLS[0]);
+        assert_eq!(pran.exp, curve.threshold(WALLS[0]), "it kept more than the wall holds");
+
+        // and from there it earns nothing at all until it evolves
+        let before = pran.exp;
+        assert_eq!(add_exp(&mut pran, 5000, &curve), Growth::MustEvolve);
+        assert_eq!(pran.exp, before, "it earned while standing at the wall");
+        assert_eq!(pran.level, WALLS[0]);
+    }
+
+    /// Evolving is what lets it move again, and nothing else does.
+    #[test]
+    fn evolving_is_what_opens_the_next_stretch() {
+        let curve = curve();
+        let mut pran = Pran { level: WALLS[0], exp: curve.threshold(WALLS[0]),
+            ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
+        assert_eq!(add_exp(&mut pran, 5000, &curve), Growth::MustEvolve);
+
+        pran.class = evolved(pran.class).unwrap();
+        assert_eq!(add_exp(&mut pran, 5000, &curve), Growth::Grew { levels: 1 });
+        assert_eq!(pran.level, 5, "the child begins at five");
+        assert_eq!(Form::of_level(pran.level), Form::Child);
+    }
+
+    /// A level in the first band raises the skills the original raises.
+    #[test]
+    fn a_level_raises_the_skills_the_band_names() {
+        let curve = curve();
+        let mut pran = Pran { level: 4, class: 62, exp: curve.threshold(4),
+            ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
+        assert_eq!(pran.skill_levels[..3], [1, 1, 1], "a hatchling knows three");
+
+        add_exp(&mut pran, 5000, &curve);
+
+        // level five: skills 0 to (4 / 5) + 2 = 0..=2, plus the fourth
+        assert!(pran.skill_levels[0] > 1, "the first skill did not grow");
+        assert_eq!(pran.skill_levels[9], 0, "the last one is not in this band");
+    }
+
+    /// A curve that never loaded must not hand out levels, and must not panic.
+    #[test]
+    fn no_curve_means_no_growth() {
+        let empty = ExpCurve::default();
+        let mut pran = Pran::hatch(Element::Fire, &stone_of(1), 0);
+
+        assert_eq!(add_exp(&mut pran, 1_000_000, &empty), Growth::Grew { levels: 0 });
+        assert_eq!(pran.level, 1, "it levelled off a table that does not exist");
+    }
+
     /// The four forms and the three walls between them, as the original's own
     /// comments lay them out.
     #[test]

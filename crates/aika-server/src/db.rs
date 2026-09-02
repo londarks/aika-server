@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS prans (
     chest         INTEGER NOT NULL DEFAULT 0,
     leg           INTEGER NOT NULL DEFAULT 0,
     equipment     BLOB,
+    skill_levels  BLOB,
     skills        BLOB,
     bar           BLOB,
     created_at    INTEGER NOT NULL DEFAULT 0,
@@ -233,6 +234,7 @@ impl Database {
             // Added once prans could be drawn: the eight indices the spawn
             // carries, the first of which is what the client draws one as.
             ("prans", "equipment BLOB"),
+            ("prans", "skill_levels BLOB"),
         ] {
             self.add_column(table, column).await?;
         }
@@ -543,7 +545,8 @@ impl Database {
             "SELECT id, item_id, name, level, class, hp, max_hp, mp, max_mp, xp,
                     def_p, def_m, food, devotion,
                     p_cute, p_smart, p_sexy, p_energetic, p_tough, p_corrupt,
-                    width, chest, leg, equipment, skills, bar, created_at, updated_at
+                    width, chest, leg, equipment, skill_levels, skills, bar,
+                    created_at, updated_at
              FROM prans WHERE account_id = ? ORDER BY id",
         )
         .bind(account_id)
@@ -580,6 +583,7 @@ impl Database {
                     chest: row.try_get::<i64, _>("chest")? as u8,
                     leg: row.try_get::<i64, _>("leg")? as u8,
                     equipment: unpack_u16(row.try_get::<Option<Vec<u8>>, _>("equipment")?),
+                    skill_levels: unpack_u8(row.try_get::<Option<Vec<u8>>, _>("skill_levels")?),
                     skills: unpack_u32(row.try_get::<Option<Vec<u8>>, _>("skills")?),
                     bar: unpack_u8(row.try_get::<Option<Vec<u8>>, _>("bar")?),
                     created_at: row.try_get::<i64, _>("created_at")?,
@@ -624,7 +628,7 @@ impl Database {
                  def_p = ?, def_m = ?, food = ?, devotion = ?,
                  p_cute = ?, p_smart = ?, p_sexy = ?, p_energetic = ?,
                  p_tough = ?, p_corrupt = ?, width = ?, chest = ?, leg = ?,
-                 equipment = ?, skills = ?, bar = ?, updated_at = ?
+                 equipment = ?, skill_levels = ?, skills = ?, bar = ?, updated_at = ?
              WHERE account_id = ? AND item_id = ?",
         )
         .bind(&pran.name)
@@ -649,6 +653,7 @@ impl Database {
         .bind(pran.chest as i64)
         .bind(pran.leg as i64)
         .bind(pack_u16(&pran.equipment))
+        .bind(pran.skill_levels.to_vec())
         .bind(pack_u32(&pran.skills))
         .bind(pran.bar.to_vec())
         .bind(pran.updated_at)
@@ -667,10 +672,10 @@ impl Database {
                  (name, level, class, hp, max_hp, mp, max_mp, xp,
                   def_p, def_m, food, devotion,
                   p_cute, p_smart, p_sexy, p_energetic, p_tough, p_corrupt,
-                  width, chest, leg, equipment, skills, bar, updated_at,
+                  width, chest, leg, equipment, skill_levels, skills, bar, updated_at,
                   account_id, item_id, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&pran.name)
         .bind(pran.level as i64)
@@ -694,6 +699,7 @@ impl Database {
         .bind(pran.chest as i64)
         .bind(pran.leg as i64)
         .bind(pack_u16(&pran.equipment))
+        .bind(pran.skill_levels.to_vec())
         .bind(pack_u32(&pran.skills))
         .bind(pran.bar.to_vec())
         .bind(pran.updated_at)

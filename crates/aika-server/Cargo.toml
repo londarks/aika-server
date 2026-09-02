@@ -24,7 +24,7 @@ hex = "0.4"
 md-5 = "0.10"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "mysql", "any", "macros"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "mysql", "any", "macros"] }
 toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 tracing = "0.1"

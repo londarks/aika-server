@@ -15,9 +15,8 @@ use crate::config::DevAccount;
 use crate::inventory::Inventory;
 use crate::store::{Account, Character, Item, DEFAULT_SIZES, DEFAULT_SPEED_MOVE};
 use anyhow::{Context, Result};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
-use std::str::FromStr;
+use sqlx::any::AnyPoolOptions;
+use sqlx::{AnyPool, Row};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Item containers, matching the `TypeSlot` the protocol uses.
@@ -25,9 +24,82 @@ pub const CONTAINER_EQUIP: i64 = 0;
 pub const CONTAINER_INVENTORY: i64 = 1;
 pub const CONTAINER_STORAGE: i64 = 2;
 
-/// The whole schema. Written for SQLite; the only lines that need a MySQL
-/// spelling are the primary keys, since `AUTOINCREMENT` there is
-/// `AUTO_INCREMENT` on an `INT`.
+/// Reads back the id of a row that was just inserted, by something unique
+/// about it.
+///
+/// Three ways to do this and two of them are traps. `RETURNING id` is
+/// SQLite's and Postgres's and MySQL has never had it. `LAST_INSERT_ID()` is
+/// per *connection*, and a pool hands the next query to whichever connection
+/// is free -- right almost always, wrong under load, which is the worst kind
+/// of wrong. So the row is found again by the thing that made it unique in the
+/// first place, which every database can do and none can get subtly wrong.
+async fn id_of(pool: &AnyPool, table: &str, column: &str, value: &str) -> Result<i64> {
+    let row = sqlx::query(&format!("SELECT id FROM {table} WHERE {column} = ?"))
+        .bind(value)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("reading back the {table} row for {value}"))?;
+    Ok(row.try_get::<i64, _>("id")?)
+}
+
+/// A connection string with its password taken out, for anything that might
+/// be written down.
+///
+/// A URL is the one configuration value here that can carry a secret, and the
+/// two places it would otherwise end up -- a log line and an error message --
+/// are exactly the two that get pasted into a chat when something goes wrong.
+pub fn redacted(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some((credentials, host)) = rest.split_once('@') else {
+        return url.to_string();
+    };
+    let user = credentials.split_once(':').map(|(u, _)| u).unwrap_or(credentials);
+    format!("{scheme}://{user}:***@{host}")
+}
+
+/// Which database is behind us.
+///
+/// The two differ in exactly one thing worth a branch: how a table says
+/// its id counts itself up. Everything else in this file is written to be
+/// read by both -- only `INTEGER`, `TEXT`, `BLOB` and `REAL`, timestamps as
+/// integer seconds, and no `INSERT OR REPLACE` or `REPLACE INTO`, each of
+/// which exists on one side and not the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Sqlite,
+    MySql,
+}
+
+impl Dialect {
+    /// Read off the connection string, the way sqlx reads it.
+    pub fn of(url: &str) -> Self {
+        if url.starts_with("mysql:") || url.starts_with("mariadb:") {
+            Dialect::MySql
+        } else {
+            Dialect::Sqlite
+        }
+    }
+
+    /// How a primary key that counts itself up is spelled.
+    fn self_counting_key(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "INTEGER PRIMARY KEY AUTOINCREMENT",
+            Dialect::MySql => "INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY",
+        }
+    }
+}
+
+/// The schema in the one spelling both understand, bar the key.
+///
+/// `AUTOINCREMENT` is SQLite's and `AUTO_INCREMENT` is MySQL's, and neither
+/// will read the other. Written here as SQLite's and rewritten on the way
+/// out, so there is one schema rather than two to keep in step.
+fn schema_for(dialect: Dialect) -> String {
+    SCHEMA.replace(Dialect::Sqlite.self_counting_key(), dialect.self_counting_key())
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS accounts (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,33 +233,69 @@ CREATE INDEX IF NOT EXISTS storage_by_account ON storage_items (account_id);
 "#;
 
 pub struct Database {
-    pool: SqlitePool,
+    pool: AnyPool,
+    dialect: Dialect,
 }
 
 impl Database {
     /// Opens the database file, creating it and the schema if needed.
-    pub async fn open(path: &str) -> Result<Self> {
-        let options = SqliteConnectOptions::from_str(path)
-            .with_context(|| format!("reading the database path {path}"))?
-            .create_if_missing(true)
-            // Characters are saved as players disconnect, so a crash should
-            // cost at most the last write rather than the file.
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .foreign_keys(true);
+    /// Opens whatever the configuration points at.
+    ///
+    /// A plain path is taken for a SQLite file and given the spelling sqlx
+    /// wants, so `var/aika.db` keeps working and nobody has to learn a URL
+    /// to run the thing. Anything with a scheme is passed through, which is
+    /// how `mysql://user:pass@host/db` gets here.
+    ///
+    /// The credentials in that URL are the reason it is read from the
+    /// environment or from an ignored file and never from anything tracked.
+    pub async fn open(url: &str) -> Result<Self> {
+        sqlx::any::install_default_drivers();
+        let url = Self::connection_string(url);
+        let dialect = Dialect::of(&url);
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(8)
-            .connect_with(options)
+        // A database in memory belongs to the connection that opened it, so a
+        // pool of eight is eight empty databases and a schema in only one of
+        // them. The typed pool hid this; the untyped one does not.
+        let connections = if url.contains(":memory:") { 1 } else { 8 };
+
+        let pool = AnyPoolOptions::new()
+            .max_connections(connections)
+            .connect(&url)
             .await
-            .with_context(|| format!("opening the database at {path}"))?;
+            .with_context(|| format!("opening the database at {}", redacted(&url)))?;
 
-        let db = Self { pool };
+        if dialect == Dialect::Sqlite {
+            // Lost with the typed options: a crash should cost the last
+            // write rather than the file, and a row should not outlive what
+            // it points at.
+            let _ = sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await;
+            let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await;
+        }
+
+        let db = Self { pool, dialect };
         db.migrate().await?;
         Ok(db)
     }
 
+    /// What sqlx needs, from what a person would write.
+    ///
+    /// A bare path becomes a SQLite URL that creates the file if it is not
+    /// there, which is what `create_if_missing` used to do before the pool
+    /// stopped being typed.
+    fn connection_string(url: &str) -> String {
+        if url.contains("://") || url.starts_with("sqlite:") {
+            return url.to_string();
+        }
+        // `sqlite:` and not `sqlite://`: with the two slashes a Windows path
+        // reads as a host called `C`, and the backslashes are not URL
+        // characters at all. Forward slashes work on Windows and are the only
+        // ones that work anywhere else.
+        format!("sqlite:{}?mode=rwc", url.replace('\\', "/"))
+    }
+
     async fn migrate(&self) -> Result<()> {
-        for statement in SCHEMA.split(';').filter(|s| !s.trim().is_empty()) {
+        let schema = schema_for(self.dialect);
+        for statement in schema.split(';').filter(|s| !s.trim().is_empty()) {
             sqlx::query(statement)
                 .execute(&self.pool)
                 .await
@@ -323,11 +431,11 @@ impl Database {
     }
 
     async fn insert_account(&self, account: &Account) -> Result<i64> {
-        let row = sqlx::query(
+        let done = sqlx::query(
             "INSERT INTO accounts
                  (username, password_hash, nation, account_status, ban_days, created_at)
              VALUES (?, ?, ?, ?, ?, ?)
-             RETURNING id",
+             ",
         )
         .bind(&account.username)
         .bind(&account.password_hash)
@@ -335,22 +443,23 @@ impl Database {
         .bind(account.account_status as i64)
         .bind(account.ban_days as i64)
         .bind(now())
-        .fetch_one(&self.pool)
+        .execute(&self.pool)
         .await
         .with_context(|| format!("inserting account {}", account.username))?;
+        let _ = done;
 
-        Ok(row.try_get::<i64, _>("id")?)
+        id_of(&self.pool, "accounts", "username", &account.username).await
     }
 
     pub async fn insert_character(&self, account_id: i64, character: &Character) -> Result<i64> {
-        let row = sqlx::query(
+        let done = sqlx::query(
             "INSERT INTO characters
                  (account_id, slot, name, nation, class_index, hair, level, exp, gold, class_tier,
                   x, y, speed_move, height, torso, legs, body,
                   strength, agility, intellect, constitution, luck, free_points,
                   skill_list, item_bar, skill_points, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             RETURNING id",
+             ",
         )
         .bind(account_id)
         .bind(character.slot as i64)
@@ -379,14 +488,15 @@ impl Database {
         .bind(pack_u32(&character.item_bar))
         .bind(character.skill_points as i64)
         .bind(now())
-        .fetch_one(&self.pool)
+        .execute(&self.pool)
         .await
         .with_context(|| format!("inserting character {}", character.name))?;
 
         // A new character is handed starting gear, and it has to go in with
         // it: writing the row alone leaves a character that arrives empty
         // after the first restart.
-        let id: i64 = row.try_get("id")?;
+        let _ = done;
+        let id = id_of(&self.pool, "characters", "name", &character.name).await?;
         self.save_inventory(id, &character.items).await?;
         Ok(id)
     }
@@ -1089,6 +1199,65 @@ pub fn default_speed() -> u8 {
 mod tests {
     use super::*;
     use crate::config::DevCharacter;
+
+    /// A connection string that carries a password must not be repeatable by
+    /// anything that writes it down. Every path out of here -- a log line, an
+    /// error, a panic -- goes through this.
+    #[test]
+    fn a_connection_string_gives_up_its_password() {
+        assert_eq!(
+            redacted("mysql://someone:hunter2@db.example.com:3306/aika"),
+            "mysql://someone:***@db.example.com:3306/aika"
+        );
+        // nothing to hide, nothing changed
+        assert_eq!(redacted("sqlite:var/aika.db?mode=rwc"), "sqlite:var/aika.db?mode=rwc");
+        assert_eq!(redacted("mysql://host/aika"), "mysql://host/aika");
+    }
+
+    /// A path is not a URL, and a Windows path is not one twice over: the
+    /// drive letter reads as a host and the separators are not URL characters.
+    #[test]
+    fn a_plain_path_becomes_something_sqlx_can_open() {
+        assert_eq!(
+            Database::connection_string("var/aika.db"),
+            "sqlite:var/aika.db?mode=rwc"
+        );
+        assert_eq!(
+            Database::connection_string("C:\\Temp\\aika.db"),
+            "sqlite:C:/Temp/aika.db?mode=rwc"
+        );
+        // and anything that is already a connection string is left alone
+        for url in ["sqlite::memory:", "mysql://u:p@h/d"] {
+            assert_eq!(Database::connection_string(url), url);
+        }
+    }
+
+    /// The one line that differs between the two schemas, and it has to
+    /// differ in both directions.
+    #[test]
+    fn the_schema_speaks_whichever_dialect_is_listening() {
+        let sqlite = schema_for(Dialect::Sqlite);
+        let mysql = schema_for(Dialect::MySql);
+
+        assert!(sqlite.contains("INTEGER PRIMARY KEY AUTOINCREMENT"));
+        assert!(!sqlite.contains("AUTO_INCREMENT"));
+        assert!(mysql.contains("AUTO_INCREMENT PRIMARY KEY"));
+        assert!(!mysql.contains("AUTOINCREMENT PRIMARY"), "sqlite spelling left in");
+
+        // every table keeps its key, whichever way it is spelled
+        assert_eq!(
+            sqlite.matches("PRIMARY KEY").count(),
+            mysql.matches("PRIMARY KEY").count()
+        );
+    }
+
+    #[test]
+    fn the_dialect_is_read_off_the_connection_string() {
+        assert_eq!(Dialect::of("mysql://u:p@h/d"), Dialect::MySql);
+        assert_eq!(Dialect::of("mariadb://u:p@h/d"), Dialect::MySql);
+        assert_eq!(Dialect::of("sqlite:var/aika.db"), Dialect::Sqlite);
+        assert_eq!(Dialect::of("var/aika.db"), Dialect::Sqlite);
+    }
 
     /// A summon stone: what a pran binds to and what it is drawn as.
     fn stone_of(identific: i32) -> Item {

@@ -56,7 +56,11 @@ fn config(database_path: &str) -> Config {
     Config {
         // Every change is written at once, so the tests do not have to wait
         // out an interval to see one.
-        database: DatabaseConfig { path: database_path.to_string(), autosave_secs: 0 },
+        database: DatabaseConfig {
+            path: database_path.to_string(),
+            url: String::new(),
+            autosave_secs: 0,
+        },
         accounts: vec![DevAccount {
             username: "admin".into(),
             password: Some("admin".into()),

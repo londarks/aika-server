@@ -45,15 +45,19 @@ impl State {
     /// seeds the very first run, so a fresh checkout still has somewhere to
     /// log in, and is ignored from then on: the database is the truth.
     pub async fn open(cfg: Config) -> anyhow::Result<Self> {
-        let db = Database::open(&cfg.database.path).await?;
+        let connection = cfg.database.connection();
+        let db = Database::open(&connection).await?;
+        // Never the raw string: it can carry a password, and a log line is
+        // the first thing pasted into a chat when something goes wrong.
+        let where_it_is = crate::db::redacted(&connection);
 
         if db.account_count().await? == 0 {
             let seeded = db.seed(&cfg.accounts).await?;
-            info!(path = %cfg.database.path, accounts = seeded, "seeded a new database");
+            info!(database = %where_it_is, accounts = seeded, "seeded a new database");
         }
 
         let accounts = db.load_accounts().await?;
-        info!(path = %cfg.database.path, accounts = accounts.len(), "database ready");
+        info!(database = %where_it_is, accounts = accounts.len(), "database ready");
 
         let store = AccountStore::from_accounts(
             accounts,

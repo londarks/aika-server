@@ -178,8 +178,26 @@ pub struct DevCharacter {
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     /// A file path, or `:memory:` for a database that dies with the process.
+    ///
+    /// This is the development database and it is where a fresh checkout
+    /// runs with no setup at all. For MySQL, see [`DatabaseConfig::url`].
     #[serde(default = "default_database_path")]
     pub path: String,
+    /// A full connection string, which wins over the path when it is set.
+    ///
+    /// `mysql://user:password@host:3306/database` for the production shape,
+    /// or a `sqlite:` URL for anything the path cannot spell.
+    ///
+    /// # Not in this file
+    ///
+    /// A MySQL URL carries a password, and this file is tracked. Leave it
+    /// empty here and set `AIKA_DATABASE_URL` in the environment instead,
+    /// which is what [`DatabaseConfig::connection`] reads first. The rule
+    /// this follows is the project's oldest: what identifies a machine or
+    /// an account does not go in a tracked file, and it is written down
+    /// because it was broken once and pushed.
+    #[serde(default)]
+    pub url: String,
     /// How long a change may sit in memory before it is written, in seconds.
     ///
     /// Saving only when a player disconnects loses the whole session to a
@@ -191,7 +209,31 @@ pub struct DatabaseConfig {
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
-        Self { path: default_database_path(), autosave_secs: default_autosave_secs() }
+        Self {
+            path: default_database_path(),
+            url: String::new(),
+            autosave_secs: default_autosave_secs(),
+        }
+    }
+}
+
+impl DatabaseConfig {
+    /// Where to connect, in the order the answer is looked for.
+    ///
+    /// The environment first, because that is the one place a password can
+    /// live without being committed by somebody in a hurry. Then the URL in
+    /// the file, for a database whose address is not a secret. Then the
+    /// path, which is what a fresh checkout uses and needs no thought.
+    pub fn connection(&self) -> String {
+        if let Ok(url) = std::env::var("AIKA_DATABASE_URL") {
+            if !url.trim().is_empty() {
+                return url;
+            }
+        }
+        if !self.url.trim().is_empty() {
+            return self.url.clone();
+        }
+        self.path.clone()
     }
 }
 

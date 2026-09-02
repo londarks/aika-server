@@ -24,6 +24,10 @@ pad_status_to = 0
 # a level here will not raise a character that has been played.
 [database]
 path = "var/aika.db"
+# A full connection string, which wins over the path. Leave it empty and set
+# AIKA_DATABASE_URL in the environment instead: a MySQL URL carries a password
+# and this file is tracked. See the README.
+url = ""
 # How long a change may sit in memory before it is written, in seconds.
 # Saving only when a player disconnects loses the whole session to a crash or
 # a kill, which to the player looks exactly like a database that does not

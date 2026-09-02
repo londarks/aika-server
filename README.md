@@ -70,6 +70,61 @@ PIN and `KarakAereo` are both dead code in the original, sitting behind an
 `Exit;` at the top of their handlers, and the live half of each is already
 implemented here.
 
+## The database
+
+SQLite while developing, MySQL in production, and the same code for both.
+A fresh checkout needs no setup: `config.toml` points at a file under
+`var/`, and the file is created on first run.
+
+```toml
+[database]
+path = "var/aika.db"      # the development database
+url  = ""                 # a full connection string, when there is one
+```
+
+For MySQL, set the connection string **in the environment**, not in the
+file:
+
+```sh
+export AIKA_DATABASE_URL='mysql://user:password@host:3306/database'
+cargo run -p aika-server -- config.toml
+```
+
+`AIKA_DATABASE_URL` wins over `url`, which wins over `path`. The schema is
+created on connection either way, so an empty database is enough to start.
+
+### Why the URL is not in `config.toml`
+
+It carries a password and `config.toml` is tracked. This is the same rule
+as the one about absolute paths, and it is written down in both places for
+the same reason: it was broken once and pushed. Anything that identifies a
+machine, an account or a person stays out of the repository.
+
+The one connection string that is written down is a redaction: the server
+logs `mysql://user:***@host/db` and its errors say the same, because the
+first thing anybody does with a connection error is paste it somewhere.
+
+### Keeping one schema for two databases
+
+Only `INTEGER`, `TEXT`, `BLOB` and `REAL`. Timestamps are integer seconds.
+No `INSERT OR REPLACE`, which is SQLite's, and no `REPLACE INTO`, which is
+MySQL's — an upsert is an `UPDATE` and then an `INSERT` if it changed
+nothing.
+
+Three differences needed real handling rather than a rule:
+
+- **The self-counting key.** `AUTOINCREMENT` is SQLite's spelling and
+  `AUTO_INCREMENT` on an `INT` is MySQL's. The schema is written once and
+  the key is rewritten on the way out.
+- **The id of a row just inserted.** `RETURNING id` is SQLite's and
+  Postgres's; MySQL has never had it. `LAST_INSERT_ID()` is per connection
+  and a pool hands the next query to whichever connection is free, which is
+  right almost always and wrong under load. So the row is read back by
+  whatever made it unique.
+- **A database in memory belongs to one connection.** `sqlite::memory:`
+  with a pool of eight is eight empty databases and a schema in one of
+  them, so that one case takes a single connection.
+
 ## Running
 
 ```sh

@@ -3917,15 +3917,51 @@ fn evolve_the_pran(state: &State, session: &mut Session) -> Option<Vec<Vec<u8>>>
     worn.appearance = grown.stone;
     let _ = character.items.put(worn.clone());
 
+    // The exact four the quest sends, in the exact order:
+    //
+    //     SendEffect(0);
+    //     SendPranToWorld(0);
+    //     SendPranSpawn(0);
+    //     SendRefreshItemSlot(EQUIP_TYPE, 10, Character.Equip[10], False);
+    //
+    // Note that this is `ToWorld` and *then* `Spawn`, which is the opposite
+    // of the order the same two go out in on arrival. The original is not
+    // consistent about it and this follows each path as it is: describing a
+    // companion that is changing shape before redrawing it is not the same
+    // act as drawing one that has just appeared, and guessing which order a
+    // client wants has cost this project an evening already.
     let mut frames = vec![encode_menu_close()];
-    // The glow comes off before the body goes on, and only the first
-    // evolution has one to take off.
     if grown.clears_the_glow {
         frames.push(encode_effect(client_id, EFFECT_NONE));
-        session.pran_body = None;
     }
+    session.pran_body = None;
+
+    let account = session.account.as_ref()?;
+    let pran = account.prans.get(at)?;
+    frames.push(frame::encode(
+        &Message {
+            sender: dialog::FIXED_INDEX,
+            opcode: pran::OP_WORLD,
+            time: PACKET_TIME,
+            body: pran::world_body(pran),
+        },
+        rand::random(),
+    ));
+
+    if pran.has_body() {
+        if let Some(pran_id) = pran_client_id(client_id) {
+            let owner = session.character.as_ref()?;
+            let at = neighbour_spot(
+                (owner.x as f32, owner.y as f32),
+                rand::random::<usize>() % NEIGHBOUR_SPOTS,
+            );
+            let speed = stats::of(owner, &state.items, &Effects::none()).speed_move;
+            frames.push(encode_pran_spawn(pran, owner, pran_id, at, speed));
+            session.pran_body = Some(pran_id);
+        }
+    }
+
     frames.push(encode_refresh_item(inventory::EQUIP, pran::STONE_SLOT, &worn, false));
-    frames.extend(pran_frames(state, session));
     frames.push(encode_client_message(client_id, "Sua pran evoluiu."));
     Some(frames)
 }

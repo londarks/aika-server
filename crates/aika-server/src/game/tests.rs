@@ -2323,6 +2323,39 @@ async fn what_the_account_owns_survives_into_the_next_session() {
     );
 }
 
+/// The evolution sends what the quest sends, in the order the quest sends it.
+///
+/// `SendEffect(0)`, `SendPranToWorld`, `SendPranSpawn`, then the worn stone.
+/// Describing a companion that is changing shape and then redrawing it is the
+/// opposite order from the one arriving in the world uses, and the original is
+/// deliberately inconsistent about it. Each path follows its own.
+#[tokio::test]
+async fn evolving_sends_the_quests_packets_in_the_quests_order() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+    session.account.as_mut().unwrap().prans[0].level = 4;
+
+    let frames = frames_of(
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::QUESTS)).await,
+    );
+    let order: Vec<u16> = opcodes(&frames)
+        .into_iter()
+        .filter(|op| {
+            *op == crate::pran::OP_WORLD
+                || *op == crate::pran::OP_SPAWN
+                || *op == shop::OP_REFRESH_ITEM
+        })
+        .collect();
+
+    assert_eq!(
+        order,
+        vec![crate::pran::OP_WORLD, crate::pran::OP_SPAWN, shop::OP_REFRESH_ITEM],
+        "the quest sends these three and this is not them"
+    );
+}
+
 /// Away from a wall the quest option is not about the pran at all, and the
 /// character's own promotion answers instead.
 #[tokio::test]

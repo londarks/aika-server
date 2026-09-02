@@ -2256,6 +2256,71 @@ async fn the_character_record_says_what_the_prans_are_called() {
     assert!(off::PRAN_NAMES + 2 * off::PRAN_NAME_SIZE < CHARACTER_SIZE);
 }
 
+/// The quest at the wall, from the outside: talk to the NPC and the
+/// companion changes.
+#[tokio::test]
+async fn the_quest_at_the_wall_evolves_the_companion() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+    session.account.as_mut().unwrap().prans[0].level = 4;
+
+    let frames = frames_of(
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::QUESTS)).await,
+    );
+
+    let pran = &session.account.as_ref().unwrap().prans[0];
+    assert_eq!(pran.class, 62, "it did not evolve");
+    assert_eq!(pran.equipment[0], 104, "it is still drawn as a fairy");
+    assert!(session.dirty);
+
+    // The stone the player is wearing changes too. Only the pran's copy
+    // changing leaves the owner holding the stone of a form it no longer is.
+    let worn = session
+        .character
+        .as_ref()
+        .unwrap()
+        .items
+        .get(inventory::EQUIP, crate::pran::STONE_SLOT)
+        .expect("the stone came off");
+    assert_eq!(worn.index, 104, "the player is still wearing the old stone");
+    assert_eq!(worn.appearance, 104);
+    assert_eq!(worn.identific, 4242, "and it is still the same stone");
+
+    // it is redrawn, and the glow it had comes off
+    let sent = opcodes(&frames);
+    assert!(sent.contains(&crate::pran::OP_WORLD), "the client was not told");
+    assert!(effects_in(&frames).contains(&0), "the fairy glow was left on the player");
+}
+
+/// Away from a wall the quest option is not about the pran at all, and the
+/// character's own promotion answers instead.
+#[tokio::test]
+async fn between_walls_the_quest_option_is_not_about_the_pran() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+    session.account.as_mut().unwrap().prans[0].level = 3;
+
+    let frames = frames_of(
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::QUESTS)).await,
+    );
+
+    assert_eq!(session.account.as_ref().unwrap().prans[0].class, 61, "it evolved early");
+    let text: Vec<String> = frames
+        .iter()
+        .zip(opcodes(&frames))
+        .filter(|(_, op)| *op == OP_CLIENT_MESSAGE)
+        .map(|(frame, _)| message_text(frame))
+        .collect();
+    assert!(
+        text.iter().any(|t| t.contains("level") || t.contains("nothing further")),
+        "the character's promotion never answered: {text:?}"
+    );
+}
+
 /// A companion says how old it is when it comes out.
 ///
 /// Nothing else carries a level. The description packet has every other thing

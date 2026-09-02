@@ -618,6 +618,116 @@ fn raise_skills(pran: &mut Pran) {
         }
     }
 }
+/// Evolving: what the quest at each wall does.
+///
+/// The level carries the shape and stops at 4, 19 and 49. What lifts it is
+/// not levelling harder -- it is a quest, and the original's own comments
+/// name them: `406: // isso aqui e a quest Evolucao pran Lv5` and
+/// `407: // ... Lv20` (`PacketHandlers/NPCHandlers.pas:1563`). Both belong to
+/// NPC 2072, the same one that hands out prans in the first place.
+///
+/// Nothing else in the whole source ever writes a class of 62, 63 or 64.
+/// These two quests are the only way a pran has ever changed shape.
+///
+/// # The stone changes too, in two places
+///
+/// This is the part that is easy to miss and impossible to work around.
+/// Evolving swaps the summon stone -- 100, 101 or 102 for a fairy, then 104,
+/// then 105 -- and it swaps it *both* in the pran's own first equipment slot
+/// **and in equipment slot ten of the player**, which is the one the player
+/// is wearing. Changing only the pran's copy leaves the owner holding the
+/// stone of a form their companion no longer is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Evolution {
+    /// The class it becomes.
+    pub class: u8,
+    /// The stone it is now carried in, which the owner wears as well.
+    pub stone: u16,
+    /// Whether the fairy effect has to be taken off the player. Only the
+    /// first evolution does it, because only before it was there one.
+    pub clears_the_glow: bool,
+}
+
+/// What each wall's quest turns the stone into.
+///
+/// The third wall has no quest in the shipped data -- `Quests.csv` has 39,
+/// 40 and 41 to make a pran and 406 and 407 to evolve one, and nothing for
+/// level 49. So an adolescent stops there, on this data, as it did on the
+/// original.
+const EVOLUTION_STONES: [(u8, u16); 2] = [(4, 104), (19, 105)];
+
+/// What a hatchling holds in slot six, and what the first evolution puts
+/// there instead.
+pub const CHILD_HELD_ITEM: u16 = 150;
+
+/// Which of the ten skills the first evolution raises.
+///
+/// `Inc(Pran1.Skills[3].Level)`, with a comment beside it calling it
+/// "transformar" and noting that this one must not grow from kills like the
+/// others -- which is why the band that raises skills on a level skips
+/// exactly this index.
+const TRANSFORM_SKILL: usize = 3;
+
+/// Why a companion cannot evolve yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotYet {
+    /// Not standing on a wall. It can only be done at the exact level, not
+    /// before it and not after.
+    NotAtAWall,
+    /// At a wall it has already passed, or one the data has no quest for.
+    NothingFurther,
+}
+
+impl NotYet {
+    /// The original's own words where it has them.
+    pub fn message(&self) -> &'static str {
+        match self {
+            NotYet::NotAtAWall => "Sua pran ainda nao esta pronta para evoluir.",
+            NotYet::NothingFurther => "Essa pran nao pode ser upada de classe.",
+        }
+    }
+}
+
+/// Evolves a companion standing at a wall.
+///
+/// `FinishQuest` for 406 and 407, which differ only in the stone and in the
+/// two things the first one also does: it raises the transform skill and it
+/// puts item 150 in slot six.
+pub fn evolve(pran: &mut Pran) -> Result<Evolution, NotYet> {
+    let Some(element) = Element::of(pran.class) else {
+        return Err(NotYet::NothingFurther);
+    };
+    let tier = pran.class - element.first_class() + 1;
+
+    let Some((at, stone)) = EVOLUTION_STONES
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(at, (wall, _))| pran.level == *wall && tier == *at as u8 + 1)
+        .map(|(at, (_, stone))| (at, stone))
+    else {
+        // Either it is between walls, or it is at one it has already passed.
+        return Err(if WALLS.contains(&pran.level) {
+            NotYet::NothingFurther
+        } else {
+            NotYet::NotAtAWall
+        });
+    };
+
+    pran.class += 1;
+    pran.equipment[0] = stone;
+
+    // Only the first one. The second sets no held item and raises nothing.
+    let first = at == 0;
+    if first {
+        pran.equipment[6] = CHILD_HELD_ITEM;
+        if let Some(level) = pran.skill_levels.get_mut(TRANSFORM_SKILL) {
+            *level = level.saturating_add(1);
+        }
+    }
+
+    Ok(Evolution { class: pran.class, stone, clears_the_glow: first })
+}
 /// What a pran looks like, which is decided by its level and not by its class.
 ///
 /// The original writes the four out in its own comments, in the switch that
@@ -1055,6 +1165,86 @@ mod tests {
             assert_eq!(evolved(class), None, "the adult evolved again");
             assert!(!must_evolve(LEVEL_CAP, class), "the adult is walled in");
         }
+    }
+    /// The quest at the first wall, field for field.
+    #[test]
+    fn the_first_quest_turns_a_fairy_into_a_child() {
+        let mut pran = Pran { level: 4, ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
+        let before = pran.skill_levels[3];
+
+        let grown = evolve(&mut pran).expect("a fairy at the wall could not evolve");
+
+        assert_eq!(grown.class, 62);
+        assert_eq!(grown.stone, 104, "the stone it is carried in did not change");
+        assert!(grown.clears_the_glow, "the fairy effect was left on the player");
+        assert_eq!(pran.equipment[0], 104, "and the pran is not drawn as it");
+        assert_eq!(pran.equipment[6], CHILD_HELD_ITEM);
+        assert_eq!(pran.skill_levels[3], before + 1, "the transform skill");
+        assert_eq!(pran.level, 4, "evolving is not a level");
+    }
+
+    /// The second differs in the stone and in what it leaves alone.
+    #[test]
+    fn the_second_quest_turns_a_child_into_an_adolescent() {
+        let mut pran = Pran {
+            level: 19,
+            class: 62,
+            ..Pran::hatch(Element::Fire, &stone_of(1), 0)
+        };
+        let held = pran.equipment[6];
+        let transform = pran.skill_levels[3];
+
+        let grown = evolve(&mut pran).expect("a child at the wall could not evolve");
+
+        assert_eq!((grown.class, grown.stone), (63, 105));
+        assert!(!grown.clears_the_glow, "there was no glow left to clear");
+        assert_eq!(pran.equipment[6], held, "the second quest sets no held item");
+        assert_eq!(pran.skill_levels[3], transform, "nor raises the transform skill");
+    }
+
+    /// Only at the wall. Not one level short of it and not one past it: the
+    /// original tests `Level = 4` and `Level = 19` exactly.
+    #[test]
+    fn evolving_happens_at_the_wall_and_nowhere_else() {
+        for level in [3u8, 5, 18, 20] {
+            let mut pran = Pran { level, ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
+            assert_eq!(evolve(&mut pran), Err(NotYet::NotAtAWall), "at level {level}");
+            assert_eq!(pran.class, 61, "it evolved anyway at level {level}");
+        }
+    }
+
+    /// A wall it has already passed, and the one the data has no quest for.
+    #[test]
+    fn a_wall_with_no_quest_behind_it_evolves_nothing() {
+        // already a child, standing on the fairy's wall
+        let mut pran = Pran { level: 4, class: 62, ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
+        assert_eq!(evolve(&mut pran), Err(NotYet::NothingFurther));
+
+        // the third wall, which `Quests.csv` has nothing for
+        let mut grown = Pran { level: 49, class: 63, ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
+        assert_eq!(evolve(&mut grown), Err(NotYet::NothingFurther));
+        assert_eq!(grown.class, 63);
+    }
+
+    /// Evolving is what lets the level move again, which is the whole point
+    /// of the pair. Walked end to end: hatch, grow to the wall, be stopped,
+    /// evolve, and grow into the next form.
+    #[test]
+    fn evolving_at_the_wall_opens_the_way_to_the_next_form() {
+        let curve = curve();
+        let mut pran = Pran::hatch(Element::Fire, &stone_of(1), 0);
+
+        add_exp(&mut pran, 1_000_000, &curve);
+        assert_eq!(pran.level, 4);
+        assert_eq!(Form::of_level(pran.level), Form::Fairy);
+        assert_eq!(add_exp(&mut pran, 5000, &curve), Growth::MustEvolve);
+
+        evolve(&mut pran).expect("the wall it was stopped at refused to open");
+
+        assert_eq!(add_exp(&mut pran, 5000, &curve), Growth::Grew { levels: 1 });
+        assert_eq!(pran.level, 5);
+        assert_eq!(Form::of_level(pran.level), Form::Child);
+        assert!(pran.has_body(), "a child walks beside its owner");
     }
     #[test]
     fn the_element_is_the_tens_digit() {

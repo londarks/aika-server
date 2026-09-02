@@ -1958,6 +1958,12 @@ fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> A
             ])
         }
         dialog::option::QUESTS => {
+            // A companion standing at its own wall is the more specific
+            // thing to be asking for, so it is answered first.
+            if let Some(frames) = evolve_the_pran(state, session) {
+                return Action::Reply(frames);
+            }
+
             // The promotion chain was quests, and this is standing in for it
             // until there are quests: an NPC that offers them promotes a
             // character waiting at its tier's wall. See `crate::promotion`.
@@ -3871,6 +3877,57 @@ fn reward_the_pran(state: &State, session: &mut Session, experience: u64) -> Vec
         pran::Growth::Grew { .. } => {}
     }
     frames
+}
+/// The evolution quest, which is what actually changes a companion's shape.
+///
+/// Levelling carries the form and stops at 4, 19 and 49. What lifts it is a
+/// quest -- 406 at the first wall and 407 at the second, both on the NPC that
+/// hands prans out in the first place, and named in the original's own
+/// comments. Nothing else in that source ever writes a class of 62, 63 or 64,
+/// so these two are the only way a pran has ever changed.
+///
+/// There are no quests here to hang it on, so the quest option stands in for
+/// the chain the same way it does for the character's promotion. A pran at a
+/// wall is answered first, because that is the more specific thing to be
+/// asking for while standing in front of the pran NPC with a pran on.
+fn evolve_the_pran(state: &State, session: &mut Session) -> Option<Vec<Vec<u8>>> {
+    let client_id = session.client_id;
+    let at = session.pran_out?;
+
+    let account = session.account.as_mut()?;
+    let pran = account.prans.get_mut(at)?;
+    let grown = match pran::evolve(pran) {
+        Ok(grown) => grown,
+        // Not a pran matter after all: let the character's promotion answer.
+        Err(pran::NotYet::NotAtAWall) => return None,
+        Err(why) => {
+            return Some(vec![encode_client_message(client_id, why.message())]);
+        }
+    };
+    session.dirty = true;
+    info!(name = %pran.name, class = grown.class, stone = grown.stone, "the pran evolved");
+
+    // The stone changes in two places, and the second is the one worth
+    // saying out loud: the item the *player* is wearing becomes the new
+    // stone as well. Changing only the pran's copy leaves the owner holding
+    // the stone of a form their companion no longer is.
+    let character = session.character.as_mut()?;
+    let mut worn = character.items.get(inventory::EQUIP, pran::STONE_SLOT).cloned()?;
+    worn.index = grown.stone;
+    worn.appearance = grown.stone;
+    let _ = character.items.put(worn.clone());
+
+    let mut frames = vec![encode_menu_close()];
+    // The glow comes off before the body goes on, and only the first
+    // evolution has one to take off.
+    if grown.clears_the_glow {
+        frames.push(encode_effect(client_id, EFFECT_NONE));
+        session.pran_body = None;
+    }
+    frames.push(encode_refresh_item(inventory::EQUIP, pran::STONE_SLOT, &worn, false));
+    frames.extend(pran_frames(state, session));
+    frames.push(encode_client_message(client_id, "Sua pran evoluiu."));
+    Some(frames)
 }
 /// Whatever the worn summon stone should be showing right now.
 ///

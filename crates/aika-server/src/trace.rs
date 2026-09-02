@@ -76,6 +76,9 @@ pub struct Entry {
     /// that is answered by nothing is where a frozen client is usually left
     /// waiting.
     pub answered: bool,
+    /// Set when our own reader could not decode a frame we sent, which means
+    /// the client cannot either.
+    pub unreadable: bool,
     /// How many of the same thing in a row this stands for.
     ///
     /// A run is folded into one line rather than filling the ring. The first
@@ -89,8 +92,9 @@ impl Entry {
     fn line(&self) -> String {
         let bytes: Vec<String> =
             self.head[..self.head_len].iter().map(|b| format!("{b:02X}")).collect();
-        let tail = match (self.way, self.answered) {
-            (Way::In, false) => "  <- nothing went back",
+        let tail = match (self.way, self.answered, self.unreadable) {
+            (_, _, true) => "  <- WE SENT SOMETHING UNREADABLE",
+            (Way::In, false, _) => "  <- nothing went back",
             _ => "",
         };
         let run = if self.repeats > 1 { format!(" x{}", self.repeats) } else { String::new() };
@@ -176,6 +180,7 @@ impl Trace {
             head,
             head_len,
             answered: true,
+            unreadable: false,
             repeats: 1,
         }
     }
@@ -195,13 +200,34 @@ impl Trace {
         self.push(entry);
     }
 
-    /// A frame on its way out, still encoded. The opcode is read back out of
-    /// the header rather than passed in, so nothing has to remember to.
+    /// A frame on its way out, decoded back to what it says.
+    ///
+    /// It arrives here encrypted, and the cipher reaches the header: for most
+    /// of this session the trace reported opcodes one off from the ones being
+    /// sent -- `0x136` for a `0x137` -- and bodies whose first byte was wrong.
+    /// An instrument that lies costs more than no instrument, so the frame is
+    /// run back through the reader that reads the client's own packets.
     pub fn sent_to_client(&mut self, frame: &[u8], now: Instant) {
-        let Some(opcode) = opcode_of(frame) else {
-            return;
+        let mut reader = aika_net::frame::FrameReader::new();
+        reader.push(frame);
+        let entry = match reader.next_message() {
+            Some(Ok(message)) => {
+                self.entry(Way::Out, message.opcode, &message.body, frame.len(), now)
+            }
+            // Unreadable by our own reader, which is worth seeing rather than
+            // dropping: it means we just sent something the client cannot
+            // parse either.
+            _ => {
+                let Some(opcode) = opcode_of(frame) else {
+                    return;
+                };
+                let mut entry =
+                    self.entry(Way::Out, opcode, &frame[HEADER..], frame.len(), now);
+                entry.unreadable = true;
+                entry
+            }
         };
-        self.push(self.entry(Way::Out, opcode, &frame[HEADER..], frame.len(), now));
+        self.push(entry);
     }
 
     /// How long the client has been quiet.

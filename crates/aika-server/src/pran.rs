@@ -36,13 +36,45 @@
 //! glow is a trap. See [`has_body`], which is the same test named for what it
 //! decides.
 //!
-//! # What is here and what is not
+//! # What is here
 //!
-//! Here: the record, where it is kept, hatching one, and putting it into and
-//! out of the world with the stone. Not here: its ten skills, food running
-//! down, devotion, levelling, evolving, and its own equipment. Those are named
-//! in the record because the packet carries them and a zero has to mean
-//! "none", not "we forgot".
+//! The record and where it is kept. Hatching one from the stone a quest
+//! hands out, with the numbers `FinishQuest` gives it. Naming it, which the
+//! client will not let a pran out of the chest without. Summoning and
+//! dismissing it with the stone, and drawing it -- an effect for the first
+//! form and a body of its own for every one after. Experience from what its
+//! owner kills, the levels that buys, the walls at 4, 19 and 49, and the
+//! quest that evolves it past one.
+//!
+//! Not here: food running down, devotion rising, the pran's own bag and the
+//! six equipment slots it can wear things in (`PRAN_EQUIP_TYPE`, a fourth
+//! container nothing reaches yet), and the ten skills doing anything beyond
+//! being counted.
+//!
+//! # One thing does not work, and it is worth writing down why not
+//!
+//! The companion's own window -- the panel with its portrait, its name and
+//! its "Grau" -- keeps drawing the first form however far the pran has come.
+//! The body beside the player is right, the window is not.
+//!
+//! What has been ruled out, each by trying it rather than by reasoning:
+//!
+//! - Every packet the original sends for a pran is sent, and no packet it
+//!   sends is missing. `SetPranEquipAtributes` and `SetPranPassiveSkill` send
+//!   none, and `SendPranDevotionAndFood` is never called by anything.
+//! - The order is the original's, and it differs between the two paths:
+//!   spawn then describe on arrival, describe then spawn when evolving.
+//! - Every field of `0x907` is filled, including the sixteen bytes of skill
+//!   levels that were blank for most of this system's life.
+//! - The level goes out on `0x116`, which is the only packet that carries
+//!   one, at summon as well as on a gain.
+//! - The class, the stone in the pran's own slot zero, and the stone the
+//!   player wears have all been set together and separately.
+//!
+//! Two things would settle it and neither is more guessing at this end: a
+//! `0x907` captured from the original with a grown pran, to diff against
+//! ours; or hooking the client itself through the d3d9 overlay in this
+//! repository, to see which field it reads the portrait from.
 
 use crate::store::Item;
 

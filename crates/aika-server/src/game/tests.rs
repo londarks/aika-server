@@ -1606,9 +1606,13 @@ const ROOTING_FAMILY: u32 = 13;
 /// Target type four, the second most common in the table after self.
 const AIMED_AT_SOMETHING: u32 = 4;
 const POTION_SKILL: usize = 9031;
-/// One of the seventeen the shipped table carries under the name
-/// "Pedra da Pran".
-const SUMMON_STONE: u16 = 104;
+/// The stone quest 39 hands out, which is the fire one: `Quests.csv` line
+/// `2072,39,21,9,100`. Its element is the whole reason it is this id and not
+/// another of the seventeen.
+const SUMMON_STONE: u16 = 100;
+/// One of the fourteen that no quest gives, which carry a pran that already
+/// exists rather than making one.
+const CARRIER_STONE: u16 = 104;
 
 fn buff_state() -> State {
     let mut state = shop_state();
@@ -1629,6 +1633,7 @@ fn buff_state() -> State {
         // A Pran Summon Stone. Type ten is what sends it to equipment
         // slot ten, which is the slot the companion lives in.
         define(SUMMON_STONE, crate::pran::STONE_ITEM_TYPE, 0);
+        define(CARRIER_STONE, crate::pran::STONE_ITEM_TYPE, 0);
         ItemList::decode(&raw).expect("the fixture table is malformed")
     };
 
@@ -1868,7 +1873,7 @@ async fn wearing_a_summon_stone_hatches_a_pran_and_shows_it() {
     let prans = &session.account.as_ref().unwrap().prans;
     assert_eq!(prans.len(), 1, "no pran hatched");
     assert_eq!(prans[0].item_id, 4242, "it is not bound to the stone it came out of");
-    assert_eq!(prans[0].class, 61);
+    assert_eq!(prans[0].class, 61, "the stone says fire, so the pran is fire");
     assert!(session.dirty, "a pran that is not saved is hatched again next time");
 
     assert!(
@@ -2041,6 +2046,35 @@ async fn opening_the_chest_sends_the_two_pran_slots_on_their_own() {
     for slot in inventory::STORAGE_PRAN_SLOTS {
         assert!(refreshed.contains(&slot), "slot {slot} was never sent, so it draws empty");
     }
+}
+
+/// A stone no quest hands out hatches nothing.
+///
+/// Only three of the seventeen make a pran -- items 100, 101 and 102, one per
+/// element, and `Quests.csv` says so outright. The rest carry a pran that
+/// already exists, sorted by the tier they fit. Hatching from one of those
+/// would be inventing an element the data never named.
+#[tokio::test]
+async fn a_stone_no_quest_gives_hatches_nothing() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    session
+        .character
+        .as_mut()
+        .unwrap()
+        .items
+        .put(Item {
+            index: CARRIER_STONE,
+            container: inventory::BAG,
+            slot: 7,
+            identific: 4242,
+            ..Item::default()
+        })
+        .unwrap();
+
+    handle_message(&state, &mut session, &wear_stone()).await;
+
+    assert!(session.account.as_ref().unwrap().prans.is_empty());
 }
 
 /// A stone that identifies nothing hatches nothing.

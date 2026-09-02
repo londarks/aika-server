@@ -400,6 +400,30 @@ pub fn world_body(pran: &Pran) -> Vec<u8> {
 
     out
 }
+/// The stone each of the three quests hands out, and so which element it
+/// hatches.
+///
+/// `Data/Quest/Quests.csv` in the original's own data, three lines that say it
+/// outright: NPC 2072, quests 39, 40 and 41, type 21, one reward each -- item
+/// 100, 101 and 102. Fire, water, air, in the order `FinishQuest` reads them.
+///
+/// This is why the element does not have to be chosen. It is written on the
+/// stone, and a stone that is not one of the three hatches nothing: the rest of
+/// the seventeen are carriers for a pran that already exists, sorted by the
+/// tier they fit rather than by element (see [`stone_tier`]).
+pub fn element_of_quest_stone(item: u16) -> Option<Element> {
+    match item {
+        100 => Some(Element::Fire),
+        101 => Some(Element::Water),
+        102 => Some(Element::Air),
+        _ => None,
+    }
+}
+
+/// The NPC the three of them belong to, which is the one whose menu carries
+/// the Pran station.
+pub const QUEST_NPC: u16 = 2072;
+
 /// `TRenamePranPacket` (`Data/Packets.pas:679`): the name a player typed.
 pub const OP_RENAME: u16 = 0x3E02;
 

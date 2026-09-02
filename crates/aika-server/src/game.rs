@@ -3747,7 +3747,18 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     let at = match account.prans.iter().position(|p| p.belongs_to(&stone)) {
         Some(at) => at,
         None => {
-            let hatched = pran::Pran::hatch(pran::Element::Fire, stone.identific, now);
+            // Which element is written on the stone rather than chosen here:
+            // the three quest rewards are items 100, 101 and 102, and that is
+            // the whole of the mapping. A stone that is not one of the three
+            // carries a pran that already exists and hatches nothing.
+            let Some(element) = pran::element_of_quest_stone(stone.index) else {
+                debug!(
+                    stone = stone.index,
+                    "a summon stone that no quest hands out, so nothing to hatch"
+                );
+                return Vec::new();
+            };
+            let hatched = pran::Pran::hatch(element, stone.identific, now);
             info!(
                 stone = stone.index,
                 identific = stone.identific,

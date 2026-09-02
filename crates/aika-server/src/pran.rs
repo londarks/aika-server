@@ -301,7 +301,13 @@ impl Pran {
 
         Self {
             item_id: stone.identific,
-            level: 1,
+            // Zero, and not one. `FinishQuest` sets fifteen fields on a new
+            // pran and `Level` is not among them: the record was zeroed and
+            // stays zeroed, so a pran is born at nothing and the client is
+            // told `Level + 1`, which is the one it shows. Starting at one
+            // put every pran a level ahead of itself on the wire for the
+            // whole of its life.
+            level: 0,
             class: element.first_class(),
             hp: max_hp,
             max_hp,
@@ -1113,9 +1119,9 @@ mod tests {
         let mut pran = Pran::hatch(Element::Fire, &stone_of(1), 0);
         let hp = pran.max_hp;
 
-        assert_eq!(add_exp(&mut pran, 2200, &curve), Growth::Grew { levels: 1 });
-        assert_eq!(pran.level, 2, "past 855 is level two");
-        assert_eq!(pran.max_hp, hp + HP_PER_LEVEL, "a level did not add health");
+        assert_eq!(add_exp(&mut pran, 2200, &curve), Growth::Grew { levels: 2 });
+        assert_eq!(pran.level, 2, "past 855 and past 2106 is two levels");
+        assert_eq!(pran.max_hp, hp + 2 * HP_PER_LEVEL, "two levels did not add health twice");
         assert_eq!(pran.hp, pran.max_hp, "and did not fill it up");
     }
 
@@ -1126,7 +1132,7 @@ mod tests {
         let curve = curve();
         let mut pran = Pran::hatch(Element::Fire, &stone_of(1), 0);
 
-        assert_eq!(add_exp(&mut pran, 1_000_000, &curve), Growth::Grew { levels: 3 });
+        assert_eq!(add_exp(&mut pran, 1_000_000, &curve), Growth::Grew { levels: 4 });
         assert_eq!(pran.level, WALLS[0]);
         assert_eq!(pran.exp, curve.threshold(WALLS[0]), "it kept more than the wall holds");
 
@@ -1173,7 +1179,7 @@ mod tests {
         let mut pran = Pran::hatch(Element::Fire, &stone_of(1), 0);
 
         assert_eq!(add_exp(&mut pran, 1_000_000, &empty), Growth::Grew { levels: 0 });
-        assert_eq!(pran.level, 1, "it levelled off a table that does not exist");
+        assert_eq!(pran.level, 0, "it levelled off a table that does not exist");
     }
 
     /// The four forms and the three walls between them, as the original's own
@@ -1375,7 +1381,7 @@ mod tests {
         for pran in [&fire, &water, &air] {
             assert_eq!(pran.hp, pran.max_hp, "it should not hatch wounded");
             assert_eq!(pran.mp, pran.max_mp);
-            assert_eq!(pran.level, 1);
+            assert_eq!(pran.level, 0, "a pran is born at nothing");
             assert!(!pran.has_body(), "a hatchling is only a glow");
         }
     }

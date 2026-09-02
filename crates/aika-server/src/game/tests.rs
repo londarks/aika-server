@@ -2294,6 +2294,35 @@ async fn the_quest_at_the_wall_evolves_the_companion() {
     assert!(effects_in(&frames).contains(&0), "the fairy glow was left on the player");
 }
 
+/// What a session changed has to survive the session.
+///
+/// A login reads the account held in memory and not the database, so anything
+/// written to one and not the other is written and then forgotten. A pran
+/// evolved, saved, and logged back in a fairy is what that looks like: the
+/// row was right and the copy the next login read was not.
+#[tokio::test]
+async fn what_the_account_owns_survives_into_the_next_session() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+    session.account.as_mut().unwrap().prans[0].level = 4;
+    handle_message(&state, &mut session, &open_npc(2050, dialog::option::QUESTS)).await;
+    assert_eq!(session.account.as_ref().unwrap().prans[0].class, 62);
+
+    // what the autosave writes back over the stored account
+    let account = session.account.clone().unwrap();
+    state.save_storage(&account).await;
+
+    // and what the next login finds
+    let stored = state.store.get(&account.username).expect("the account went missing");
+    assert_eq!(
+        stored.prans.first().map(|p| p.class),
+        Some(62),
+        "the next login gets the companion as it was before it evolved"
+    );
+}
+
 /// Away from a wall the quest option is not about the pran at all, and the
 /// character's own promotion answers instead.
 #[tokio::test]

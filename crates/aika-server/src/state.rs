@@ -153,7 +153,7 @@ impl State {
     }
 
     pub async fn save_storage(&self, account: &Account) {
-        self.store.update_storage(account);
+        self.store.update_account(account);
 
         let Some(db) = &self.db else { return };
         if let Err(e) =

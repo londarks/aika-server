@@ -392,15 +392,23 @@ impl AccountStore {
         false
     }
 
-    /// Copies a session's chest back over the stored account, so the next
-    /// character to log in on the same account finds what the last one left.
-    pub fn update_storage(&self, updated: &Account) -> bool {
+    /// Copies what a session changed back over the stored account, so the
+    /// next character to log in on the same account finds what the last one
+    /// left.
+    ///
+    /// Everything the *account* owns has to be here, not only the chest. A
+    /// login reads this copy and not the database, so anything written to the
+    /// database and not to this is written and then forgotten: a companion
+    /// evolved and saved came back a fairy on the next login, because the
+    /// account in memory still held the fairy.
+    pub fn update_account(&self, updated: &Account) -> bool {
         let mut accounts = self.accounts.lock().unwrap();
         let Some(account) = accounts.get_mut(&updated.username) else {
             return false;
         };
         account.storage = updated.storage.clone();
         account.storage_gold = updated.storage_gold;
+        account.prans = updated.prans.clone();
         true
     }
 

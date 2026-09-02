@@ -1173,9 +1173,6 @@ fn handle_enter_world(
     }
     frames.push(zeroed(OP_ENTER_94C, 0, ENTER_94C_SIZE));
 
-    // The companion comes back with the stone still worn, which is where
-    // the original picks it up too.
-    frames.extend(pran_frames(state, session));
 
     let effects = Effects::of(&character, &state.items, &session.buffs, &state.skills);
     let stats = stats::of(&character, &state.items, &effects);
@@ -1243,6 +1240,18 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
         other.send(mine.clone());
         session.visible.insert(other.client_id);
     }
+
+    // And last of all, the companion.
+    //
+    // Last is the point. The original puts it at the very end of arriving,
+    // after `SendCreateMob(SPAWN_NORMAL)` and `SendCreateMob(SPAWN_TELEPORT)`
+    // have put the character itself on the field (`Mob/Player.pas:5190`). We
+    // had it in the burst that carries the character *record*, which the
+    // client receives long before it draws anybody -- so the companion was
+    // being stood next to a character that did not exist yet, and simply was
+    // not there. Taking the stone off and putting it back worked because by
+    // then it did.
+    frames.extend(pran_frames(state, session));
 
     info!(
         character = %character.name,

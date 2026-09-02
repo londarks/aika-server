@@ -2256,6 +2256,51 @@ async fn the_character_record_says_what_the_prans_are_called() {
     assert!(off::PRAN_NAMES + 2 * off::PRAN_NAME_SIZE < CHARACTER_SIZE);
 }
 
+/// The companion arrives after the character it belongs to.
+///
+/// The original spawns it at the very end of arriving, once
+/// `SendCreateMob(SPAWN_NORMAL)` and `SendCreateMob(SPAWN_TELEPORT)` have put
+/// the character on the field. Sent any earlier it is stood beside somebody
+/// the client has not drawn yet, and it simply is not there -- which is what
+/// made a pran vanish on every login and come back only when the stone was
+/// taken off and put on again.
+#[tokio::test]
+async fn the_companion_arrives_after_the_character_does() {
+    let state = buff_state();
+    let mut session = logged_in(&state).await;
+
+    // equipped before arriving, the way a returning player has it
+    let entering = frames_of(handle_message(&state, &mut session, &enter_world(0)).await);
+    session
+        .character
+        .as_mut()
+        .unwrap()
+        .items
+        .put(Item {
+            index: SUMMON_STONE,
+            container: inventory::EQUIP,
+            slot: crate::pran::STONE_SLOT,
+            identific: 4242,
+            ..Item::default()
+        })
+        .unwrap();
+
+    assert!(
+        !opcodes(&entering).contains(&crate::pran::OP_WORLD),
+        "the companion went out with the character record, before anybody is drawn"
+    );
+
+    let arriving = frames_of(handle_client_ready(&state, &mut session));
+    let sent = opcodes(&arriving);
+    let spawn_at = sent.iter().position(|op| *op == OP_CREATE_MOB);
+    let pran_at = sent.iter().position(|op| *op == crate::pran::OP_WORLD);
+
+    let (Some(spawn_at), Some(pran_at)) = (spawn_at, pran_at) else {
+        panic!("the companion never arrived at all: {sent:04x?}");
+    };
+    assert!(spawn_at < pran_at, "the companion was stood beside nobody");
+}
+
 /// The body goes out before the description of it.
 ///
 /// `SendPranSpawn(n); SendPranToWorld(n);` in that order, in both of the two

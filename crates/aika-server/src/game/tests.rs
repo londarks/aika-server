@@ -2029,6 +2029,60 @@ async fn the_pran_station_opens_the_chest_on_its_pran_side() {
     }
 }
 
+/// The pran station says which pran it is showing.
+///
+/// `0x907` is the only packet that carries a name, and the original sends it
+/// when a pran is summoned and never otherwise. So the station draws a pran
+/// the client may know nothing about -- and one it believes is unnamed is one
+/// it asks the player to name, before any refusal exists to correct it.
+#[tokio::test]
+async fn the_pran_station_says_which_pran_is_in_it() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+    handle_message(&state, &mut session, &name_pran("Alice")).await;
+
+    // and back into the station it goes
+    let stone = Item {
+        index: SUMMON_STONE,
+        container: inventory::STORAGE,
+        slot: inventory::STORAGE_PRAN_SLOTS[0],
+        identific: 4242,
+        ..Item::default()
+    };
+    session.account.as_mut().unwrap().storage.put(stone).unwrap();
+
+    let frames = frames_of(
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::PRAN_STATION))
+            .await,
+    );
+
+    let told = frames
+        .iter()
+        .map(|frame| decode(frame))
+        .find(|m| m.opcode == crate::pran::OP_WORLD)
+        .expect("the station drew a pran it never described");
+    let name = &told.body[crate::pran::at::NAME..crate::pran::at::CLASS];
+    let name = &name[..name.iter().position(|b| *b == 0).unwrap()];
+    assert_eq!(name, b"Alice");
+}
+
+/// The plain chest says nothing about prans, because it is not about them.
+#[tokio::test]
+async fn the_ordinary_chest_does_not_describe_a_pran() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+
+    let frames = frames_of(
+        handle_message(&state, &mut session, &open_npc(2050, dialog::option::STORAGE)).await,
+    );
+
+    assert!(!opcodes(&frames).contains(&crate::pran::OP_WORLD));
+}
+
 /// And the two slots the chest packet does not carry go out on their own.
 ///
 /// `SendStorage` refreshes 84 and 85 separately, every time. They sit past

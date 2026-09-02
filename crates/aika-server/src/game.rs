@@ -1972,6 +1972,35 @@ fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> A
                 &account.storage,
                 if for_prans { STORAGE_TYPE_PRANS } else { STORAGE_TYPE_PLAYER },
             ));
+
+            // What the window is about, for the window that is about it.
+            //
+            // Ours, and the second half of the same hole: `0x907` is the only
+            // packet that carries a pran's name, and the original sends it
+            // when one is summoned and at no other time. The station draws a
+            // pran the client may know nothing about, and a pran it thinks is
+            // unnamed is one it asks the player to name -- before there is any
+            // refusal to correct it with.
+            //
+            // The stone in the first pran slot names which one. Sent only for
+            // the pran side of the window, so the plain chest is untouched.
+            if for_prans {
+                let named_by_the_first_slot = account
+                    .storage
+                    .get(inventory::STORAGE, inventory::STORAGE_PRAN_SLOTS[0])
+                    .and_then(|stone| account.prans.iter().find(|p| p.belongs_to(stone)));
+                if let Some(pran) = named_by_the_first_slot {
+                    frames.push(frame::encode(
+                        &Message {
+                            sender: dialog::FIXED_INDEX,
+                            opcode: pran::OP_WORLD,
+                            time: 0,
+                            body: pran::world_body(pran),
+                        },
+                        rand::random(),
+                    ));
+                }
+            }
             Action::Reply(frames)
         }
         dialog::option::CLOSE => {

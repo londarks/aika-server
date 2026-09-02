@@ -113,6 +113,16 @@ impl Element {
     }
 }
 
+/// How many of the pran's equipment slots the spawn packet carries. Its
+/// record holds sixteen; only the first eight are drawn.
+pub const EQUIPMENT_SLOTS: usize = 8;
+
+/// What a newly hatched pran is given to hold, in slot six
+/// (`FinishQuest`, with no explanation of what it is).
+pub const HATCHLING_HELD_ITEM: u16 = 7780;
+/// And in the fortieth slot of its own bag.
+pub const HATCHLING_BAG_ITEM: u16 = 5301;
+
 /// How many skills a pran carries. The original's own comment says the array
 /// is ten and may one day be twelve.
 pub const SKILLS: usize = 10;
@@ -210,6 +220,14 @@ pub struct Pran {
     pub width: u8,
     pub chest: u8,
     pub leg: u8,
+    /// The eight equipment slots the spawn carries, by item index.
+    ///
+    /// The first is what the client draws it as. In the player spawn that
+    /// this packet is a copy of, `Equip[0]` is the model; for a pran it is
+    /// the summon stone the pran wears, which `FinishQuest` puts there
+    /// when it makes one. Leave it zero and the client falls back to a
+    /// bare human body.
+    pub equipment: [u16; EQUIPMENT_SLOTS],
     /// The ten skills, by id, zero for one it does not know.
     pub skills: [u32; SKILLS],
     /// Which three it has on its bar.
@@ -239,6 +257,7 @@ impl Default for Pran {
             width: 0,
             chest: 0,
             leg: 0,
+            equipment: [0; EQUIPMENT_SLOTS],
             skills: [0; SKILLS],
             bar: [0; 3],
             created_at: 0,
@@ -250,13 +269,15 @@ impl Default for Pran {
 impl Pran {
     /// A newly hatched pran, exactly as `FinishQuest` builds one.
     ///
-    /// The three quests that hand one out -- 39 fire, 40 water, 41 air -- each
-    /// set the same fields to different numbers, and these are those numbers
-    /// (`PacketHandlers/NPCHandlers.pas`, in `FinishQuest`). It knows its ten
-    /// skills by id and has learned the first three.
+    /// The three quests that hand one out -- 39 fire, 40 water, 41 air --
+    /// differ only in four numbers; everything below them is the same for all
+    /// three (`PacketHandlers/NPCHandlers.pas`, in `FinishQuest`). Fire is
+    /// the tough one, water the one that thinks, air between them.
     ///
-    /// Fire is the tough one, water the one that thinks, air between them.
-    pub fn hatch(element: Element, item_id: i32, now: i64) -> Self {
+    /// The stone is both halves of what a pran needs: its `Identific` is what
+    /// binds them, and its item index is what the pran is *drawn* as, worn in
+    /// its own first equipment slot.
+    pub fn hatch(element: Element, stone: &Item, now: i64) -> Self {
         let (max_hp, max_mp, def_physical, def_magic) = match element {
             Element::Fire => (383, 235, 239, 104),
             Element::Water => (209, 356, 153, 308),
@@ -268,16 +289,42 @@ impl Pran {
             *skill = element.first_skill() + at as u32 * SKILL_STRIDE;
         }
 
+        let mut equipment = [0u16; EQUIPMENT_SLOTS];
+        // It wears its own stone, which is what the client draws it from,
+        // and holds one other thing the original does not name.
+        equipment[0] = stone.index;
+        equipment[6] = HATCHLING_HELD_ITEM;
+
         Self {
-            item_id,
+            item_id: stone.identific,
             level: 1,
             class: element.first_class(),
             hp: max_hp,
             max_hp,
             mp: max_mp,
             max_mp,
+            // Not zero. The original starts the count at one.
+            exp: 1,
             def_physical,
             def_magic,
+            food: 121,
+            devotion: 113,
+            // Cute is well past devotion and the rest are well under, so a
+            // hatchling reads as cute until it is raised into something else.
+            personality: Personality {
+                cute: 226,
+                smart: 50,
+                sexy: 50,
+                energetic: 50,
+                tough: 50,
+                corrupt: 50,
+            },
+            // Its build. Zero here is what draws the misshapen half-height
+            // human that the first version of this put on the field.
+            width: 7,
+            chest: 100,
+            leg: 100,
+            equipment,
             skills,
             created_at: now,
             updated_at: now,
@@ -489,6 +536,12 @@ pub fn name_is_allowed(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A summon stone with an identific of its own, which is both halves of
+    /// what hatching needs: what to bind to, and what to be drawn as.
+    fn stone_of(identific: i32) -> Item {
+        Item { index: 100, identific, ..Item::default() }
+    }
+
     /// The packet is a fixed size the client reads by offset, so the length
     /// is part of the contract and not an implementation detail.
     #[test]
@@ -497,12 +550,12 @@ mod tests {
         // + 16 of hp/mp + 4 exp + 4 defences + 16 skill levels
         // + 16 and 42 items + 3 bar + 41 trailing.
         assert_eq!(WORLD_BODY, 1268);
-        assert_eq!(world_body(&Pran::hatch(Element::Fire, 1, 0)).len(), WORLD_BODY);
+        assert_eq!(world_body(&Pran::hatch(Element::Fire, &stone_of(1), 0)).len(), WORLD_BODY);
     }
 
     #[test]
     fn the_world_packet_carries_what_the_window_shows() {
-        let mut pran = Pran::hatch(Element::Water, 5, 0);
+        let mut pran = Pran::hatch(Element::Water, &stone_of(5), 0);
         pran.name = "Nina".into();
         pran.food = 90;
         pran.devotion = 12;
@@ -534,7 +587,7 @@ mod tests {
     /// reads on into the class byte.
     #[test]
     fn a_long_name_is_cut_short_of_its_terminator() {
-        let mut pran = Pran::hatch(Element::Air, 1, 0);
+        let mut pran = Pran::hatch(Element::Air, &stone_of(1), 0);
         pran.name = "aaaaaaaaaaaaaaaaaaaa".into();
 
         let body = world_body(&pran);
@@ -546,7 +599,7 @@ mod tests {
     /// zero there has to read as an empty slot rather than as item zero.
     #[test]
     fn a_hatchling_carries_nothing() {
-        let body = world_body(&Pran::hatch(Element::Fire, 1, 0));
+        let body = world_body(&Pran::hatch(Element::Fire, &stone_of(1), 0));
         assert!(body[at::EQUIPMENT..at::BAR].iter().all(|b| *b == 0));
         assert!(
             body[at::SKILL_LEVELS..at::EQUIPMENT].iter().all(|b| *b == 0),
@@ -641,15 +694,15 @@ mod tests {
     /// fire takes hits, water casts, air is between them.
     #[test]
     fn hatching_gives_the_numbers_the_quest_gives() {
-        let fire = Pran::hatch(Element::Fire, 7, 1000);
+        let fire = Pran::hatch(Element::Fire, &stone_of(7), 1000);
         assert_eq!((fire.class, fire.max_hp, fire.max_mp), (61, 383, 235));
         assert_eq!((fire.def_physical, fire.def_magic), (239, 104));
 
-        let water = Pran::hatch(Element::Water, 7, 1000);
+        let water = Pran::hatch(Element::Water, &stone_of(7), 1000);
         assert_eq!((water.class, water.max_hp, water.max_mp), (71, 209, 356));
         assert_eq!((water.def_physical, water.def_magic), (153, 308));
 
-        let air = Pran::hatch(Element::Air, 7, 1000);
+        let air = Pran::hatch(Element::Air, &stone_of(7), 1000);
         assert_eq!((air.class, air.max_hp, air.max_mp), (81, 255, 267));
         assert_eq!((air.def_physical, air.def_magic), (201, 205));
 
@@ -661,17 +714,59 @@ mod tests {
         }
     }
 
+    /// Everything below the four numbers that differ by element, which is most
+    /// of what `FinishQuest` sets and none of what the first cut of this
+    /// ported. Zeros here are not harmless: a build of 0/0/0 is what put a
+    /// misshapen half-height naked human on the field with the right name over
+    /// its head.
+    #[test]
+    fn a_hatchling_is_built_the_way_the_quest_builds_one() {
+        let pran = Pran::hatch(Element::Fire, &stone_of(4242), 1000);
+
+        assert_eq!((pran.width, pran.chest, pran.leg), (7, 100, 100), "its build");
+        assert_eq!(pran.exp, 1, "the count starts at one, not at zero");
+        assert_eq!((pran.food, pran.devotion), (121, 113));
+        assert_eq!(pran.personality.cute, 226);
+        assert_eq!(
+            [
+                pran.personality.smart,
+                pran.personality.sexy,
+                pran.personality.energetic,
+                pran.personality.tough,
+                pran.personality.corrupt,
+            ],
+            [50; 5]
+        );
+
+        // Cute is past devotion and the others are under it, so a hatchling
+        // reads as the first of the six until it is raised into another.
+        assert_eq!(pran.personality.shown(pran.devotion as u32), 0);
+    }
+
+    /// What the client draws it as. In the player spawn this packet is a copy
+    /// of, `Equip[0]` is the model, and a pran wears its own summon stone
+    /// there.
+    #[test]
+    fn a_hatchling_wears_the_stone_it_came_out_of() {
+        let pran = Pran::hatch(Element::Water, &Item { index: 101, identific: 9, ..Item::default() }, 0);
+
+        assert_eq!(pran.equipment[0], 101, "it has nothing to be drawn as");
+        assert_eq!(pran.equipment[6], HATCHLING_HELD_ITEM);
+        assert_eq!(pran.item_id, 9, "and it is bound to that same stone");
+        assert!(pran.equipment[1..6].iter().all(|i| *i == 0), "it wears nothing else");
+    }
+
     /// Ten skills, ten apart, starting where the element starts.
     #[test]
     fn a_hatchling_carries_its_elements_ten_skills() {
-        let fire = Pran::hatch(Element::Fire, 1, 0);
+        let fire = Pran::hatch(Element::Fire, &stone_of(1), 0);
         assert_eq!(fire.skills[0], 5761);
         assert_eq!(fire.skills[1], 5771);
         assert_eq!(fire.skills[9], 5851);
         assert_eq!(fire.known_skills(), SKILLS);
 
-        assert_eq!(Pran::hatch(Element::Water, 1, 0).skills[0], 5861);
-        assert_eq!(Pran::hatch(Element::Air, 1, 0).skills[0], 5961);
+        assert_eq!(Pran::hatch(Element::Water, &stone_of(1), 0).skills[0], 5861);
+        assert_eq!(Pran::hatch(Element::Air, &stone_of(1), 0).skills[0], 5961);
     }
 
     /// The three elements must not share a skill, or learning one would teach
@@ -680,7 +775,7 @@ mod tests {
     fn the_three_elements_do_not_share_a_skill() {
         let mut all: Vec<u32> = [Element::Fire, Element::Water, Element::Air]
             .iter()
-            .flat_map(|e| Pran::hatch(*e, 1, 0).skills)
+            .flat_map(|e| Pran::hatch(*e, &stone_of(1), 0).skills)
             .collect();
         let before = all.len();
         all.sort_unstable();
@@ -692,7 +787,7 @@ mod tests {
     /// same item are two different homes.
     #[test]
     fn a_pran_belongs_to_the_one_stone_it_was_hatched_in() {
-        let pran = Pran::hatch(Element::Fire, 4242, 0);
+        let pran = Pran::hatch(Element::Fire, &stone_of(4242), 0);
         let hers = Item { index: 100, identific: 4242, ..Item::default() };
         let his = Item { index: 100, identific: 9999, ..Item::default() };
 
@@ -704,7 +799,7 @@ mod tests {
     /// item whose identific has not been filled in.
     #[test]
     fn a_pran_with_no_stone_answers_to_nothing() {
-        let pran = Pran { item_id: 0, ..Pran::hatch(Element::Fire, 0, 0) };
+        let pran = Pran { item_id: 0, ..Pran::hatch(Element::Fire, &stone_of(0), 0) };
         assert!(!pran.belongs_to(&Item { identific: 0, ..Item::default() }));
     }
 

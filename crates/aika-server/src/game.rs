@@ -3830,7 +3830,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
                 );
                 return Vec::new();
             };
-            let hatched = pran::Pran::hatch(element, stone.identific, now);
+            let hatched = pran::Pran::hatch(element, &stone, now);
             info!(
                 stone = stone.index,
                 identific = stone.identific,
@@ -3931,8 +3931,15 @@ fn encode_pran_spawn(
 
     write_fixed_str(&mut body[off::NAME..off::NAME + 16], &pran.name);
 
-    // Its own eight equipment slots, by item id. It has none yet, so the
-    // client dresses it in whatever the class alone gives it.
+    // Its own eight equipment slots, by item id, and the first of them is what
+    // the client draws it as -- the same field that carries the model in the
+    // player spawn this packet is a copy of. A pran wears its own summon stone
+    // there. Without it the client falls back to a bare human body, which is
+    // exactly what turned up on the field: a half-height naked copy of the
+    // player, correctly labelled "Pran do <owner>".
+    for (slot, index) in pran.equipment.iter().enumerate() {
+        put16(&mut body, off::EQUIP + slot * 2, *index);
+    }
 
     body[off::POSITION_X..off::POSITION_X + 4].copy_from_slice(&at.0.to_le_bytes());
     body[off::POSITION_Y..off::POSITION_Y + 4].copy_from_slice(&at.1.to_le_bytes());

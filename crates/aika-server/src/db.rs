@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS prans (
     width         INTEGER NOT NULL DEFAULT 0,
     chest         INTEGER NOT NULL DEFAULT 0,
     leg           INTEGER NOT NULL DEFAULT 0,
+    equipment     BLOB,
     skills        BLOB,
     bar           BLOB,
     created_at    INTEGER NOT NULL DEFAULT 0,
@@ -539,7 +540,7 @@ impl Database {
             "SELECT id, item_id, name, level, class, hp, max_hp, mp, max_mp, xp,
                     def_p, def_m, food, devotion,
                     p_cute, p_smart, p_sexy, p_energetic, p_tough, p_corrupt,
-                    width, chest, leg, skills, bar, created_at, updated_at
+                    width, chest, leg, equipment, skills, bar, created_at, updated_at
              FROM prans WHERE account_id = ? ORDER BY id",
         )
         .bind(account_id)
@@ -575,6 +576,7 @@ impl Database {
                     width: row.try_get::<i64, _>("width")? as u8,
                     chest: row.try_get::<i64, _>("chest")? as u8,
                     leg: row.try_get::<i64, _>("leg")? as u8,
+                    equipment: unpack_u16(row.try_get::<Option<Vec<u8>>, _>("equipment")?),
                     skills: unpack_u32(row.try_get::<Option<Vec<u8>>, _>("skills")?),
                     bar: unpack_u8(row.try_get::<Option<Vec<u8>>, _>("bar")?),
                     created_at: row.try_get::<i64, _>("created_at")?,
@@ -619,7 +621,7 @@ impl Database {
                  def_p = ?, def_m = ?, food = ?, devotion = ?,
                  p_cute = ?, p_smart = ?, p_sexy = ?, p_energetic = ?,
                  p_tough = ?, p_corrupt = ?, width = ?, chest = ?, leg = ?,
-                 skills = ?, bar = ?, updated_at = ?
+                 equipment = ?, skills = ?, bar = ?, updated_at = ?
              WHERE account_id = ? AND item_id = ?",
         )
         .bind(&pran.name)
@@ -643,6 +645,7 @@ impl Database {
         .bind(pran.width as i64)
         .bind(pran.chest as i64)
         .bind(pran.leg as i64)
+        .bind(pack_u16(&pran.equipment))
         .bind(pack_u32(&pran.skills))
         .bind(pran.bar.to_vec())
         .bind(pran.updated_at)
@@ -661,10 +664,10 @@ impl Database {
                  (name, level, class, hp, max_hp, mp, max_mp, xp,
                   def_p, def_m, food, devotion,
                   p_cute, p_smart, p_sexy, p_energetic, p_tough, p_corrupt,
-                  width, chest, leg, skills, bar, updated_at,
+                  width, chest, leg, equipment, skills, bar, updated_at,
                   account_id, item_id, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                     ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&pran.name)
         .bind(pran.level as i64)
@@ -687,6 +690,7 @@ impl Database {
         .bind(pran.width as i64)
         .bind(pran.chest as i64)
         .bind(pran.leg as i64)
+        .bind(pack_u16(&pran.equipment))
         .bind(pack_u32(&pran.skills))
         .bind(pran.bar.to_vec())
         .bind(pran.updated_at)
@@ -1077,6 +1081,11 @@ mod tests {
     use super::*;
     use crate::config::DevCharacter;
 
+    /// A summon stone: what a pran binds to and what it is drawn as.
+    fn stone_of(identific: i32) -> Item {
+        Item { index: 100, identific, ..Item::default() }
+    }
+
     async fn memory_db() -> Database {
         Database::open("sqlite::memory:").await.expect("in-memory database")
     }
@@ -1450,7 +1459,7 @@ mod tests {
         db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
         let account_id = db.load_accounts().await.unwrap()[0].id as i64;
 
-        let mut pran = crate::pran::Pran::hatch(crate::pran::Element::Water, 4242, 1700);
+        let mut pran = crate::pran::Pran::hatch(crate::pran::Element::Water, &stone_of(4242), 1700);
         pran.name = "Nina".into();
         pran.level = 7;
         pran.hp = 111;
@@ -1478,7 +1487,7 @@ mod tests {
         db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
         let account_id = db.load_accounts().await.unwrap()[0].id as i64;
 
-        let mut pran = crate::pran::Pran::hatch(crate::pran::Element::Fire, 7, 1000);
+        let mut pran = crate::pran::Pran::hatch(crate::pran::Element::Fire, &stone_of(7), 1000);
         db.save_pran(account_id, &pran).await.unwrap();
 
         pran.level = 4;
@@ -1499,10 +1508,10 @@ mod tests {
         db.seed(&[dev_account("admin", "Athus")]).await.unwrap();
         let account_id = db.load_accounts().await.unwrap()[0].id as i64;
 
-        db.save_pran(account_id, &crate::pran::Pran::hatch(crate::pran::Element::Fire, 1, 0))
+        db.save_pran(account_id, &crate::pran::Pran::hatch(crate::pran::Element::Fire, &stone_of(1), 0))
             .await
             .unwrap();
-        db.save_pran(account_id, &crate::pran::Pran::hatch(crate::pran::Element::Air, 2, 0))
+        db.save_pran(account_id, &crate::pran::Pran::hatch(crate::pran::Element::Air, &stone_of(2), 0))
             .await
             .unwrap();
 

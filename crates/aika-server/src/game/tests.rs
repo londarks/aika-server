@@ -2278,6 +2278,14 @@ async fn a_pran_is_drawn_under_an_id_of_its_own() {
         .find(|m| m.opcode == crate::pran::OP_SPAWN)
         .expect("no body was drawn");
 
+    // and it is drawn as its own stone, not as a bare human body
+    assert_eq!(
+        u16::from_le_bytes(spawn.body[16..18].try_into().unwrap()),
+        SUMMON_STONE,
+        "nothing in the spawn says what to draw, so the client draws a person"
+    );
+    assert_eq!(&spawn.body[75..78], &[7, 100, 100], "its build went out as zeros");
+
     assert!(
         crate::pran::IDS.contains(&(spawn.sender as u32)),
         "drawn under {}, which belongs to somebody else",

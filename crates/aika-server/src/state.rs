@@ -129,6 +129,21 @@ impl State {
 
     /// Writes the chest, which belongs to the account rather than to the
     /// character and so is saved beside the session rather than inside it.
+    /// Whether a companion of this name already exists.
+    ///
+    /// With no database behind it nothing is taken, which suits the tests:
+    /// they are about the rule and not about the storage.
+    pub async fn pran_name_taken(&self, name: &str) -> bool {
+        let Some(db) = &self.db else { return false };
+        match db.pran_name_taken(name).await {
+            Ok(taken) => taken,
+            Err(e) => {
+                warn!(name, error = %e, "could not check the pran name, allowing it");
+                false
+            }
+        }
+    }
+
     pub async fn save_storage(&self, account: &Account) {
         self.store.update_storage(account);
 

@@ -400,6 +400,67 @@ pub fn world_body(pran: &Pran) -> Vec<u8> {
 
     out
 }
+/// `TRenamePranPacket` (`Data/Packets.pas:679`): the name a player typed.
+pub const OP_RENAME: u16 = 0x3E02;
+
+/// A companion is named once and keeps it. The original has no way to change
+/// one: `RenamePran` names the first pran that has none and refuses when
+/// they all do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rename {
+    /// The client sends one, and the original never reads it -- it names the
+    /// first unnamed pran whatever this says. Kept because the answer is the
+    /// same packet sent back.
+    pub slot: u32,
+    pub name: String,
+}
+
+impl Rename {
+    pub const BODY_SIZE: usize = 24;
+    const NAME_AT: usize = 4;
+    const ACCOUNT_AT: usize = 20;
+
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        if body.len() < Self::BODY_SIZE {
+            return None;
+        }
+        let raw = &body[Self::NAME_AT..Self::ACCOUNT_AT];
+        let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+        Some(Self {
+            slot: u32::from_le_bytes(body[0..4].try_into().ok()?),
+            name: String::from_utf8_lossy(&raw[..end]).into_owned(),
+        })
+    }
+
+    /// The answer, which is the question with the account filled in.
+    pub fn to_body(&self, account_id: u32) -> Vec<u8> {
+        let mut out = vec![0u8; Self::BODY_SIZE];
+        out[0..4].copy_from_slice(&self.slot.to_le_bytes());
+        let name = self.name.as_bytes();
+        let len = name.len().min(NAME_MAX);
+        out[Self::NAME_AT..Self::NAME_AT + len].copy_from_slice(&name[..len]);
+        out[Self::ACCOUNT_AT..Self::ACCOUNT_AT + 4].copy_from_slice(&account_id.to_le_bytes());
+        out
+    }
+}
+
+/// Sixteen bytes with room for a terminator.
+pub const NAME_MAX: usize = 15;
+
+/// Whether a name is one the original would accept.
+///
+/// `TFunctions.IsLetter` is the whole test, and it does not mean what it is
+/// called: its alphabet is `['a'..'z', 'A'..'Z', '0'..'9']`, so digits pass.
+/// Empty fails, because the check starts from `Length(Text) > 0`.
+///
+/// The length cap is ours. The original copies sixteen bytes into a sixteen
+/// byte array with `StrPLCopy` and lets the terminator fall off the end; a
+/// name that long comes back out running into whatever follows it.
+pub fn name_is_allowed(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= NAME_MAX
+        && name.chars().all(|c| c.is_ascii_alphanumeric())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +528,47 @@ mod tests {
             body[at::SKILL_LEVELS..at::EQUIPMENT].iter().all(|b| *b == 0),
             "skill levels are not ours to fill in yet"
         );
+    }
+    /// The original's test is `IsLetter`, which allows digits despite the
+    /// name. Getting this wrong either refuses names the client offered or
+    /// lets through something the client cannot draw.
+    #[test]
+    fn a_name_is_letters_and_digits_and_nothing_else() {
+        assert!(name_is_allowed("Nina"));
+        assert!(name_is_allowed("Pran2"), "digits pass, whatever the name says");
+        assert!(!name_is_allowed(""), "empty is not a name");
+        assert!(!name_is_allowed("Ni na"), "a space is not a letter");
+        assert!(!name_is_allowed("Nina!"));
+        assert!(!name_is_allowed("Niña"), "nor anything outside ascii");
+    }
+
+    /// Sixteen bytes with a terminator is fifteen letters. The original lets
+    /// the sixteenth push its terminator off the end.
+    #[test]
+    fn a_name_leaves_room_for_its_terminator() {
+        assert!(name_is_allowed(&"a".repeat(NAME_MAX)));
+        assert!(!name_is_allowed(&"a".repeat(NAME_MAX + 1)));
+    }
+
+    #[test]
+    fn the_rename_packet_reads_and_answers() {
+        let mut body = vec![0u8; Rename::BODY_SIZE];
+        body[4..9].copy_from_slice(b"Alice");
+
+        let asked = Rename::parse(&body).expect("a full packet did not parse");
+        assert_eq!(asked.name, "Alice");
+        assert_eq!(asked.slot, 0);
+
+        // the answer is the question with the account filled in
+        let answer = asked.to_body(7);
+        assert_eq!(&answer[4..9], b"Alice");
+        assert_eq!(u32::from_le_bytes(answer[20..24].try_into().unwrap()), 7);
+        assert_eq!(Rename::parse(&answer).unwrap(), asked);
+    }
+
+    #[test]
+    fn a_short_rename_packet_is_not_one() {
+        assert_eq!(Rename::parse(&[0u8; Rename::BODY_SIZE - 1]), None);
     }
     #[test]
     fn the_element_is_the_tens_digit() {

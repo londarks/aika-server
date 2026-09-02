@@ -1915,6 +1915,66 @@ async fn something_that_is_not_a_stone_hatches_nothing() {
     assert!(session.account.as_ref().unwrap().prans.is_empty());
 }
 
+/// Naming a companion. The original names the first one that has none, so
+/// there is no way to change a name once it is set.
+#[tokio::test]
+async fn a_pran_is_named_once_and_keeps_it() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+    assert_eq!(session.account.as_ref().unwrap().prans[0].name, "");
+
+    let frames = frames_of(handle_message(&state, &mut session, &name_pran("Alice")).await);
+
+    assert_eq!(session.account.as_ref().unwrap().prans[0].name, "Alice");
+    assert!(session.dirty, "a name that is not saved is not a name");
+
+    // the answer is the question sent back, and the two chest slots follow it
+    assert!(opcodes(&frames).contains(&crate::pran::OP_RENAME));
+    let answered = frames
+        .iter()
+        .map(|frame| decode(frame))
+        .find(|m| m.opcode == crate::pran::OP_RENAME)
+        .unwrap();
+    assert_eq!(crate::pran::Rename::parse(&answered.body).unwrap().name, "Alice");
+
+    // and a second name is refused rather than replacing the first
+    let frames = frames_of(handle_message(&state, &mut session, &name_pran("Bob")).await);
+    assert_eq!(session.account.as_ref().unwrap().prans[0].name, "Alice", "it was renamed");
+    assert!(!opcodes(&frames).contains(&crate::pran::OP_RENAME));
+}
+
+/// A name the original would refuse is refused here, with a reason rather
+/// than in silence.
+#[tokio::test]
+async fn a_name_that_is_not_letters_or_digits_is_refused() {
+    let state = buff_state();
+    let mut session = in_world(&state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(&state, &mut session, &wear_stone()).await;
+
+    for bad in ["", "Al ice", "Alice!"] {
+        let frames = frames_of(handle_message(&state, &mut session, &name_pran(bad)).await);
+        assert_eq!(
+            session.account.as_ref().unwrap().prans[0].name,
+            "",
+            "{bad:?} was accepted"
+        );
+        assert_eq!(opcodes(&frames), vec![OP_CLIENT_MESSAGE], "{bad:?} was refused in silence");
+    }
+
+    // and a good one still goes through afterwards
+    handle_message(&state, &mut session, &name_pran("Alice2")).await;
+    assert_eq!(session.account.as_ref().unwrap().prans[0].name, "Alice2");
+}
+
+fn name_pran(name: &str) -> Message {
+    let mut body = vec![0u8; crate::pran::Rename::BODY_SIZE];
+    body[4..4 + name.len()].copy_from_slice(name.as_bytes());
+    Message { sender: TEST_CLIENT_ID, opcode: crate::pran::OP_RENAME, time: 0, body }
+}
+
 /// The Pran station is the chest with a different face on it.
 ///
 /// `OpenNPC` answers option 7 and option 13 with the same `SendStorage` and

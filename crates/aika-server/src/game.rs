@@ -972,6 +972,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         OP_SERVER_TIME => handle_server_time(session),
         OP_CHEST_GOLD => handle_chest_gold(session, message),
         OP_USE_BUFF_ITEM => handle_use_buff_item(state, session, message),
+        pran::OP_RENAME => handle_rename_pran(state, session, message).await,
         OP_MOUNT_SKILL => handle_mount_skill(state, session, message),
         OP_STATUS_POINT => handle_status_point(state, session, message),
         OP_REMOVE_BUFF => handle_remove_buff(state, session, message),
@@ -3625,6 +3626,62 @@ fn encode_effect(client_id: u16, effect: u32) -> Vec<u8> {
     )
 }
 
+/// `0x3E02`: the name a player typed for their companion.
+///
+/// A pran is named once and keeps it. `RenamePran` does not read the slot the
+/// client sends -- it names the first pran that has no name, and refuses when
+/// they all do, so there is no way to change one afterwards.
+///
+/// The answer is the question sent back with the account filled in, followed
+/// by the two chest slots the pran centre draws from. Those two are refreshed
+/// here for the same reason `SendStorage` refreshes them: the packet that
+/// carries the chest does not reach them.
+async fn handle_rename_pran(
+    state: &State,
+    session: &mut Session,
+    message: &Message,
+) -> Action {
+    let Some(asked) = pran::Rename::parse(&message.body) else {
+        warn!(size = message.body.len(), "0x3E02 packet too short");
+        return Action::Ignore;
+    };
+    let client_id = session.client_id;
+    let refuse = |why: &str| Action::Reply(vec![encode_client_message(client_id, why)]);
+
+    if !pran::name_is_allowed(&asked.name) {
+        return refuse("That name cannot be used.");
+    }
+    if state.pran_name_taken(&asked.name).await {
+        return refuse("That name is already taken.");
+    }
+
+    let Some(account) = session.account.as_mut() else {
+        return Action::Ignore;
+    };
+    let Some(unnamed) = account.prans.iter_mut().find(|p| p.name.is_empty()) else {
+        return refuse("All of your prans already have a name.");
+    };
+
+    unnamed.name = asked.name.clone();
+    session.dirty = true;
+    let account_id = account.id;
+    info!(name = %asked.name, "a pran was named");
+
+    let mut frames = vec![frame::encode(
+        &Message {
+            sender: client_id,
+            opcode: pran::OP_RENAME,
+            time: message.time,
+            body: asked.to_body(account_id),
+        },
+        rand::random(),
+    )];
+    for slot in inventory::STORAGE_PRAN_SLOTS {
+        let item = account.storage.get(inventory::STORAGE, slot).cloned().unwrap_or_default();
+        frames.push(encode_refresh_item(inventory::STORAGE, slot, &item, false));
+    }
+    Action::Reply(frames)
+}
 /// Whatever the worn summon stone should be showing right now.
 ///
 /// Called wherever equipment slot ten can have changed: entering the world,

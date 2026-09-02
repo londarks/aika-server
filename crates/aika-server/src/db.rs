@@ -584,6 +584,23 @@ impl Database {
             .collect()
     }
 
+    /// Whether any companion anywhere already answers to this name.
+    ///
+    /// `VerifyNameAlreadyExists` asks `prans` and not `characters`, so a pran
+    /// may share a name with a player but not with another pran. Compared
+    /// without regard to case, which the original gets from its column
+    /// collation rather than from the query.
+    pub async fn pran_name_taken(&self, name: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM prans WHERE LOWER(name) = LOWER(?)",
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await
+        .context("looking for a pran of that name")?;
+        Ok(row.try_get::<i64, _>("n")? > 0)
+    }
+
     /// Writes one companion.
     ///
     /// Keyed on the stone rather than on the row id. A pran belongs to one

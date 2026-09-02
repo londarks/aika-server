@@ -26,14 +26,28 @@ the file in that source which owns it, and the commit that adds it says which.
 | Storage | the account chest: 86 slots, four pages, gold in and out |
 | Buffs | potions and saddles start them; they expire on their own |
 | Mounts | worn, drawn on the rider, and their own two skills |
-| Persistence | SQLite in development, MySQL in production — position, gold, items, skills, chest |
+| Companions | the Pran: hatched from a quest stone, named, summoned, drawn, fed on kills, evolved |
+| Promotion | the class tier and its level walls at 50 and 89 |
+| Persistence | SQLite or MySQL, one schema — position, gold, items, skills, chest, companions |
+| Diagnostics | a per-connection packet trace that dumps itself when a client stops talking |
 | Game data | `ItemList.bin`, `SkillData.bin`, `ExpList.bin`, `.npc`, mob CSVs, drops, `SL.bin` |
 
-405 tests, including end-to-end runs over real sockets: HTTP token, TCP login
+514 tests, including end-to-end runs over real sockets: HTTP token, TCP login
 and game server through to the character list, and a second server started on
 the same database file to prove what was saved.
 
-**The original 2008 client logs in, fights, trades, learns skills and rides.**
+**The original 2008 client logs in, fights, trades, learns skills, rides, and
+raises a companion.**
+
+### The one thing that does not work
+
+A Pran's own window keeps drawing the first form however far the companion has
+come. The body beside the player is right; the panel is not. Every packet the
+original sends is sent, in the order each of its paths uses, with every field
+of `0x907` filled — so the next step is a capture from the original to diff
+against, or hooking the client itself. `crates/aika-server/src/pran.rs` lists
+what has already been ruled out, so nobody spends another evening on the same
+six things.
 
 ## Roadmap
 
@@ -57,11 +71,16 @@ already identified in `UseItem`; the work is the tables behind them.
 
 **4. The small ones.** Quests, dungeons.
 
-**5. Channels.** Changing channel needs the world split per channel first —
+**5. The companion's window.** Everything else about a Pran works; the panel
+still draws the first form. Not a server problem to keep guessing at -- see
+the list of what has been ruled out in `pran.rs`, and then either capture a
+`0x907` from the original to diff, or hook the client.
+
+**6. Channels.** Changing channel needs the world split per channel first —
 today all four share one — and then the token handshake of `LoginIntoChannel`.
 Large, and worth little until there is somebody else online.
 
-**6. Everything that needs other people.** Guilds, parties and raids, friends
+**7. Everything that needs other people.** Guilds, parties and raids, friends
 and duels, trading, nations and relics, mail, the auction house, titles and
 events. About half the remaining opcodes, and none of it testable alone.
 

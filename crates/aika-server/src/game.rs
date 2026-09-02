@@ -247,6 +247,24 @@ const ITEM_TYPE_PRAN: u16 = 10;
 
 /// Which chest a packet is about (`Data/GlobalDefs.pas:363`). Two is the
 /// player's own; three is the guild's, which waits on guilds.
+/// What goes in the header's time field: nothing.
+///
+/// The original never puts anything there. `Mob/Player.pas` and
+/// `Mob/BaseMob.pas` build almost every packet the server sends and assign
+/// `Header.Time` exactly zero times between them -- they `ZeroMemory` the
+/// record and fill in the size, the index and the code. The sixteen places
+/// that do touch it in `PacketHandlers.pas` assign 0, with
+/// `Header.Time := GetTickCount` commented out on the line below each one.
+/// Somebody tried a real clock there and put it back.
+///
+/// This used to carry milliseconds since the server process started, which is
+/// a number the client has no way to relate to its own clock. It reads the
+/// field: an equipment change would be refused with "you may equip in N
+/// seconds", a different N for each item and a different one every session,
+/// counting down to a deadline that came from our uptime rather than from
+/// anything the player did.
+const PACKET_TIME: u32 = 0;
+
 const STORAGE_TYPE_PLAYER: u32 = 1;
 /// The same window told to open on the pran side of itself
 /// (`STORAGE_TYPE_PRANS`, `Data/GlobalDefs.pas:364`).
@@ -942,7 +960,7 @@ pub(crate) enum Action {
 async fn handle_message(state: &State, session: &mut Session, message: &Message) -> Action {
     match message.opcode {
         OP_REQUEST_LOGIN => handle_request_login(state, session, message),
-        OP_ENTER_WORLD => handle_enter_world(state, session, message, state.uptime_ms()),
+        OP_ENTER_WORLD => handle_enter_world(state, session, message, PACKET_TIME),
         OP_CLIENT_READY => handle_client_ready(state, session),
         OP_MOVE => handle_move(state, session, message),
         dialog::OP_OPEN_NPC => handle_open_npc(state, session, message),
@@ -1052,7 +1070,7 @@ fn handle_request_login(state: &State, session: &mut Session, message: &Message)
         );
     }
 
-    let frame = encode_char_list(&account, session.client_id, state.uptime_ms());
+    let frame = encode_char_list(&account, session.client_id, PACKET_TIME);
     state.world.set_account(session.client_id, account.id);
     session.account = Some(account);
     Action::Reply(vec![frame])
@@ -1935,7 +1953,7 @@ fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> A
                         account,
                         character,
                         session.client_id,
-                        state.uptime_ms(),
+                        PACKET_TIME,
                     );
                     Action::Reply(vec![
                         encode_menu_close(),
@@ -2752,7 +2770,7 @@ async fn handle_create_character(
             info!(user = %username, name = %request.name, error = %e, "character refused");
             return Action::Reply(vec![
                 encode_client_message(session.client_id, &e.message()),
-                encode_char_list(account, session.client_id, state.uptime_ms()),
+                encode_char_list(account, session.client_id, PACKET_TIME),
             ]);
         }
     };
@@ -2775,7 +2793,7 @@ async fn handle_create_character(
                 );
                 return Action::Reply(vec![
                     encode_client_message(session.client_id, "The character could not be saved."),
-                    encode_char_list(account, session.client_id, state.uptime_ms()),
+                    encode_char_list(account, session.client_id, PACKET_TIME),
                 ]);
             }
         }
@@ -2795,7 +2813,7 @@ async fn handle_create_character(
     // the one the store holds.
     let account = state.store.get(&username).unwrap_or_else(|| account.clone());
     session.account = Some(account.clone());
-    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
+    Action::Reply(vec![encode_char_list(&account, session.client_id, PACKET_TIME)])
 }
 
 
@@ -2843,7 +2861,7 @@ async fn handle_delete_character(
         return Action::Reply(vec![encode_char_list(
             account,
             session.client_id,
-            state.uptime_ms(),
+            PACKET_TIME,
         )]);
     };
 
@@ -2851,7 +2869,7 @@ async fn handle_delete_character(
     if session.character.as_ref().is_some_and(|c| c.id == doomed.id) {
         return Action::Reply(vec![
             encode_client_message(session.client_id, "You cannot delete the character you are playing."),
-            encode_char_list(account, session.client_id, state.uptime_ms()),
+            encode_char_list(account, session.client_id, PACKET_TIME),
         ]);
     }
 
@@ -2865,7 +2883,7 @@ async fn handle_delete_character(
             );
             return Action::Reply(vec![
                 encode_client_message(session.client_id, "The character could not be deleted."),
-                encode_char_list(account, session.client_id, state.uptime_ms()),
+                encode_char_list(account, session.client_id, PACKET_TIME),
             ]);
         }
     }
@@ -2875,7 +2893,7 @@ async fn handle_delete_character(
 
     let account = state.store.get(&username).unwrap_or_else(|| account.clone());
     session.account = Some(account.clone());
-    Action::Reply(vec![encode_char_list(&account, session.client_id, state.uptime_ms())])
+    Action::Reply(vec![encode_char_list(&account, session.client_id, PACKET_TIME)])
 }
 
 

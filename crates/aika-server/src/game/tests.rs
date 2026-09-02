@@ -1996,6 +1996,32 @@ fn name_pran(name: &str) -> Message {
     Message { sender: TEST_CLIENT_ID, opcode: crate::pran::OP_RENAME, time: 0, body }
 }
 
+/// Nothing the server sends carries a clock in its header.
+///
+/// The original never puts one there, and the client reads the field: with
+/// our uptime in it, equipment changes were refused with "you may equip in N
+/// seconds" -- a different N per item, counting down to a deadline made of
+/// how long the server had been running.
+#[tokio::test]
+async fn no_packet_carries_the_servers_clock() {
+    let state = shop_state();
+    let mut session = logged_in(&state).await;
+
+    // The whole of arriving, which is where a session-long clock would be set.
+    let mut frames =
+        frames_of(handle_message(&state, &mut session, &enter_world(0)).await);
+    frames.extend(frames_of(handle_client_ready(&state, &mut session)));
+    assert!(frames.len() > 20, "the arrival burst is too small to be the real one");
+
+    let stamped: Vec<(u16, u32)> = frames
+        .iter()
+        .map(|frame| decode(frame))
+        .filter(|m| m.time != 0)
+        .map(|m| (m.opcode, m.time))
+        .collect();
+    assert!(stamped.is_empty(), "these went out with a clock in them: {stamped:04x?}");
+}
+
 /// The Pran station is the chest with a different face on it.
 ///
 /// `OpenNPC` answers option 7 and option 13 with the same `SendStorage` and

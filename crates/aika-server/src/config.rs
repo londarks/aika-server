@@ -217,6 +217,54 @@ impl Default for DatabaseConfig {
     }
 }
 
+/// Reads `.env` into the environment, if there is one.
+///
+/// The database URL carries a password and `config.toml` is tracked, so the
+/// URL lives in a file that is not. `.env` is the shape everybody already
+/// knows, and `.env.example` is tracked beside it with the same keys and no
+/// values.
+///
+/// Written here rather than taken from a crate: it is twenty lines, and a
+/// dependency that reads secrets is a dependency worth not having. It
+/// handles `KEY=value`, blank lines, `#` comments and a quoted value, which
+/// is all any of these files contain. It does not handle interpolation,
+/// multi-line values or `export`, and will not pretend to -- a line it does
+/// not understand is skipped rather than guessed at.
+///
+/// A variable already set in the environment wins. Something typed at the
+/// shell is meant for this run, and a file should not overrule it.
+pub fn load_env(path: &str) -> usize {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+
+    let mut set = 0;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+            set += 1;
+        }
+    }
+    set
+}
 impl DatabaseConfig {
     /// Where to connect, in the order the answer is looked for.
     ///
@@ -324,5 +372,66 @@ impl Config {
         let cfg: Config = toml::from_str(&text)
             .with_context(|| format!("parsing {}", path.display()))?;
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The shapes a `.env` actually contains, and the ones it does not, so a
+    /// line nobody meant is skipped rather than guessed at.
+    #[test]
+    fn the_env_file_is_read_the_way_env_files_are_written() {
+        let dir = std::env::temp_dir().join("aika-env-read");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        std::fs::write(
+            &path,
+            concat!(
+                "# a comment
+",
+                "
+",
+                "AIKA_TEST_PLAIN=one
+",
+                "AIKA_TEST_QUOTED=\"two three\"
+",
+                "  AIKA_TEST_SPACED = four 
+",
+                "not a pair
+",
+            ),
+        )
+        .unwrap();
+
+        super::load_env(path.to_str().unwrap());
+
+        assert_eq!(std::env::var("AIKA_TEST_PLAIN").unwrap(), "one");
+        assert_eq!(std::env::var("AIKA_TEST_QUOTED").unwrap(), "two three");
+        assert_eq!(std::env::var("AIKA_TEST_SPACED").unwrap(), "four");
+        assert!(std::env::var("not a pair").is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// What is already in the environment was meant for this run and wins.
+    #[test]
+    fn the_environment_beats_the_file() {
+        let dir = std::env::temp_dir().join("aika-env-wins");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        std::fs::write(&path, "AIKA_TEST_WINS=from_the_file
+").unwrap();
+
+        std::env::set_var("AIKA_TEST_WINS", "from_the_shell");
+        super::load_env(path.to_str().unwrap());
+
+        assert_eq!(std::env::var("AIKA_TEST_WINS").unwrap(), "from_the_shell");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// No file at all is the ordinary case and must not be an error.
+    #[test]
+    fn a_missing_env_file_is_not_a_problem() {
+        assert_eq!(super::load_env("this/does/not/exist/.env"), 0);
     }
 }

@@ -82,13 +82,21 @@ path = "var/aika.db"      # the development database
 url  = ""                 # a full connection string, when there is one
 ```
 
-For MySQL, set the connection string **in the environment**, not in the
-file:
+For MySQL, the connection string goes **in the environment**, not in the file.
+A `.env` beside `config.toml` is read at start-up and is ignored by git;
+`.env.example` is tracked and shows the keys with nothing real in them:
 
 ```sh
-export AIKA_DATABASE_URL='mysql://user:password@host:3306/database'
+cp .env.example .env        # then fill it in
 cargo run -p aika-server -- config.toml
 ```
+
+```ini
+AIKA_DATABASE_URL=mysql://user:password@host:3306/database
+```
+
+Anything already set in the shell wins over the file — something typed for one
+run should not be overruled by something written down.
 
 `AIKA_DATABASE_URL` wins over `url`, which wins over `path`. The schema is
 created on connection either way, so an empty database is enough to start.

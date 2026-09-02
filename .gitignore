@@ -8,6 +8,10 @@
 # Local overrides
 config.local.toml
 
+# Secrets. The database URL carries a password, so it lives here and never in
+# config.toml, which is tracked. `.env.example` shows the shape without one.
+.env
+
 # Original dump: carries real account rows from a private server.
 # Only sql/schema.sql (structure, no data) is tracked.
 sql/SQL Aika.sql
@@ -25,3 +29,9 @@ crates/aika-data/testdata/ItemList.bin
 # The overlay builds for another target, out of the workspace, so its output
 # does not land under the /target above.
 /crates/aika-overlay/target/
+
+# Caminhos locais do cliente: o exemplo e versionado, o real nao.
+/tools/visualizador/config.toml
+/tools/gm/config.toml
+/tools/visualizador/src-tauri/target/
+/tools/gm/src-tauri/target/

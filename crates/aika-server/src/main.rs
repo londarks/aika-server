@@ -7,6 +7,12 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before the logger, because the logger reads the environment too, and
+    // before the configuration, because the configuration asks it where the
+    // database is. Nothing is logged about it: the values are secrets, and
+    // the count is not worth a line.
+    let _ = aika_server::config::load_env(".env");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| "aika_server=debug,info".into()),

@@ -412,20 +412,41 @@ pub mod at {
 /// original leaves zeroed.
 pub const WORLD_BODY: usize = at::BAR + 3 + 41;
 
+/// One skill's entry in the sixteen bytes, and how wide it is.
+///
+/// `TSkillFunctions.GetSkillPranLevel` line for line. The width it returns is
+/// how many bytes of the value the caller copies, and it is one below 256 and
+/// two above it.
+fn skill_level_field(skill: usize, level: u8) -> (u32, usize) {
+    let l = (1u32 << level.min(31)) - 1;
+    if skill == 0 {
+        // The first skill is the value on its own, and the width the original
+        // returns for it is the one it started with.
+        return (l, 1);
+    }
+    let mut a = (skill as u32).pow(4);
+    if a == 1 {
+        a = 4;
+    }
+    let value = l.saturating_mul(a);
+    (value, if value <= u8::MAX as u32 { 1 } else { 2 })
+}
+
 /// The body of `0x907` for one companion.
 ///
-/// # The sixteen bytes of skill levels are left alone
+/// # The sixteen bytes of skill levels
 ///
-/// The original fills them from `GetSkillPranLevel`, which is a shape nobody
-/// should reproduce from memory: `l := 2^Level - 1`, then for any skill past
-/// the first `a := SkillIndex^4` (with one read as four), and `Level := l * a`
-/// is written at *byte* `SkillIndex` in one or two bytes depending on whether
-/// it fits. Consecutive skills therefore write over each other, and the
-/// fourth power means the offsets are not even a bit shift.
+/// `GetSkillPranLevel`, transcribed rather than reasoned about, because it is
+/// a shape nobody would arrive at twice: `l := 2^Level - 1`; for the first
+/// skill the value is `l`, and for any other `a := SkillIndex^4` with one read
+/// as four, and the value is `l * a`. It is written at *byte* `SkillIndex`, in
+/// one byte if it fits and two if it does not -- so consecutive skills write
+/// over each other, and the fourth power means the offsets are not a bit
+/// shift either. A skill at level zero is skipped rather than written as zero.
 ///
-/// None of the ten skills are granted yet, so zero is the truthful value:
-/// the client draws no levels because there are none. The transcription
-/// above is here so whoever grants them does not have to find it again.
+/// These were left blank for most of this system's life on the grounds that
+/// no skills were granted. They are granted now, and this is the field the
+/// window is drawn from.
 pub fn world_body(pran: &Pran) -> Vec<u8> {
     let mut out = vec![0u8; WORLD_BODY];
 
@@ -451,6 +472,16 @@ pub fn world_body(pran: &Pran) -> Vec<u8> {
     put32(&mut out, at::EXP, pran.exp);
     put16(&mut out, at::DEF_PHYSICAL, pran.def_physical);
     put16(&mut out, at::DEF_MAGIC, pran.def_magic);
+
+    for (at, level) in pran.skill_levels.iter().enumerate() {
+        if *level == 0 {
+            continue;
+        }
+        let (value, width) = skill_level_field(at, *level);
+        let start = at::SKILL_LEVELS + at;
+        let end = (start + width).min(at::EQUIPMENT);
+        out[start..end].copy_from_slice(&value.to_le_bytes()[..end - start]);
+    }
 
     for (slot, skill) in pran.bar.iter().enumerate() {
         out[at::BAR + slot] = *skill;
@@ -904,6 +935,39 @@ mod tests {
         Item { index: 100, identific, ..Item::default() }
     }
 
+    /// `GetSkillPranLevel`, checked against the numbers it produces rather
+    /// than against a reading of what it means -- because nobody knows what it
+    /// means. A fourth power and a byte offset that overlap on purpose or by
+    /// accident, and either way the client reads what it reads.
+    #[test]
+    fn a_skills_entry_is_the_original_arithmetic() {
+        // the first is the mask on its own
+        assert_eq!(skill_level_field(0, 1), (1, 1));
+        assert_eq!(skill_level_field(0, 4), (15, 1));
+
+        // one is read as four rather than as one
+        assert_eq!(skill_level_field(1, 1), (4, 1));
+        assert_eq!(skill_level_field(2, 1), (16, 1), "two to the fourth");
+        assert_eq!(skill_level_field(3, 1), (81, 1), "three to the fourth");
+
+        // and past a byte it takes two
+        assert_eq!(skill_level_field(4, 1), (256, 2));
+        assert_eq!(skill_level_field(9, 2), (3 * 6561, 2));
+    }
+
+    /// A level of zero means the skill is not there at all, and the original
+    /// skips it rather than writing a zero over whatever the byte held.
+    #[test]
+    fn a_skill_at_no_level_writes_nothing() {
+        let mut pran = Pran::hatch(Element::Fire, &stone_of(1), 0);
+        pran.skill_levels = [0; SKILLS];
+        pran.skill_levels[5] = 2;
+
+        let body = world_body(&pran);
+        assert_eq!(body[at::SKILL_LEVELS], 0, "the first was written anyway");
+        assert_ne!(body[at::SKILL_LEVELS + 5], 0, "the one that has a level was not");
+    }
+
     /// The packet is a fixed size the client reads by offset, so the length
     /// is part of the contract and not an implementation detail.
     #[test]
@@ -963,9 +1027,12 @@ mod tests {
     fn a_hatchling_carries_nothing() {
         let body = world_body(&Pran::hatch(Element::Fire, &stone_of(1), 0));
         assert!(body[at::EQUIPMENT..at::BAR].iter().all(|b| *b == 0));
+        // The first three carry a level, so the field is not blank: it is
+        // 1, 4, 16 -- `2^1 - 1` times one, four and sixteen.
+        assert_eq!(&body[at::SKILL_LEVELS..at::SKILL_LEVELS + 3], &[1, 4, 16]);
         assert!(
-            body[at::SKILL_LEVELS..at::EQUIPMENT].iter().all(|b| *b == 0),
-            "skill levels are not ours to fill in yet"
+            body[at::SKILL_LEVELS + 3..at::EQUIPMENT].iter().all(|b| *b == 0),
+            "a skill at level zero is skipped, not written"
         );
     }
     /// The original's test is `IsLetter`, which allows digits despite the

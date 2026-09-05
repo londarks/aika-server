@@ -467,7 +467,28 @@ fn skill_level_field(skill: usize, level: u8) -> (u32, usize) {
         a = 4;
     }
     let value = l.saturating_mul(a);
-    (value, if value <= u8::MAX as u32 { 1 } else { 2 })
+    // The original's `case` names two ranges and its `Result` starts at one,
+    // so a value past sixty-five thousand falls through every arm and is
+    // written in **one** byte, not two. It is reachable: the fourth power
+    // takes the sixth skill past that at level three.
+    let width = match value {
+        0..=255 => 1,
+        256..=65535 => 2,
+        _ => 1,
+    };
+    (value, width)
+}
+
+/// One `TItem` (`Data/MiscData.pas:44`), of which the window needs two fields.
+///
+/// `Index` is the item and `APP` what it is drawn as, and everything that
+/// hands a pran an item sets the two to the same number (`FinishQuest`, and
+/// each of the three evolutions). The rest of the twenty bytes -- the
+/// identific, the effects, the durability, the refine and the licence -- a
+/// pran's own gear has never carried.
+fn write_item(out: &mut [u8], index: u16) {
+    out[0..2].copy_from_slice(&index.to_le_bytes());
+    out[2..4].copy_from_slice(&index.to_le_bytes());
 }
 
 /// The body of `0x907` for one companion.
@@ -485,6 +506,16 @@ fn skill_level_field(skill: usize, level: u8) -> (u32, usize) {
 /// These were left blank for most of this system's life on the grounds that
 /// no skills were granted. They are granted now, and this is the field the
 /// window is drawn from.
+///
+/// # And the gear, which is what draws the picture
+///
+/// The original copies the pran's sixteen equipment slots in whole
+/// (`Move(Pran.Equip, Packet.Equips, ...)`), and the first of them is the
+/// summon stone: 100, 101 or 102 for a fairy, then 104, then 105, then 111.
+/// That is the same field the *spawn* packet reads to decide what body to
+/// draw. Leaving it out of this one is why a companion could walk beside its
+/// owner in its grown shape while its own window went on drawing the first
+/// one -- the window had never been told which shape it was.
 pub fn world_body(pran: &Pran) -> Vec<u8> {
     let mut out = vec![0u8; WORLD_BODY];
 
@@ -519,6 +550,18 @@ pub fn world_body(pran: &Pran) -> Vec<u8> {
         let start = at::SKILL_LEVELS + at;
         let end = (start + width).min(at::EQUIPMENT);
         out[start..end].copy_from_slice(&value.to_le_bytes()[..end - start]);
+    }
+
+    // `Move(Pran.Equip, Packet.Equips, 16 * SizeOf(TItem))`. The first of them
+    // is the summon stone, and it is the same field that tells the *spawn*
+    // what body to draw -- which is why the companion beside the player has
+    // been right all along and the window beside it has not.
+    for (slot, index) in pran.equipment.iter().enumerate() {
+        if *index == 0 {
+            continue;
+        }
+        let start = at::EQUIPMENT + slot * at::ITEM;
+        write_item(&mut out[start..start + at::ITEM], *index);
     }
 
     for (slot, skill) in pran.bar.iter().enumerate() {
@@ -702,7 +745,7 @@ fn raise_skills(pran: &mut Pran) {
 ///
 /// This is the part that is easy to miss and impossible to work around.
 /// Evolving swaps the summon stone -- 100, 101 or 102 for a fairy, then 104,
-/// then 105 -- and it swaps it *both* in the pran's own first equipment slot
+/// then 105, then 111 -- and it swaps it *both* in the pran's own first slot
 /// **and in equipment slot ten of the player**, which is the one the player
 /// is wearing. Changing only the pran's copy leaves the owner holding the
 /// stone of a form their companion no longer is.
@@ -719,11 +762,18 @@ pub struct Evolution {
 
 /// What each wall's quest turns the stone into.
 ///
-/// The third wall has no quest in the shipped data -- `Quests.csv` has 39,
-/// 40 and 41 to make a pran and 406 and 407 to evolve one, and nothing for
-/// level 49. So an adolescent stops there, on this data, as it did on the
-/// original.
-const EVOLUTION_STONES: [(u8, u16); 2] = [(4, 104), (19, 105)];
+/// Three walls, three stones, and the third needs saying. `Quests.csv` has
+/// five lines for NPC 2072 -- 39, 40 and 41 to make a pran, 406 and 407 to
+/// evolve one -- and no line for level 49. The *code* has one:
+/// `408: // quest Evolucao pran lv50 (fazer nos proximos caps)`
+/// (`NPCHandlers.pas:1845`), with the same shape as the other two and stone
+/// 111, sitting there waiting for a data line that never shipped.
+///
+/// Evolving here is driven by the NPC's own Quest option rather than by a
+/// line of that file, the same substitution promotion makes, so there is no
+/// missing line to stop it and an adolescent that would otherwise stand at
+/// the last wall for ever can go through it. The numbers are the original's.
+const EVOLUTION_STONES: [(u8, u16); 3] = [(4, 104), (19, 105), (49, 111)];
 
 /// What a hatchling holds in slot six, and what the first evolution puts
 /// there instead.
@@ -759,9 +809,9 @@ impl NotYet {
 
 /// Evolves a companion standing at a wall.
 ///
-/// `FinishQuest` for 406 and 407, which differ only in the stone and in the
-/// two things the first one also does: it raises the transform skill and it
-/// puts item 150 in slot six.
+/// `FinishQuest` for 406, 407 and 408, which differ only in the stone and in
+/// the two things the first one also does: it raises the transform skill and
+/// it puts item 150 in slot six.
 pub fn evolve(pran: &mut Pran) -> Result<Evolution, NotYet> {
     let Some(element) = Element::of(pran.class) else {
         return Err(NotYet::NothingFurther);
@@ -1047,6 +1097,47 @@ mod tests {
         assert_eq!(&body[at::BAR..at::BAR + 3], &[1, 2, 3]);
     }
 
+    /// The whole of the reported bug: a companion walking beside its owner in
+    /// its grown shape while its own window drew the first one. The window is
+    /// drawn from the stone in the first equipment slot, exactly as the body
+    /// is, and the window packet was not carrying it.
+    #[test]
+    fn a_grown_companions_window_says_which_shape_it_is() {
+        let mut pran = Pran { level: 4, ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
+        for (level, class, stone) in [(4u8, 62u8, 104u16), (19, 63, 105), (49, 64, 111)] {
+            pran.level = level;
+            evolve(&mut pran).expect("it would not evolve");
+            assert_eq!(pran.class, class);
+
+            let body = world_body(&pran);
+            assert_eq!(body[at::CLASS], class, "the window was told the wrong class");
+            assert_eq!(
+                u16::from_le_bytes(body[at::EQUIPMENT..at::EQUIPMENT + 2].try_into().unwrap()),
+                stone,
+                "the window is still holding the stone of a shape it no longer is",
+            );
+        }
+    }
+
+    /// `GetSkillPranLevel` returns its width from a `case` with two arms over
+    /// a `Result` that starts at one, so a value past sixty-five thousand
+    /// matches neither and is written in one byte. Reachable: the fourth power
+    /// takes the sixth skill past that at level three.
+    #[test]
+    fn a_skill_value_too_big_for_either_arm_is_written_in_one_byte() {
+        assert_eq!(skill_level_field(0, 9), (511, 1), "the first skill is never scaled");
+        assert_eq!(skill_level_field(1, 1), (4, 1), "one to the fourth is read as four");
+        assert_eq!(skill_level_field(2, 9), (8176, 2));
+
+        let (value, width) = skill_level_field(6, 3);
+        assert_eq!(value, 7 * 1296);
+        assert_eq!(width, 2, "still inside the second arm");
+
+        let (value, width) = skill_level_field(6, 9);
+        assert_eq!(value, 511 * 1296);
+        assert_eq!(width, 1, "past both arms, so the original writes one byte");
+    }
+
     /// A name at the limit must still leave its terminator, or the client
     /// reads on into the class byte.
     #[test]
@@ -1059,12 +1150,37 @@ mod tests {
         assert_eq!(body[at::CLASS], 81);
     }
 
-    /// The gear and the bags are zero because a hatchling has neither, and a
-    /// zero there has to read as an empty slot rather than as item zero.
+    /// The gear is what the window draws the companion's picture from, and a
+    /// hatchling's is its own summon stone. This was asserted blank for as
+    /// long as the field went out blank, which is how it went unnoticed that
+    /// the window was never told which shape it was looking at.
     #[test]
-    fn a_hatchling_carries_nothing() {
+    fn the_window_carries_the_stone_that_says_what_shape_it_is() {
+        let stone = 100;
         let body = world_body(&Pran::hatch(Element::Fire, &stone_of(1), 0));
-        assert!(body[at::EQUIPMENT..at::BAR].iter().all(|b| *b == 0));
+
+        assert_eq!(
+            u16::from_le_bytes(body[at::EQUIPMENT..at::EQUIPMENT + 2].try_into().unwrap()),
+            stone,
+            "the window has nothing to draw the companion as"
+        );
+        assert_eq!(
+            u16::from_le_bytes(body[at::EQUIPMENT + 2..at::EQUIPMENT + 4].try_into().unwrap()),
+            stone,
+            "everything that hands a pran an item sets the appearance to match"
+        );
+
+        let held = at::EQUIPMENT + 6 * at::ITEM;
+        assert_eq!(
+            u16::from_le_bytes(body[held..held + 2].try_into().unwrap()),
+            HATCHLING_HELD_ITEM,
+        );
+
+        // An empty slot is still zero, or the client draws item nought in it.
+        let empty = at::EQUIPMENT + at::ITEM;
+        assert!(body[empty..empty + at::ITEM].iter().all(|b| *b == 0));
+        // The bag is a container this server does not keep yet.
+        assert!(body[at::INVENTORY..at::BAR].iter().all(|b| *b == 0));
         // The first three carry a level, so the field is not blank: it is
         // 1, 4, 16 -- `2^1 - 1` times one, four and sixteen.
         assert_eq!(&body[at::SKILL_LEVELS..at::SKILL_LEVELS + 3], &[1, 4, 16]);
@@ -1318,17 +1434,33 @@ mod tests {
         }
     }
 
-    /// A wall it has already passed, and the one the data has no quest for.
+    /// A wall it has already passed evolves nothing, and neither does the
+    /// last form: there is no fifth.
     #[test]
-    fn a_wall_with_no_quest_behind_it_evolves_nothing() {
+    fn a_wall_already_passed_evolves_nothing() {
         // already a child, standing on the fairy's wall
         let mut pran = Pran { level: 4, class: 62, ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
         assert_eq!(evolve(&mut pran), Err(NotYet::NothingFurther));
 
-        // the third wall, which `Quests.csv` has nothing for
-        let mut grown = Pran { level: 49, class: 63, ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
-        assert_eq!(evolve(&mut grown), Err(NotYet::NothingFurther));
-        assert_eq!(grown.class, 63);
+        // and the last form, which has nothing left to become
+        let mut last = Pran { level: 49, class: 64, ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
+        assert_eq!(evolve(&mut last), Err(NotYet::NothingFurther));
+        assert_eq!(last.class, 64);
+    }
+
+    /// The third wall. Its quest is in the original's code and not in its
+    /// data, and evolving here is driven by the NPC rather than by that file,
+    /// so an adolescent goes through it instead of standing on it for ever.
+    #[test]
+    fn the_last_wall_turns_an_adolescent_into_an_adult() {
+        let mut pran =
+            Pran { level: 49, class: 63, ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
+
+        let grown = evolve(&mut pran).expect("it stopped at the last wall");
+
+        assert_eq!((grown.class, grown.stone), (64, 111));
+        assert_eq!(pran.equipment[0], 111, "and it is not drawn as its new stone");
+        assert!(!grown.clears_the_glow, "only the first evolution takes the glow off");
     }
 
     /// Evolving is what lets the level move again, which is the whole point

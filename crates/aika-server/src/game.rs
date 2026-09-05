@@ -1173,7 +1173,7 @@ fn handle_enter_world(
         encode_signal(OP_SIGNAL_LOAD, client_id, time, 1),
         encode_signal(OP_SIGNAL_LOAD, client_id, time, 1),
         encode_enter_131(),
-        encode_send_to_world(&account, &character, client_id, time, &state.skills),
+        encode_send_to_world(&account, &character, client_id, time),
         zeroed(OP_ENTER_12C, 0, ENTER_12C_SIZE),
     ];
 
@@ -1227,7 +1227,7 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
     let skills = known_skills(state, &character);
     let effects = Effects::of(&character, &state.items, &session.buffs, &state.skills);
     let mut frames =
-        world_burst(&character, session.client_id, &skills, &state.items, &effects, &state.skills);
+        world_burst(&character, session.client_id, &skills, &state.items, &effects);
 
     // The city is drawn by the client; the people in it are not. Without this
     // the player arrives in an empty town.
@@ -1296,7 +1296,6 @@ fn world_burst(
     skills: &[usize],
     items: &ItemList,
     effects: &Effects,
-    table: &SkillTable,
 ) -> Vec<Vec<u8>> {
     let (hp, mp) = vitals(character);
     // What the client walks the body at: forty and whatever a mount adds.
@@ -1305,7 +1304,7 @@ fn world_burst(
     let mut frames = vec![
         encode_spawn(character, client_id, speed_move),
         encode_skill_list(client_id, skills),
-        encode_skills_level(character, client_id, table),
+        encode_skills_level(character, client_id),
         encode_signal(OP_CASH, 0, 0, character.gold.min(u32::MAX as u64) as u32),
         zeroed(OP_ACCOUNT_STATUS, client_id, SIGNAL_SIZE),
         zeroed(OP_BUFFS, client_id, BUFFS_SIZE),
@@ -2006,7 +2005,6 @@ fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> A
                         character,
                         session.client_id,
                         PACKET_TIME,
-                        &state.skills,
                     );
                     Action::Reply(vec![
                         encode_menu_close(),
@@ -2316,7 +2314,7 @@ fn handle_learn_skill(state: &State, session: &mut Session, message: &Message) -
         // The skill list said to come from the trainer, so its window redraws
         // the newly learned skill; `SendPlayerSkills(NPCIndex)` in the original.
         encode_skill_list_from(client_id, npc, &known),
-        encode_skills_level(character, client_id, &state.skills),
+        encode_skills_level(character, client_id),
         encode_refresh_point(character),
         encode_refresh_money(character.gold, chest),
     ];
@@ -2437,7 +2435,7 @@ fn handle_reset_skills(state: &State, session: &mut Session) -> Action {
         encode_hp_mp(character, client_id, session.cur_hp, session.cur_mp),
         encode_skill_list(client_id, &known),
         encode_refresh_money(character.gold, chest),
-        encode_skills_level(character, client_id, &state.skills),
+        encode_skills_level(character, client_id),
         encode_refresh_status(character, &state.items, &effects),
         encode_refresh_point(character),
     ]);
@@ -3152,24 +3150,37 @@ const LAST_RANK: u16 = 16;
 /// `TPlayer.SetPlayerSkills` (`Mob/Player.pas:7079`): the sixty words of the
 /// record's skill list, **built and never stored**.
 ///
-/// # The word is not a level
+/// # The word is not a level, it is the ranks as bits
 ///
-/// It is every rank up to the one held, as bits: `GetSkillLevel` computes
-/// `2 ^ (rank + 1) - 2`, so rank one is `10`, rank two `110`, rank three
-/// `1110`. And the rank it raises two to is the *table's* own column for the
-/// id in use, not the count this server keeps.
+/// `GetSkillLevel` computes `2 ^ (rank + 1) - 2`, so rank one is `10`, rank
+/// two `110`, rank three `1110`: every rank up to the one held, set. Send a
+/// plain count here instead and the client reads it as a mask, works out a
+/// rank below the one it has, and asks to buy the rank it just bought — for
+/// ever, after every purchase, with the rank never moving.
 ///
-/// Sending the count instead is a loop with no way out, and it is worth
-/// spelling out because it looks like nothing on the wire. A fresh character
-/// holds level one of its first advanced skill, whose id the table calls rank
-/// two, so the word is 6 and the client asks to buy rank three. Send it 1 and
-/// the client reads rank one and asks to buy rank two — which is the same id
-/// it just bought. It asks again after every purchase, for ever, and the rank
-/// never moves.
+/// # Where this departs from the original, and why
 ///
-/// A basic is `2` whatever it has learned, which is the original writing the
-/// same formula's answer for rank one by hand.
-fn set_player_skills(character: &Character, skills: &SkillTable) -> [u8; SKILL_LIST_BYTES] {
+/// The original raises two to the *table's* rank column for the id in use.
+/// Under its own numbering that column is always one more than the level
+/// held: `GetSkillIndex(class, slot, 1)` lands on `base + slot * 16 + 1`,
+/// which the table calls rank two — 97 is Ataque Poderoso at rank one and the
+/// record points at 98. So a skill bought for the first time reads as rank
+/// two, and the level and the number beside it never agree.
+///
+/// This raises two to the level instead. Three things say that is the number
+/// wanted. The original hardcodes `2` for every learned basic rather than
+/// computing it, which is this formula's answer for rank one and not the
+/// table's answer for the id a basic actually points at — the correction is
+/// already there, applied by hand, to the half of the record that gets it.
+/// The client's own arithmetic closes only this way: it asks for
+/// `Index + rank`, so a rank equal to the level buys the next one and a rank
+/// one too high skips. And sixteen levels then land on the sixteen ids a slot
+/// owns instead of running one past the end into the next skill.
+///
+/// The `Exit;` rule cuts the other way here: this is live code that computes a
+/// number the original then draws, so it is a deliberate departure and not an
+/// oversight, and it is written down rather than quietly done.
+fn set_player_skills(character: &Character) -> [u8; SKILL_LIST_BYTES] {
     let mut list = [0u8; SKILL_LIST_BYTES];
 
     for i in 0..BASIC_SKILL_COUNT {
@@ -3178,7 +3189,6 @@ fn set_player_skills(character: &Character, skills: &SkillTable) -> [u8; SKILL_L
         }
     }
 
-    let class = character.class_number() as u32;
     for i in 0..ability::SKILL_SLOTS {
         let slot = BASIC_SKILL_COUNT + i;
         let level = character.skill_list[slot];
@@ -3186,11 +3196,7 @@ fn set_player_skills(character: &Character, skills: &SkillTable) -> [u8; SKILL_L
             continue;
         }
 
-        // `Others[I].Index + (Others[I].Level - 1)`: the record keeps the
-        // first rank's id and a level, and the rank in use is that many ids
-        // along.
-        let id = ability::skill_index(class, slot + 1, 1) + level as usize - 1;
-        let (size, mut value) = learned_ranks(skills, id);
+        let (size, mut value) = learned_ranks(level);
 
         // The original's own patch for the slot before this one having spilled
         // four bytes where two were expected. Copied because the client is
@@ -3207,13 +3213,12 @@ fn set_player_skills(character: &Character, skills: &SkillTable) -> [u8; SKILL_L
 }
 
 /// `TSkillFunctions.GetSkillLevel` (`Functions/SkillFunctions.pas:38`): every
-/// rank up to this id's, as bits, and how many bytes of it to write.
+/// rank up to this one, as bits, and how many bytes of it to write.
 ///
 /// Two bytes until rank fifteen and four from sixteen, which is the original's
 /// own `case` and the reason a maxed skill writes over the word after it.
-fn learned_ranks(skills: &SkillTable, id: usize) -> (usize, u32) {
-    let rank = skills.get(id).map_or(0, |skill| skill.rank());
-    let value = 2u32.checked_pow(rank + 1).map_or(0, |power| power - 2);
+fn learned_ranks(rank: u16) -> (usize, u32) {
+    let value = 2u32.checked_pow(rank as u32 + 1).map_or(0, |power| power - 2);
     let size = match value {
         0..=65535 => 2,
         65536..=131080 => 4,
@@ -3231,9 +3236,9 @@ fn learned_ranks(skills: &SkillTable, id: usize) -> (usize, u32) {
 /// Without it the client draws the whole tree as if available and lets the
 /// player press skills the server then refuses. The word after is how many
 /// skill points are unspent, which the original takes from the score.
-fn encode_skills_level(character: &Character, client_id: u16, skills: &SkillTable) -> Vec<u8> {
+fn encode_skills_level(character: &Character, client_id: u16) -> Vec<u8> {
     let mut body = Vec::with_capacity(SKILLS_LEVEL_SIZE - MIN_FRAME);
-    body.extend_from_slice(&set_player_skills(character, skills));
+    body.extend_from_slice(&set_player_skills(character));
     body.extend_from_slice(&character.skill_points.to_le_bytes());
     body.extend_from_slice(&SKILLS_LEVEL_TRAILER.to_le_bytes());
 
@@ -4560,11 +4565,10 @@ fn encode_send_to_world(
     character: &Character,
     client_id: u16,
     time: u32,
-    skills: &SkillTable,
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(4 + CHARACTER_SIZE);
     body.extend_from_slice(&account.id.to_le_bytes());
-    body.extend_from_slice(&encode_character(character, client_id, &account.prans, skills));
+    body.extend_from_slice(&encode_character(character, client_id, &account.prans));
 
     debug_assert_eq!(body.len() + MIN_FRAME, SEND_TO_WORLD_SIZE);
     frame::encode(
@@ -4575,12 +4579,7 @@ fn encode_send_to_world(
 
 /// `TCharacter`. Only the fields the client needs to build the character;
 /// the rest (inventory, skills, quests, titles) stays zeroed for now.
-fn encode_character(
-    character: &Character,
-    client_id: u16,
-    prans: &[pran::Pran],
-    skills: &SkillTable,
-) -> Vec<u8> {
+fn encode_character(character: &Character, client_id: u16, prans: &[pran::Pran]) -> Vec<u8> {
     use character_offset as off;
     let mut out = vec![0u8; CHARACTER_SIZE];
 
@@ -4652,7 +4651,7 @@ fn encode_character(
     // screen -- and the skill list is built rather than copied, for the
     // reason spelled out on `set_player_skills`.
     out[off::SKILL_LIST..off::SKILL_LIST + SKILL_LIST_BYTES]
-        .copy_from_slice(&set_player_skills(character, skills));
+        .copy_from_slice(&set_player_skills(character));
     for (i, slot) in character.item_bar.iter().enumerate() {
         put32(&mut out, off::ITEM_BAR + i * 4, *slot);
     }

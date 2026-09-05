@@ -236,12 +236,13 @@ They look like bugs and are not:
   keeps a level; the id cast is `Index + Level - 1`, and the client sends
   whatever its bar slot holds and nothing else. Buying a rank without
   rewriting the slot leaves the player casting the first one for ever.
-- **The skill list in the record is a mask, not a level.** `GetSkillLevel`
-  writes `2 ^ (rank + 1) - 2` — rank one is `10`, rank two `110` — and the
-  rank it counts is the *table's* own column for the id in use. The `2` every
-  learned basic carries is that same formula's answer for rank one, not a
-  marker. Write the level there instead and the client asks to buy the rank
-  it just bought, for ever.
+- **The skill list in the record is a mask, not a count.** `GetSkillLevel`
+  writes `2 ^ (rank + 1) - 2` — one level held is `10`, two is `110` — and the
+  `2` every learned basic carries is that same formula's answer for one, not a
+  marker. Write a plain count there and the client asks to buy the rank it
+  just bought, for ever. The rank raised to is the level held; the original
+  reads the table's rank column instead, which under its own numbering is
+  always one more, and `set_player_skills` says why we do not.
 - Offset comments inside the Delphi records are stale and disagree with each
   other by 16 and 32 bytes. Trust the declared types.
 

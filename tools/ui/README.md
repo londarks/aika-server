@@ -219,3 +219,40 @@ servidor e nao mudou o painel, entao a HUD nao e escolhida por ai. O que
 sobra e `UI/UITextureList.bin`, que tem dez texturas de Pran nos registros
 51 a 60 (`pranfairy1` e `pranbaby0<elemento><forma>`): falta achar quem
 indexa essa lista.
+
+
+## `pacotes.py` — o mapa de pacotes do cliente
+
+    python pacotes.py <AIKA.exe> --switch     opcode -> tratador
+    python pacotes.py <AIKA.exe> --cadeias    os despachos em cadeia de `cmp`
+
+Para parar de adivinhar o que o cliente faz com um pacote. Ele desmonta a
+`.text` inteira (930 mil instrucoes, dois segundos) e reconhece as duas formas
+que o compilador usou.
+
+**Cadeia**, na tela de selecao: `cmp edi, <opcode>` / `jne proxima` / `call`.
+**Switch**, no jogo: `sub eax, <base>` / `cmp eax, <quantos>` / `movzx eax,
+byte ptr [eax + <indices>]` / `jmp [eax*4 + <saltos>]` — duas tabelas, um byte
+de indice por opcode. Quem cai no ramo mais repetido e o default, ou seja, o
+opcode que o cliente ignora.
+
+### O que ele revelou de cara
+
+Cinco despachos no jogo, **137 opcodes tratados**:
+
+| faixa | tratados |
+|---|---|
+| 0x101..0x1B3 | 43 |
+| 0x301..0x3AD | 46 |
+| 0x901..0x97F | 15 |
+| 0xD18..0xD68 | 7 |
+| 0xF10..0xF86 | 26 |
+
+E a descoberta que fechou tres sessoes de caca ao painel da Pran: **`0x907`
+nao esta em nenhum deles.** No jogo ele cai no default. O unico lugar que
+trata `0x907` e a cadeia da **tela de selecao de personagem**, em
+`0x005C0D69`, atras de um porteiro `cmp [eax+0x77AD0], 0x7533`.
+
+Ou seja: dentro do mundo o cliente **descarta** o `0x907`. O painel da
+companheira nao e desenhado a partir dele, e nenhuma quantidade de campos
+certos naquele pacote ia mudar isso.

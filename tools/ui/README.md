@@ -182,3 +182,40 @@ indices de icone, entao a mesma celula guarda coisas diferentes — trazer o
 atlas deles poe a figura errada nos nossos itens. E o `ItemIcons12` nao resolve
 os 15 itens sem sprite (Confetti, Carnival Serpentine, Facion Eggs...): essa
 arte veio de um cliente BR que nenhum dos dois tem.
+
+
+## `refs.py` — quem no exe usa uma string
+
+O `desmontar.py` precisa de um endereco que o BugTrap ja tenha dado. Este nao:
+acha a string sozinho, converte para endereco virtual, varre as secoes de
+codigo atras da constante de 4 bytes que a empurra na pilha e desmonta em
+volta de cada uso.
+
+    python refs.py <AIKA.exe> "UI\PranHair.bin"
+    python refs.py <AIKA.exe> --hex 0031A077
+
+### O que ele ja resolveu
+
+**`UI/PranHair.bin` e uma grade de 8 linhas x 3 colunas de `u16`**, e nao doze
+valores em fila. Quem le e a janela de troca de cabelo, em `0x004DC5C1`: ela
+anda de 6 em 6 bytes por 8 iteracoes (`cmp edi, 8`) e copia as tres colunas
+para posicoes 0x14 apartadas na UI.
+
+    linha 0    0    0    0     (a fada, que nao usa nenhum)
+    linha 1  150  154  158     Curto
+    linha 2  151  155  159     Longo Ondulado
+    linha 3  152  156  160     Bicolor Ondulado
+    linhas 4-7                 vazias
+
+Cada **linha e um estilo** e cada **coluna e uma forma** — os tres ids de uma
+linha tem o mesmo nome na tabela de itens e icones diferentes. O rotulo da
+janela sai da coluna 0 (`mov cx, [esi + eax*2 + 0xc91e2]`, que e linha+1
+coluna 0) e vai para `0x00442F60`, que e o buscador de nome de item: `id *
+0x1D0` — o tamanho do registro do `ItemList` — dentro da tabela carregada em
+`0x193E700`.
+
+**Isso nao e o retrato da Pran.** Trocar o cabelo pela forma foi tentado no
+servidor e nao mudou o painel, entao a HUD nao e escolhida por ai. O que
+sobra e `UI/UITextureList.bin`, que tem dez texturas de Pran nos registros
+51 a 60 (`pranfairy1` e `pranbaby0<elemento><forma>`): falta achar quem
+indexa essa lista.

@@ -238,7 +238,7 @@ opcode que o cliente ignora.
 
 ### O que ele revelou de cara
 
-Cinco despachos no jogo, **137 opcodes tratados**:
+Cinco despachos no jogo, **137 opcodes** tratados por tabela de saltos:
 
 | faixa | tratados |
 |---|---|
@@ -248,11 +248,36 @@ Cinco despachos no jogo, **137 opcodes tratados**:
 | 0xD18..0xD68 | 7 |
 | 0xF10..0xF86 | 26 |
 
-E a descoberta que fechou tres sessoes de caca ao painel da Pran: **`0x907`
-nao esta em nenhum deles.** No jogo ele cai no default. O unico lugar que
-trata `0x907` e a cadeia da **tela de selecao de personagem**, em
-`0x005C0D69`, atras de um porteiro `cmp [eax+0x77AD0], 0x7533`.
+**Cuidado com o "default".** O ramo mais repetido de cada switch nao e um
+default: e um `call 0x004C0B90`, que e uma **segunda cadeia** para tudo que as
+tabelas nao cobrem. Ela le o opcode de `[edi+6]` e trata pelo menos `0x3E02`
+(renomear pran, inline), `0x907`, `0x96B` e `0x118`. Chamar aquilo de default
+custou uma conclusao errada: a de que o cliente descartava o `0x907`.
 
-Ou seja: dentro do mundo o cliente **descarta** o `0x907`. O painel da
-companheira nao e desenhado a partir dele, e nenhuma quantidade de campos
-certos naquele pacote ia mudar isso.
+### O `0x907` no jogo — `0x004B5350`
+
+Onde o painel da companheira e montado. O pacote chega em `ebx`, o corpo em
+`ebx+0xC`, e ele le:
+
+| do pacote | corpo | o que e |
+|---|---|---|
+| `[ebx+0xC]` | 0 | nome, copiado como string C |
+| `[ebx+0x1C]` | **16** | classe |
+| `[ebx+0x1D]` | 17 | comida |
+| `[ebx+0x1E]` | 18 | personalidade |
+| `[ebx+0x20]` | 20 | devocao |
+| `[ebx+0x24..0x34]` | 24..40 | vida, mana, exp |
+| `[ebx+0x38]`, `[ebx+0x3A]` | 44, 46 | defesas |
+| `[ebx+0x3C]`, `+0x44`, `+0x48` | 48, 56, 60 | **13 dos 16 bytes** de skill |
+| `rep movsd 0x50` de `[ebx+0x4C]` | **64** | os **16 equipamentos** (320 bytes) |
+| `rep movsd 0xD2` de `[ebx+0x18C]` | **384** | os **42 do inventario** (840 bytes) |
+| `[ebx+0x4D4]`, `[ebx+0x4D6]` | 1224, 1226 | as tres casas da barra |
+| `[ebx+0x4D7]` | **1227** | um byte |
+| `[ebx+0x4D8..0x4FC]` | **1228..1264** | **dez dwords** |
+
+Depois chama seis funcoes seguidas, que sao a remontagem da janela.
+
+**As duas coisas que o servidor Delphi nunca escreve e o cliente le:** os 840
+bytes do inventario da Pran, e os 41 bytes finais (`Unk2` no record) — um byte
+em 1227 e **dez dwords em 1228**, que sao exatamente o numero de skills dela.
+O `ZeroMemory` do inicio de `SendPranToWorld` e tudo que aquela area recebe.

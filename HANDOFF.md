@@ -151,6 +151,15 @@ Login/token (web ASP), lista/criação/deleção de personagem, entrar no mundo 
 - **Ponta solta conhecida:** ninguém trava o rank em 16. `IncremmentSkillLevel` não trava, e id 113 (rank 1 da skill seguinte) cai no `record_slot` da anterior. O `SetPlayerSkills` tem uma linha que compensa isso (`if Others[I-1].Level = 16 then Inc(Level)`), o que sugere que o original conhecia. A janela do treinador não oferece, então não dá pra chegar lá pelo jogo.
 - **Outra ponta solta:** `bar_of` filtra e **compacta** os 40 ids da janela K; o `SendPlayerSkills` manda os 40 por posição. Hoje não quebra porque os buracos da tabela e o filtro de nível são ambos monotônicos no slot (só cortam o fim), mas um buraco no meio deslocaria tudo depois dele.
 
+#### E na Pran, no mesmo dia
+- **Ela segue o dono** (`MovementCommand`, `PacketHandlers.pas:922`): um `0x301` comum com o id dela no cabeçalho. Pendura numa **segunda posição, grossa** — o original guarda duas e só age quando o jogador está a 3 da segunda. Na mesma condição fecha a loja de quem sai andando, que também não acontecia.
+- **Desvio consciente:** o original decide "ficou pra trás" perguntando se o ponto escolhido está a mais de 25 do jogador, o que só acontece porque a lista de pontos dele envelhece na thread de visibilidade. A nossa sai da posição atual, então pergunto da posição da Pran.
+- **Os pontos do `SetCurrentNeighbors` estão todos na diagonal** — o `Random(7)` escolhe entre dois cantos e não sabe pra onde o jogador anda, então metade das vezes joga ela na frente. Trocado por atrás-da-direção-de-marcha com o lado fixo. **Desvio, pedido pelo Gabriel.**
+- **O `0x907` não levava o equipamento.** `Move(Pran.Equip, Packet.Equips, 16*20)` — e o `Equip[0]` é a pedra, o mesmo campo que o *spawn* lê pra decidir o corpo. Era por isso que o corpo acertava e a janela não. **Não resolveu o painel**, mas era um buraco real.
+- **`GetSkillPranLevel` sai em 1 byte acima de 65535**, não 2: o `case` tem dois braços e o `Result` começa em 1. Alcançável na sexta skill no nível 3.
+- **O baú abria a janela da Pran.** Pacote nosso, posto lá pra quebrar o laço de nomeação. O `0x907` **é** a janela, então abrir o baú abria a janela de uma Pran que está dentro dele. A recusa do `handle_rename_pran` fecha o mesmo laço de graça.
+- **Outro servidor conferido** (`Aika Lore Community`): mesmo código-fonte, versão mais antiga, mesmas funções de Pran menos `ViewPran`, `TSendPranToWorld` idêntico. Não rendeu nada — mas confirma o pacote por uma segunda fonte.
+
 ## 12. Falta (roadmap) — ordem sugerida pra jogo solo
 1. **Skills passivas (`SearchSkillsPassive`, `Mob/Player.pas:7158`).** É a metade da árvore de toda classe e hoje não faz **nada**: a passiva é aprendida, custa os pontos, aparece aprendida, e não muda número nenhum. O que a transforma em número é um `case` por skill que sobe efeitos pelo rank (`EF_DAMAGE1`, `EF_HP`, `EF_COOLTIME`, `EF_REDUCE_AOE`…). Tabela longa, não difícil. Cuidado: o `Mode` é invertido — **0 ativa, 1 desativa** — e o reset chama com 1.
 2. **Inventário**: reparar (tipos 708/709, já lidos em `UseItem`), encantar, craftar.
@@ -204,16 +213,59 @@ Ordem barata se um dia for mexer: `.hgt` (grade `i16` simples, já lida) → `At
 ## 17. Pran — o que funciona e o que não
 Sistema em `pran.rs`, tabela `prans` (por conta, como o baú).
 
-**Funciona:** nasce da Pedra da Pran que a quest entrega (`Quests.csv`: NPC 2072, quests 39/40/41, recompensa **item 100 fogo / 101 água / 102 ar** — o elemento está escrito na pedra); os números de criação são os do `FinishQuest`; é batizada (`0x3E02`, e **o cliente não a deixa sair do baú sem nome**); é invocada pela pedra no slot 10; a primeira forma é só um efeito no jogador (2/4/8 por elemento) e as seguintes têm corpo próprio com id da faixa **44241..45240**; ganha **um quinto** do que o dono mata; sobe de nível (209 vida / 356 mana); trava nos muros **4, 19 e 49**; e **evolui pela quest** (406 no muro 4, 407 no 19 — no jogo real quem faz é a **Moa Bariel**).
+**Funciona:** nasce da Pedra da Pran que a quest entrega (`Quests.csv`: NPC 2072, quests 39/40/41, recompensa **item 100 fogo / 101 água / 102 ar** — o elemento está escrito na pedra); os números de criação são os do `FinishQuest`; é batizada (`0x3E02`, e **o cliente não a deixa sair do baú sem nome**); é invocada pela pedra no slot 10; a primeira forma é só um efeito no jogador (2/4/8 por elemento) e as seguintes têm corpo próprio com id da faixa **44241..45240**; ganha **um quinto** do que o dono mata; sobe de nível (209 vida / 356 mana); trava nos muros **4, 19 e 49**; **evolui pelas três quests**; **segue o dono**; **tem barra de skill própria**; **vira fada e volta pela Forma Faérica**; e **passa fome**.
 
 **Coisas que custaram caro e não devem ser reaprendidas:**
 - O nome da Pran mora no **registro do personagem** (`Character.PranName[0..1]`), não em pacote de Pran. Sem ele o cliente pede nome de uma Pran já batizada, recusa deixá-la sair do baú, e não há saída.
 - **A forma é o nível, não a classe** — `0..3` fada, `4` muro, `5..18` criança, `19` muro, `20..48` adolescente, `49` muro, `50..69` adulta (comentários do próprio original em `Mob/BaseMob.pas:6177`).
-- O `0x907` **não carrega nível**. O único que carrega é o `0x116`, e vai `Level + 1`.
+- O `0x907` **não carrega nível**. O único que carrega é o `0x116`, e vai `Level + 1`. **Mas o original não manda nível nenhum na chegada** — só spawn e janela (`Player.pas:5190`) —, então a forma que a janela desenha **não** pode vir do nível.
 - Uma Pran nasce em **nível 0**: o `FinishQuest` não atribui `Level` nenhuma vez.
-- Evoluir troca a pedra em **dois lugares**: `Pran.Equip[0]` **e** `Character.Equip[10]` (100/101/102 → 104 → 105).
+- Evoluir troca a pedra em **dois lugares**: `Pran.Equip[0]` **e** `Character.Equip[10]`.
 - A ordem dos dois pacotes **difere por caminho**: spawn-depois-descreve na chegada, descreve-depois-spawn na evolução.
+- **`Equip[6]` é o CABELO dela.** 7780 "Curto Rosa" ao nascer, 150 "Curto" na primeira evolução — e nunca mais. `Equip[0]` é a pedra, que é o corpo.
+- **`Inventory[40]` = 5301, a "Bolsa Pran"** (tipo 100), que destranca a página do inventário dela.
+- **`MovedToCentral`, `ViewPran` (`0x1A1`) e `SendPranDevotionAndFood` (`0x96B`) são código morto** — o primeiro está dentro de `{ }`, as duas chamadas do segundo estão comentadas, o terceiro nunca é chamado. Não procurar.
 
-**NÃO funciona — o painel da Pran desenha sempre a primeira forma.** O corpo ao lado do jogador está certo; a janela não. Já descartado, cada um testando: todo pacote que o original manda é mandado e nenhum falta (`SetPranEquipAtributes` e `SetPranPassiveSkill` não mandam nada, `SendPranDevotionAndFood` nunca é chamado); a ordem é a dele; **todo** campo do `0x907` está preenchido, inclusive os 16 bytes de níveis de skill do `GetSkillPranLevel`; o nível sai no `0x116` na invocação e no ganho; classe, pedra da Pran e pedra vestida foram postas juntas e separadas. **Os dois caminhos que restam:** capturar um `0x907` do servidor original com uma Pran crescida e comparar byte a byte, ou enganchar no cliente pelo overlay d3d9.
+### As três evoluções (`NPCHandlers.pas`)
+| quest | muro | classe | pedra | extra |
+|---|---|---|---|---|
+| 406 | nível 4 | 61→62 | 104 | `Inc(Skills[3].Level)`, `Equip[6] := 150`, `SendEffect(0)` |
+| 407 | nível 19 | 62→63 | 105 | — |
+| 408 | nível 49 | 63→64 | **111** | — |
 
-**Falta na Pran:** comida descendo, devoção subindo, a bolsa dela e os seis slots de equipamento (`PRAN_EQUIP_TYPE`, um quarto container), e as dez skills fazerem alguma coisa além de serem contadas.
+A 408 **não tem linha no `Quests.csv`** (o NPC 2072 só tem 39/40/41/406/407), mas existe no código. Como aqui a evolução é disparada pela opção Quest do NPC e não pelo CSV, ela é alcançável.
+
+### As dez skills dela
+Ids `5761/5861/5961 + slot*10`, dez ranks cada. **Cinco ativas e cinco passivas**, separadas pelo `Duration`:
+
+| slot | offset | duração | nome (fogo) | |
+|---|---|---|---|---|
+| 0 | 1 | 0 | Bravura | passiva |
+| 1 | 11 | 0 | Defesa Elemental | passiva |
+| 2 | 21 | 30 | Golpe Flamejante | ativa |
+| **3** | **31** | **0xFFFFFFFF** | **Forma Faérica** | ativa |
+| 4 | 41 | 0 | Coragem | passiva |
+| 5 | 51 | 30 | Espinho de Chamas | ativa |
+| 6 | 61 | 0 | Lâmina Flamejante | passiva |
+| 7 | 71 | 30 | Magia Ardente | ativa |
+| 8 | 81 | 0 | Fogo | passiva |
+| 9 | 91 | 30 | Fogo | ativa |
+
+- **A barra dela é o tipo 3 do `ChangeItemBar`**, três casas, guardadas na Pran. O valor no fio é o id **menos a base do elemento** (5760/5860/5960), então a quarta skill é 31 em qualquer elemento. O original valida contra `SkillData[SrcIndex + 5760]` — a base do fogo, sempre — e escapa porque os três elementos se espelham. **Só entra skill com `Duration <> 0`.**
+- **Forma Faérica** é o `case 196, 220, 244` do `SelfBuffSkill` (`BaseMob.pas:7626`): tira o que está desenhado, vira o `FaericForm` do jogador, desenha de novo. `PranIsFairy` = classe 61/71/81 **ou** esse flag, então uma Pran adulta vira brilho e volta.
+- As skills dela não caem em bloco de classe nenhum (ficam logo depois do 6º), então entram pela mesma porta das skills de montaria (`Named::ByTheServer`).
+
+### NÃO funciona — o painel desenha sempre a primeira forma
+Depois de um dia inteiro nisso, o que está **descartado com prova**:
+- O pacote está certo. `TSendPranToWorld` foi conferido contra **duas fontes Delphi independentes** (a nossa e a de outro servidor, versão mais antiga): idênticas, `PranClass` no byte 16 do corpo. Mandamos 64 lá, travado em teste.
+- O tamanho está certo: 1280 bytes exatos.
+- Os dados estão certos: classe 64, pedra 111 no `Equip[0]` **e** no slot 10 do personagem, exp no limiar exato do nível 50, `0x116` saindo com 51.
+- O original **não manda nível na chegada**, então a forma sai do próprio `0x907`.
+
+**O que o cliente revelou (2026-09-05):** `UI/UITextureList.bin` tem **dez texturas de Pran nos registros 51 a 60** — `pranfairy1`, depois `pranbaby011/021/031`, `012/022/032`, `013/023/033`. Uma fada mais **três elementos × três formas**, com o elemento variando mais rápido. Os dois valores saem do `ClassPran`. São skins de modelo (2048×2048), não retratos.
+
+**`UI/PranHair.bin`** são doze `u16`: `0,0,0` e depois `150,154,158, 151,155,159, 152,156,160`. Tem **duas leituras que os números não distinguem** — estilo por fora (adulto = 158) ou forma por fora (adulto = 152/156/160). Os nomes na tabela repetem "Curto/Longo/Bicolor" três vezes mas os **ícones são todos diferentes**. **Tentei a primeira leitura e não funcionou; foi revertida.** Não chutar a segunda.
+
+**O passo que decide:** desmontar o exe em volta de onde ele lê essas duas tabelas. A string `UI\PranHair.bin` está em **`0x31A077`** do `AIKA.exe`, que é um ponto de partida. `tools/ui/desmontar.py` e `ids_exe.py` existem para isso.
+
+**Falta na Pran:** o quarto container (**16 slots de equipamento e 42 de inventário** — os `Move(Pran.Equip, ...)` e `Move(Pran.Inventory, ...)` são **840 bytes que mandamos zerados** no `0x907`), as cinco passivas (`SetPranPassiveSkill`), o equipamento dela somando efeito no dono (`SetPranEquipAtributes`), e alimentar.

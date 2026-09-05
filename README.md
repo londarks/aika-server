@@ -27,13 +27,13 @@ the file in that source which owns it, and the commit that adds it says which.
 | Storage | the account chest: 86 slots, four pages, gold in and out |
 | Buffs | potions and saddles start them, they change the numbers they promise, and they expire on their own |
 | Mounts | worn, drawn on the rider, and their own two skills |
-| Companions | the Pran: hatched from a quest stone, named, summoned, drawn, fed on kills, evolved |
+| Companions | the Pran: hatched, named, summoned, drawn, fed on kills, evolved through all three forms, following its owner, with its own skill bar and the skill that turns it into a fairy |
 | Promotion | the class tier and its level walls at 50 and 89 |
 | Persistence | SQLite or MySQL, one schema — position, gold, items, skills, chest, companions |
 | Diagnostics | a per-connection packet trace that dumps itself when a client stops talking |
 | Game data | `ItemList.bin`, `SkillData.bin`, `ExpList.bin`, `.npc`, mob CSVs, drops, `SL.bin` |
 
-530 tests, including end-to-end runs over real sockets: HTTP token, TCP login
+543 tests, including end-to-end runs over real sockets: HTTP token, TCP login
 and game server through to the character list, and a second server started on
 the same database file to prove what was saved.
 
@@ -43,12 +43,20 @@ raises a companion.**
 ### The one thing that does not work
 
 A Pran's own window keeps drawing the first form however far the companion has
-come. The body beside the player is right; the panel is not. Every packet the
-original sends is sent, in the order each of its paths uses, with every field
-of `0x907` filled — so the next step is a capture from the original to diff
-against, or hooking the client itself. `crates/aika-server/src/pran.rs` lists
-what has already been ruled out, so nobody spends another evening on the same
-six things.
+come. The body beside the player is right; the panel is not.
+
+The packet is not the problem, and that is now proven rather than assumed:
+`TSendPranToWorld` has been read against two independent Delphi sources and is
+identical in both, the class travels in byte sixteen of the body, and this
+server puts the right number there under test. What was missing from it — the
+sixteen equipment slots, the first of which is the summon stone — has been
+sent since, and the panel did not move.
+
+So the answer is on the client's side. `UI/UITextureList.bin` holds ten pran
+textures in a row: `pranfairy1`, then `pranbaby011` through `033`, which is a
+fairy and three elements across three forms. Finding what indexes them is the
+whole of the remaining question. `crates/aika-server/src/pran.rs` lists what
+has been ruled out, so nobody spends another evening on the same things.
 
 ## Roadmap
 
@@ -68,16 +76,24 @@ already identified in `UseItem`; the work is the tables behind them.
 
 **3. The small ones.** Quests, dungeons.
 
-**4. The companion's window.** Everything else about a Pran works; the panel
-still draws the first form. Not a server problem to keep guessing at -- see
-the list of what has been ruled out in `pran.rs`, and then either capture a
-`0x907` from the original to diff, or hook the client.
+**4. The companion's own containers.** Sixteen equipment slots and
+forty-two inventory ones, which `0x907` carries and this server sends as
+eight hundred and forty zero bytes. Its gear also feeds the owner's effects
+through `SetPranEquipAtributes`, and its five passive skills do nothing until
+`SetPranPassiveSkill` is ported.
 
-**5. Channels.** Changing channel needs the world split per channel first —
+**5. The companion's window.** Everything else about a Pran works; the panel
+still draws the first form. The packet is not the problem -- it has been
+checked field by field against two independent Delphi sources and is right.
+The answer is in the client: `UI/UITextureList.bin` holds ten pran textures
+in a row, a fairy and three elements across three forms, and what indexes
+them is what has to be found. `pran.rs` lists everything ruled out.
+
+**6. Channels.** Changing channel needs the world split per channel first —
 today all four share one — and then the token handshake of `LoginIntoChannel`.
 Large, and worth little until there is somebody else online.
 
-**6. Everything that needs other people.** Guilds, parties and raids, friends
+**7. Everything that needs other people.** Guilds, parties and raids, friends
 and duels, trading, nations and relics, mail, the auction house, titles and
 events. About half the remaining opcodes, and none of it testable alone.
 

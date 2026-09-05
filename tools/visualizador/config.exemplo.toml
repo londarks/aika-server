@@ -1,0 +1,8 @@
+# Caminhos dos dois arquivos que o app le. Relativos a este arquivo.
+# Copie para config.toml e ajuste se o seu cliente estiver em outro lugar.
+
+# Tabela de itens do servidor, em texto claro (a do cliente e cifrada).
+item_list = "../../assets/items/ItemList.bin"
+
+# Pasta UI do cliente, de onde saem os ItemIcons01..12.jit.
+ui = "../../../aika-client/UI"

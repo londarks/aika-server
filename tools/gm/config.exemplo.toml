@@ -1,0 +1,10 @@
+# Caminhos, relativos a este arquivo. Copie para config.toml e ajuste.
+
+# Tabela de itens do servidor, em texto claro.
+item_list = "../../assets/items/ItemList.bin"
+
+# Pasta UI do cliente, de onde saem os ItemIcons01..12.jit.
+ui = "../../../aika-client/UI"
+
+# O banco do servidor. A ferramenta escreve aqui.
+banco = "../../var/aika.db"

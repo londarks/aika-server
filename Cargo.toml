@@ -5,7 +5,7 @@ members = ["crates/aika-net", "crates/aika-server", "crates/aika-data"]
 # of the server. Building it with the workspace would compile it for the host's
 # 64 bits, where it is of no use to anything, so it keeps its own workspace and
 # is built with an explicit `--target`.
-exclude = ["crates/aika-overlay"]
+exclude = ["crates/aika-overlay", "tools/visualizador/src-tauri", "tools/gm/src-tauri"]
 
 [workspace.package]
 edition = "2021"

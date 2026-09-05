@@ -30,8 +30,21 @@ crates/aika-data/testdata/ItemList.bin
 # does not land under the /target above.
 /crates/aika-overlay/target/
 
-# Caminhos locais do cliente: o exemplo e versionado, o real nao.
+# Local client paths: the example is tracked, the real one is not.
 /tools/visualizador/config.toml
 /tools/gm/config.toml
 /tools/visualizador/src-tauri/target/
 /tools/gm/src-tauri/target/
+
+# Python bytecode from the tools.
+__pycache__/
+
+# Tauri writes these itself on the first build, and they are three hundred
+# kilobytes of JSON apiece.
+/tools/*/src-tauri/gen/
+
+# The stock icon set `tauri icon` generates: two megabytes of Android, iOS and
+# Store art for two desktop windows. Only the one the bundle names is kept, and
+# `npx tauri icon` makes the rest again if a bundle ever needs them.
+/tools/*/src-tauri/icons/*
+!/tools/*/src-tauri/icons/icon.ico

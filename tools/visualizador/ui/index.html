@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Itens do Aika</title>
+<style>
+  :root {
+    --fundo: #17181c;
+    --painel: #1e2026;
+    --borda: #2c2f38;
+    --texto: #dfe1e6;
+    --fraco: #8b909c;
+    --realce: #d8b56a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--fundo); color: var(--texto);
+    font: 13px/1.45 "Segoe UI", system-ui, sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 10px 14px; border-bottom: 1px solid var(--borda);
+    display: flex; gap: 12px; align-items: center; background: var(--painel);
+  }
+  #busca {
+    flex: 1; padding: 7px 11px; border-radius: 6px;
+    border: 1px solid var(--borda); background: #141519; color: var(--texto);
+    font-size: 14px; outline: none;
+  }
+  #busca:focus { border-color: var(--realce); }
+  #resumo { color: var(--fraco); font-size: 12px; white-space: nowrap; }
+  #grade {
+    flex: 1; overflow-y: auto; padding: 12px;
+    display: grid; gap: 8px;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    align-content: start;
+  }
+  .item {
+    display: flex; gap: 10px; align-items: center;
+    background: var(--painel); border: 1px solid var(--borda);
+    border-radius: 7px; padding: 7px; cursor: pointer;
+  }
+  .item:hover { border-color: var(--realce); }
+  .item.copiado { border-color: #6fbf73; }
+  .sprite {
+    width: 42px; height: 42px; flex: none; image-rendering: pixelated;
+    background: #101116; border-radius: 4px;
+  }
+  .vazio {
+    width: 42px; height: 42px; flex: none; border-radius: 4px;
+    background: repeating-linear-gradient(45deg, #202127 0 5px, #191a1f 5px 10px);
+  }
+  .txt { min-width: 0; }
+  .nome { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { color: var(--fraco); font-size: 11px; }
+  .id { color: var(--realce); font-variant-numeric: tabular-nums; }
+  #rodape { padding: 14px; text-align: center; color: var(--fraco); grid-column: 1 / -1; }
+  button {
+    background: #262932; color: var(--texto); border: 1px solid var(--borda);
+    border-radius: 6px; padding: 7px 16px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { border-color: var(--realce); }
+</style>
+</head>
+<body>
+  <header>
+    <input id="busca" placeholder="nome do item, em português ou inglês — ou o id" autofocus>
+    <span id="resumo">carregando…</span>
+  </header>
+  <div id="grade"><div id="rodape">carregando…</div></div>
+
+<script>
+const invoke = window.__TAURI__.core.invoke;
+const LOTE = 120;
+const grade = document.getElementById('grade');
+const rodape = document.getElementById('rodape');
+const busca = document.getElementById('busca');
+
+let consulta = '', carregados = 0, total = 0, ocupado = false;
+
+invoke('resumo').then(r => {
+  document.getElementById('resumo').textContent =
+    `${r.com_nome.toLocaleString('pt-BR')} itens · ${r.atlas_encontrados} atlas`;
+}).catch(e => document.getElementById('resumo').textContent = 'erro: ' + e);
+
+function cartao(it) {
+  const el = document.createElement('div');
+  el.className = 'item';
+  const nome = it.nome || it.nome_en || '(sem nome)';
+  const alt = it.nome_en && it.nome && it.nome_en !== it.nome ? it.nome_en : '';
+  const fig = it.png
+    ? `<img class="sprite" src="${it.png}" alt="">`
+    : `<div class="vazio" title="sem sprite: ícone ${it.icone} cai no atlas ${it.atlas}"></div>`;
+  el.innerHTML = `${fig}<div class="txt">
+      <div class="nome" title="${nome.replace(/"/g, '&quot;')}">${nome}</div>
+      <div class="meta"><span class="id">#${it.id}</span>${alt ? ' · ' + alt : ''}</div>
+      <div class="meta">ícone ${it.icone} · atlas ${it.atlas}</div>
+    </div>`;
+  el.onclick = () => {
+    navigator.clipboard.writeText(String(it.id));
+    el.classList.add('copiado');
+    setTimeout(() => el.classList.remove('copiado'), 700);
+  };
+  return el;
+}
+
+async function carregar(zerar) {
+  if (ocupado) return;
+  ocupado = true;
+  if (zerar) { grade.innerHTML = ''; grade.appendChild(rodape); carregados = 0; }
+  rodape.textContent = 'carregando…';
+  try {
+    const p = await invoke('buscar', { texto: consulta, inicio: carregados, quantidade: LOTE });
+    total = p.total;
+    for (const it of p.itens) grade.insertBefore(cartao(it), rodape);
+    carregados += p.itens.length;
+    rodape.textContent = carregados >= total
+      ? (total ? `${total.toLocaleString('pt-BR')} itens` : 'nada encontrado')
+      : '';
+    if (carregados < total) {
+      const b = document.createElement('button');
+      b.textContent = `carregar mais (${carregados.toLocaleString('pt-BR')} de ${total.toLocaleString('pt-BR')})`;
+      b.onclick = () => carregar(false);
+      rodape.innerHTML = ''; rodape.appendChild(b);
+    }
+  } catch (e) {
+    rodape.textContent = 'erro: ' + e;
+  }
+  ocupado = false;
+}
+
+let timer;
+busca.oninput = () => {
+  clearTimeout(timer);
+  timer = setTimeout(() => { consulta = busca.value; carregar(true); }, 180);
+};
+
+// Rolagem carrega o lote seguinte sozinha; o botão fica para quem prefere clicar.
+grade.onscroll = () => {
+  if (grade.scrollTop + grade.clientHeight > grade.scrollHeight - 300
+      && carregados < total) carregar(false);
+};
+
+carregar(true);
+</script>
+</body>
+</html>

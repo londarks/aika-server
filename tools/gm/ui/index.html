@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>GM do Aika</title>
+<style>
+  :root { --fundo:#17181c; --painel:#1e2026; --borda:#2c2f38; --texto:#dfe1e6;
+          --fraco:#8b909c; --realce:#d8b56a; --perigo:#e0705f; --ok:#6fbf73; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--fundo); color:var(--texto); height:100vh;
+         display:flex; flex-direction:column;
+         font:13px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { padding:9px 12px; border-bottom:1px solid var(--borda); background:var(--painel);
+           display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input, select { padding:6px 9px; border-radius:6px; border:1px solid var(--borda);
+                  background:#141519; color:var(--texto); outline:none; font-size:13px; }
+  input:focus, select:focus { border-color:var(--realce); }
+  #busca { flex:1; min-width:220px; }
+  #aviso { width:100%; padding:7px 10px; border-radius:6px; font-size:12px;
+           background:#3a2a26; color:#f0c0b4; border:1px solid #6a4038; }
+  main { flex:1; display:grid; grid-template-columns:1fr 330px; min-height:0; }
+  #grade { overflow-y:auto; padding:10px; display:grid; gap:7px; align-content:start;
+           grid-template-columns:repeat(auto-fill, minmax(250px,1fr)); }
+  .item { display:flex; gap:9px; align-items:center; background:var(--painel);
+          border:1px solid var(--borda); border-radius:7px; padding:6px; cursor:pointer; }
+  .item:hover { border-color:var(--realce); }
+  .item.sel { border-color:var(--realce); background:#2a2620; }
+  .sprite { width:42px; height:42px; flex:none; image-rendering:pixelated;
+            background:#101116; border-radius:4px; }
+  .vazio { width:42px; height:42px; flex:none; border-radius:4px;
+           background:repeating-linear-gradient(45deg,#202127 0 5px,#191a1f 5px 10px); }
+  .txt { min-width:0; }
+  .nome { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .meta { color:var(--fraco); font-size:11px; }
+  .id { color:var(--realce); font-variant-numeric:tabular-nums; }
+  aside { border-left:1px solid var(--borda); background:var(--painel);
+          display:flex; flex-direction:column; min-height:0; }
+  aside h2 { margin:0; padding:10px 12px 6px; font-size:12px; color:var(--fraco);
+             text-transform:uppercase; letter-spacing:.06em; }
+  #pers { flex:1; overflow-y:auto; padding:0 8px 8px; }
+  .p { padding:7px 9px; border-radius:6px; border:1px solid transparent; cursor:pointer; }
+  .p:hover { background:#262932; }
+  .p.sel { border-color:var(--realce); background:#2a2620; }
+  #entrega { border-top:1px solid var(--borda); padding:11px 12px; display:grid; gap:8px; }
+  button { background:#262932; color:var(--texto); border:1px solid var(--borda);
+           border-radius:6px; padding:9px; cursor:pointer; font-size:13px; }
+  button:hover:not(:disabled) { border-color:var(--realce); }
+  button:disabled { opacity:.4; cursor:default; }
+  #resultado { font-size:12px; min-height:2.6em; }
+  .bom { color:var(--ok); } .ruim { color:var(--perigo); }
+  #rodape { grid-column:1/-1; padding:12px; text-align:center; color:var(--fraco); }
+</style>
+</head>
+<body>
+  <header>
+    <input id="busca" placeholder="nome do item, em português ou inglês — ou o id" autofocus>
+    <select id="classe"><option value="">todas as classes</option></select>
+    <select id="raridade"><option value="">toda raridade</option></select>
+    <input id="nivel" type="number" min="0" max="99" placeholder="nível máx" style="width:110px">
+    <span id="conta" style="color:var(--fraco); font-size:12px"></span>
+    <div id="aviso" hidden></div>
+  </header>
+
+  <main>
+    <div id="grade"><div id="rodape">carregando…</div></div>
+    <aside>
+      <h2>Personagem</h2>
+      <div id="pers"></div>
+      <div id="entrega">
+        <label style="font-size:12px; color:var(--fraco)">
+          quantidade <input id="qtd" type="number" value="1" min="1" max="120" style="width:70px">
+        </label>
+        <button id="enviar" disabled>escolha item e personagem</button>
+        <div id="resultado"></div>
+      </div>
+    </aside>
+  </main>
+
+<script>
+const invoke = window.__TAURI__.core.invoke;
+const LOTE = 100;
+const $ = id => document.getElementById(id);
+// Guardado numa const de propósito: `innerHTML = ''` tira este nó do documento,
+// e a partir daí getElementById devolve null.
+const rodape = $('rodape');
+const RARIDADE = ['comum','incomum','raro','épico','lendário','único','herói','mítico'];
+
+let itemSel = null, persSel = null, carregados = 0, total = 0, ocupado = false;
+
+// A tela vazia sem explicação foi o primeiro bug desta janela. Qualquer falha
+// aparece aqui, inclusive as que acontecem antes da grade existir.
+function falhou(e) {
+  const a = $('aviso');
+  a.hidden = false;
+  a.textContent = 'erro: ' + (e && e.message ? e.message : e);
+  if (rodape.isConnected) rodape.textContent = '';
+  console.error(e);
+}
+window.onerror = (m, _f, _l, _c, e) => falhou(e || m);
+window.onunhandledrejection = ev => falhou(ev.reason);
+
+invoke('resumo').then(r => {
+  $('conta').textContent = `${r.itens.toLocaleString('pt-BR')} itens`;
+  for (const [v, n] of r.classes) $('classe').add(new Option(n, v));
+  RARIDADE.forEach((n, i) => $('raridade').add(new Option(`${i} — ${n}`, i)));
+  if (r.em_uso) {
+    $('aviso').hidden = false;
+    $('aviso').textContent =
+      'O banco parece estar em uso. Com o personagem logado, o autosave do servidor ' +
+      'regrava o inventário por cima da entrega. Feche o jogo antes.';
+  }
+});
+
+function carregarPersonagens() {
+  invoke('personagens').then(ps => {
+    $('pers').innerHTML = '';
+    for (const p of ps) {
+      const el = document.createElement('div');
+      el.className = 'p';
+      el.innerHTML = `<div class="nome">${p.nome}</div>
+        <div class="meta">#${p.id} · nível ${p.nivel} · ${p.classe_nome} · ${p.ocupados}/120 na bolsa</div>`;
+      el.onclick = () => {
+        document.querySelectorAll('#pers .p').forEach(x => x.classList.remove('sel'));
+        el.classList.add('sel'); persSel = p; atualizar();
+        // A classe do personagem é a mesma numeração 0-5 do campo do item,
+        // então dá para usar direto como filtro.
+        if ($('classe').value === '') { $('classe').value = String(p.familia); refazer(); }
+      };
+      if (persSel && persSel.id === p.id) { el.classList.add('sel'); persSel = p; }
+      $('pers').appendChild(el);
+    }
+  }).catch(e => $('pers').textContent = 'erro: ' + e);
+}
+carregarPersonagens();
+
+function cartao(it) {
+  const el = document.createElement('div');
+  el.className = 'item';
+  const nome = it.nome || it.nome_en || '(sem nome)';
+  const fig = it.png ? `<img class="sprite" src="${it.png}" alt="">`
+                     : `<div class="vazio" title="sem sprite neste cliente"></div>`;
+  el.innerHTML = `${fig}<div class="txt">
+      <div class="nome" title="${(it.descricao || nome).replace(/"/g,'&quot;')}">${nome}</div>
+      <div class="meta"><span class="id">#${it.id}</span> · ${it.classe_nome} · nv ${it.nivel}</div>
+      <div class="meta">${RARIDADE[it.raridade] || it.raridade} · tipo ${it.tipo}</div>
+    </div>`;
+  el.onclick = () => {
+    document.querySelectorAll('#grade .item').forEach(x => x.classList.remove('sel'));
+    el.classList.add('sel'); itemSel = it; atualizar();
+  };
+  return el;
+}
+
+function atualizar() {
+  const b = $('enviar');
+  b.disabled = !(itemSel && persSel);
+  b.textContent = b.disabled ? 'escolha item e personagem'
+    : `entregar ${$('qtd').value}× "${(itemSel.nome || itemSel.nome_en)}" para ${persSel.nome}`;
+}
+$('qtd').oninput = atualizar;
+
+$('enviar').onclick = async () => {
+  $('enviar').disabled = true;
+  $('resultado').textContent = 'entregando…';
+  try {
+    const r = await invoke('entregar', {
+      personagem: persSel.id, item: itemSel.id, quantidade: Number($('qtd').value) });
+    $('resultado').className = 'bom';
+    $('resultado').textContent =
+      `entregue nas posições ${r.slots.join(', ')}.` + (r.aviso ? ' ' + r.aviso : '');
+    carregarPersonagens();
+  } catch (e) {
+    $('resultado').className = 'ruim';
+    $('resultado').textContent = 'erro: ' + e;
+  }
+  atualizar();
+};
+
+async function carregar(zerar) {
+  if (ocupado) return;
+  ocupado = true;
+  if (zerar) { $('grade').innerHTML = ''; $('grade').appendChild(rodape); carregados = 0; }
+  try {
+    const p = await invoke('buscar', {
+      texto: $('busca').value,
+      classe: $('classe').value === '' ? null : Number($('classe').value),
+      nivelMax: $('nivel').value === '' ? null : Number($('nivel').value),
+      raridade: $('raridade').value === '' ? null : Number($('raridade').value),
+      inicio: carregados, quantidade: LOTE });
+    total = p.total;
+    for (const it of p.itens) $('grade').insertBefore(cartao(it), rodape);
+    carregados += p.itens.length;
+    rodape.textContent = carregados >= total
+      ? (total ? `${total.toLocaleString('pt-BR')} itens` : 'nada encontrado') : '';
+  } catch (e) { falhou(e); }
+  ocupado = false;
+}
+
+let t;
+const refazer = () => { clearTimeout(t); t = setTimeout(() => carregar(true), 180); };
+['busca','classe','raridade','nivel'].forEach(id => $(id).oninput = refazer);
+$('grade').onscroll = () => {
+  if ($('grade').scrollTop + $('grade').clientHeight > $('grade').scrollHeight - 300
+      && carregados < total) carregar(false);
+};
+carregar(true);
+</script>
+</body>
+</html>

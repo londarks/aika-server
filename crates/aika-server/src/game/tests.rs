@@ -25,6 +25,14 @@ fn state_with(characters: Vec<DevCharacter>) -> State {
     State::new(cfg).unwrap()
 }
 
+/// A table with nothing in it, for the record tests that do not care what any
+/// skill is. `set_player_skills` reads the rank column out of the table, so
+/// one has to be there even when the answer is nought.
+fn no_skills() -> aika_data::skills::SkillTable {
+    use aika_data::skills::{RECORD_SIZE, SLOTS};
+    aika_data::skills::SkillTable::decode(&vec![0u8; SLOTS * RECORD_SIZE + 4]).unwrap()
+}
+
 fn dev_character(name: &str, slot: usize) -> DevCharacter {
     DevCharacter {
         name: name.into(),
@@ -871,11 +879,14 @@ async fn a_whisper_to_nobody_says_so() {
 /// offset wrong and the bar is empty however much is stored.
 #[test]
 fn the_record_carries_the_hotbar_and_known_skills() {
+    let state = cast_state();
     let mut character = Character::from(&dev_character("Athus", 0));
     character.item_bar[3] = 30994;
-    character.skill_list[52] = 15378;
+    // The second class's seventh slot, which is the one the fixture defines,
+    // held at its first level.
+    character.skill_list[6] = 1;
 
-    let record = encode_character(&character, 7, &[]);
+    let record = encode_character(&character, 7, &[], &state.skills);
 
     use character_offset as off;
     let bar3 = u32::from_le_bytes(
@@ -883,10 +894,11 @@ fn the_record_carries_the_hotbar_and_known_skills() {
     );
     assert_eq!(bar3, 30994, "the hotbar icon is not where the client looks");
 
-    let skill52 = u16::from_le_bytes(
-        record[off::SKILL_LIST + 52 * 2..off::SKILL_LIST + 52 * 2 + 2].try_into().unwrap(),
+    // The fixture's skill is rank one, so the word is `10` in binary.
+    let skill6 = u16::from_le_bytes(
+        record[off::SKILL_LIST + 6 * 2..off::SKILL_LIST + 6 * 2 + 2].try_into().unwrap(),
     );
-    assert_eq!(skill52, 15378, "the known skill is not where the client looks");
+    assert_eq!(skill6, 2, "the known skill is not where the client looks");
 }
 
 /// The skill window reads unspent points from the record, so they have to
@@ -896,7 +908,7 @@ fn the_record_carries_the_skill_points() {
     let mut character = Character::from(&dev_character("Athus", 0));
     character.skill_points = 100;
 
-    let record = encode_character(&character, 7, &[]);
+    let record = encode_character(&character, 7, &[], &no_skills());
     let points = u16::from_le_bytes(
         record[character_offset::SKILL_POINT..character_offset::SKILL_POINT + 2]
             .try_into()
@@ -1413,7 +1425,7 @@ async fn what_a_character_carries_reaches_the_client_in_the_world_packet() {
     character.gold = 4242;
 
     let character = session.character.as_ref().unwrap().clone();
-    let record = encode_character(&character, TEST_CLIENT_ID, &[]);
+    let record = encode_character(&character, TEST_CLIENT_ID, &[], &no_skills());
 
     use character_offset as off;
     let at = off::INVENTORY + 2 * off::ITEM_SIZE;
@@ -1541,7 +1553,7 @@ async fn a_new_character_arrives_carrying_its_starting_gear() {
     handle_message(&state, &mut session, &create_message("Novato", 0)).await;
 
     let created = session.account.as_ref().unwrap().characters[0].clone();
-    let record = encode_character(&created, TEST_CLIENT_ID, &[]);
+    let record = encode_character(&created, TEST_CLIENT_ID, &[], &no_skills());
 
     use character_offset as off;
     let last_bag = off::INVENTORY + 125 * off::ITEM_SIZE;
@@ -2242,7 +2254,7 @@ async fn the_character_record_says_what_the_prans_are_called() {
 
     let character = session.character.as_ref().unwrap();
     let prans = &session.account.as_ref().unwrap().prans;
-    let record = encode_character(character, TEST_CLIENT_ID, prans);
+    let record = encode_character(character, TEST_CLIENT_ID, prans, &state.skills);
 
     let first = &record[off::PRAN_NAMES..off::PRAN_NAMES + off::PRAN_NAME_SIZE];
     let end = first.iter().position(|b| *b == 0).unwrap();
@@ -3681,7 +3693,16 @@ async fn a_player_arriving_is_announced_as_an_arrival() {
     );
 
     // the copy the player gets of itself is the ordinary kind
-    let own = decode(&world_burst(&character, session.client_id, &[], &state.items, &crate::effects::Effects::none())[0]);
+    let own = decode(
+        &world_burst(
+            &character,
+            session.client_id,
+            &[],
+            &state.items,
+            &crate::effects::Effects::none(),
+            &state.skills,
+        )[0],
+    );
     assert_eq!(own.body[spawn_offset::SPAWN_TYPE], SPAWN_NORMAL);
 }
 
@@ -4100,14 +4121,17 @@ fn cast_state() -> State {
     let mut state = fight_state();
     let mut raw = vec![0u8; 4000 * RECORD_SIZE];
 
+    // `rank` is the table's own column, which is what the record's skill list
+    // is built from -- consecutive ids are consecutive ranks, as they are in
+    // the real table.
     let mut define = |id: usize, family: u32, min_level: u32, class: u32,
-                      mana: u32, damage: u32, range: u32, cooldown: u32| {
+                      mana: u32, damage: u32, range: u32, cooldown: u32, rank: u32| {
         let r = &mut raw[id * RECORD_SIZE..(id + 1) * RECORD_SIZE];
         let put = |r: &mut [u8], at: usize, v: u32| {
             r[at..at + 4].copy_from_slice(&v.to_le_bytes());
         };
         put(r, field::FAMILY, family);
-        put(r, field::RANK, 1);
+        put(r, field::RANK, rank);
         put(r, field::MIN_LEVEL, min_level);
         put(r, field::CLASS, class);
         put(r, field::MANA, mana);
@@ -4118,11 +4142,13 @@ fn cast_state() -> State {
         r[field::NAME_ENGLISH.start] = b'x';
     };
 
-    define(SPELL as usize, 1, 1, 11, 30, 500, 300, 3000);       // ours
+    define(SPELL as usize, 1, 1, 11, 30, 500, 300, 3000, 1);       // ours
     // The rank above it, which is the id one past. Not a slot's first rank,
     // so it never joins the forty the trainer window lists.
-    define(SPELL as usize + 1, 1, 1, 11, 30, 700, 300, 3000);
-    define(OTHER_SPELL as usize, 1, 1, 51, 5, 40, 200, 1000);   // another class
+    define(SPELL as usize + 1, 1, 1, 11, 30, 700, 300, 3000, 2);
+    // And a maxed one, whose word is the one that does not fit in two bytes.
+    define(MAXED_SPELL as usize, 1, 1, 11, 30, 900, 300, 3000, 16);
+    define(OTHER_SPELL as usize, 1, 1, 51, 5, 40, 200, 1000, 1);   // another class
 
     state.skills = SkillTable::decode(&raw).unwrap();
     state
@@ -4131,6 +4157,9 @@ fn cast_state() -> State {
 /// The second class owns ids 960 to 1919, and its seventh slot - the
 /// first one the bar carries - is at 960 + 6 * 16 + 1.
 const SPELL: u32 = 960 + 6 * 16 + 1;
+/// The eighth slot's first rank, defined at rank sixteen so the four-byte
+/// case has something to read.
+const MAXED_SPELL: u32 = 960 + 7 * 16 + 1;
 /// The fifth class's, which the test character must not be able to reach.
 const OTHER_SPELL: u32 = 4 * 960 + 1;
 
@@ -4269,6 +4298,73 @@ async fn the_last_skill_point_takes_the_status_points_with_it() {
     let c = session.character.as_ref().unwrap();
     assert_eq!(c.skill_points, 0);
     assert_eq!(c.attributes[FREE_POINTS], 0, "the original wipes these and we did not");
+}
+
+/// The word in the record is every rank up to the one held, as bits, and the
+/// rank it counts is the table's own column for the id in use — not the level
+/// this server keeps.
+///
+/// Sending the level instead is a loop with no way out: the client reads it
+/// as a mask, works out a lower rank than the character has, and asks to buy
+/// the rank it already bought. It asks again after every purchase and the
+/// rank never moves. That is what a whole session of clicking looked like.
+#[test]
+fn the_skill_list_word_is_the_ranks_as_bits() {
+    let state = cast_state();
+    let mut character = Character::from(&dev_character("Athus", 0));
+
+    character.skill_list[6] = 1;
+    let first = set_player_skills(&character, &state.skills);
+    assert_eq!(
+        u16::from_le_bytes(first[12..14].try_into().unwrap()),
+        2,
+        "rank one is 10 in binary"
+    );
+
+    character.skill_list[6] = 2;
+    let second = set_player_skills(&character, &state.skills);
+    assert_eq!(
+        u16::from_le_bytes(second[12..14].try_into().unwrap()),
+        6,
+        "rank two is 110, and sending 2 here is what froze the trainer"
+    );
+}
+
+/// A learned basic is `2` whatever it holds, which is the original writing
+/// the same formula's answer for rank one by hand.
+#[test]
+fn a_basic_is_two_and_an_unlearned_slot_is_nothing() {
+    let state = cast_state();
+    let mut character = Character::from(&dev_character("Athus", 0));
+    character.skill_list = [0; 60];
+    character.skill_list[0] = 1;
+    character.skill_list[3] = 9;
+
+    let list = set_player_skills(&character, &state.skills);
+
+    assert_eq!(u16::from_le_bytes(list[0..2].try_into().unwrap()), 2);
+    assert_eq!(u16::from_le_bytes(list[6..8].try_into().unwrap()), 2, "a basic is 2 at any level");
+    assert_eq!(u16::from_le_bytes(list[2..4].try_into().unwrap()), 0, "an unlearned basic");
+    assert_eq!(u16::from_le_bytes(list[12..14].try_into().unwrap()), 0, "an unlearned skill");
+}
+
+/// The sixteenth rank is 131070, which does not fit in the two bytes the
+/// slot has, so the original writes four and runs into the word after.
+#[test]
+fn a_maxed_skill_writes_over_the_word_after_it() {
+    let state = cast_state();
+    let mut character = Character::from(&dev_character("Athus", 0));
+    character.skill_list = [0; 60];
+    character.skill_list[7] = 1;
+
+    let list = set_player_skills(&character, &state.skills);
+
+    let at = 7 * 2;
+    assert_eq!(
+        u32::from_le_bytes(list[at..at + 4].try_into().unwrap()),
+        131070,
+        "rank sixteen is not the four bytes the original writes"
+    );
 }
 
 fn reset_message() -> Message {

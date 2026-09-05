@@ -599,6 +599,11 @@ pub(crate) struct Session {
     /// held after that. Redrawing it every step is what made it weave across
     /// the player rather than follow them.
     pran_side: f32,
+    /// When the companion's food was last counted down. The original runs it
+    /// on a thread of its own; here it hangs off the client's own heartbeat,
+    /// which arrives twice a second and is the only regular tick a standing
+    /// player gives us.
+    pran_fed_at: Option<std::time::Instant>,
     /// `TPlayer.FaericForm`: the companion has been turned into a fairy by its
     /// own Forma Faerica skill. `PranIsFairy` is true for the first class of
     /// each element **or** for this, so while it is on a grown companion is
@@ -1235,6 +1240,7 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
         let mut frames = refresh_mob_visibility(state, session);
         frames.extend(collect_blows(state, session));
         frames.extend(drop_spent_buffs(state, session));
+        frames.extend(feed_the_companion(state, session));
         return if frames.is_empty() { Action::Ignore } else { Action::Reply(frames) };
     }
 
@@ -1630,6 +1636,64 @@ fn trailing_spot(at: (f32, f32), heading: (f32, f32), side: f32) -> (f32, f32) {
         at.0 - forward.0 * PRAN_BEHIND + across.0 * PRAN_BESIDE * side,
         at.1 - forward.1 * PRAN_BEHIND + across.1 * PRAN_BESIDE * side,
     )
+}
+
+/// How often a companion that is out gets hungrier, and by how much
+/// (`TPranFoodThread`, created with 60000 in `ServerSocket.pas:495`).
+const PRAN_FOOD_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+const PRAN_FOOD_STEP: u8 = 3;
+/// Below this it says so, once a minute, until it is fed.
+const PRAN_FOOD_HUNGRY: u8 = 25;
+
+/// A companion gets hungry while it is out (`TPranFoodThread.CheckFood`).
+///
+/// Three off the food every minute, and a word about it under twenty-five.
+/// Nothing happens at nought: what the original does there -- devotion
+/// falling, and the companion sending itself back to the station -- is
+/// commented out in the source, so a starving pran simply stays hungry.
+///
+/// The original gives this its own thread across every player. Here it hangs
+/// off the heartbeat of the player it concerns, which arrives twice a second
+/// and costs nothing to look at.
+fn feed_the_companion(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+    if session.pran_out.is_none() {
+        session.pran_fed_at = None;
+        return Vec::new();
+    }
+    let now = std::time::Instant::now();
+    match session.pran_fed_at {
+        Some(at) if now.duration_since(at) < PRAN_FOOD_EVERY => return Vec::new(),
+        // First look of this summoning: start the clock rather than taking a
+        // minute's worth off straight away.
+        None => {
+            session.pran_fed_at = Some(now);
+            return Vec::new();
+        }
+        _ => {}
+    }
+    session.pran_fed_at = Some(now);
+
+    let at = session.pran_out.expect("checked above");
+    let Some(account) = session.account.as_mut() else {
+        return Vec::new();
+    };
+    let Some(pran) = account.prans.get_mut(at) else {
+        return Vec::new();
+    };
+    if pran.food == 0 {
+        return Vec::new();
+    }
+
+    // `if Food <= 3 then Food := 0 else Food := Food - 3`, which is the same
+    // as saturating and is written out because the original writes it out.
+    pran.food = pran.food.saturating_sub(PRAN_FOOD_STEP);
+    session.dirty = true;
+
+    if pran.food < PRAN_FOOD_HUNGRY {
+        let _ = state;
+        return vec![encode_client_message(session.client_id, "Pran esta com fome.")];
+    }
+    Vec::new()
 }
 
 /// The companion walking after its owner (`MovementCommand`,

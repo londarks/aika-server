@@ -178,10 +178,6 @@ pub const EQUIPMENT_SLOTS: usize = 8;
 /// What a newly hatched pran is given to hold, in slot six
 /// (`FinishQuest`, with no explanation of what it is).
 pub const HATCHLING_HELD_ITEM: u16 = 7780;
-/// Which of the sixteen holds it. Not slot one, where a character's hair
-/// lives -- the original tried that and left the attempt commented out beside
-/// the line that works.
-pub const HAIR_SLOT: usize = 6;
 /// And in the fortieth slot of its own bag.
 pub const HATCHLING_BAG_ITEM: u16 = 5301;
 
@@ -805,59 +801,6 @@ pub struct Evolution {
 /// the last wall for ever can go through it. The numbers are the original's.
 const EVOLUTION_STONES: [(u8, u16); 3] = [(4, 104), (19, 105), (49, 111)];
 
-/// The nine hairs a grown companion can wear, as `UI/PranHair.bin` lays them
-/// out: three styles across three forms.
-///
-/// | style | child | adolescent | adult |
-/// |---|---|---|---|
-/// | Curto | 150 | 154 | 158 |
-/// | Longo Ondulado | 151 | 155 | 159 |
-/// | Bicolor Ondulado | 152 | 156 | 160 |
-///
-/// So a hair is `FIRST_HAIR + style + 4 * form`, and the file is that grid
-/// with three zeros in front of it -- the fairy, which wears none.
-///
-/// # This is what the window draws
-///
-/// The client carries nine `UI/PranBaby0<style><form>.jit` and one
-/// `pranfairy1.jit`, which is the same grid and its missing first row. The
-/// companion's *portrait* is chosen from the hair, not from the summon stone:
-/// the stone decides the body standing on the field and the hair decides the
-/// face in the panel.
-///
-/// The original sets the hair once, at the first evolution
-/// (`Equip[6] := 150`), and neither of the two evolutions after it touches it
-/// again. So every grown companion goes on wearing the child's hair and the
-/// panel goes on drawing the first cell of the grid, however far the
-/// companion has come -- which is the panel that has been wrong here since
-/// there was a panel.
-pub const FIRST_HAIR: u16 = 150;
-const HAIR_STYLES: u16 = 3;
-const HAIR_FORM_STEP: u16 = 4;
-
-/// The same style of hair, cut for the form the companion has become.
-///
-/// `form` counts from nought at the child, which is the first form that has
-/// hair at all. A hair that is not one of the nine is left alone: it is not
-/// ours to reinterpret.
-pub fn hair_for_form(hair: u16, form: u8) -> u16 {
-    let Some(offset) = hair.checked_sub(FIRST_HAIR) else {
-        return hair;
-    };
-    let style = offset % HAIR_FORM_STEP;
-    if style >= HAIR_STYLES || offset >= HAIR_FORM_STEP * HAIR_STYLES {
-        return hair;
-    }
-    FIRST_HAIR + style + HAIR_FORM_STEP * form as u16
-}
-
-/// Which of the nine rows a class is on: the child is nought.
-fn hair_form_of(class: u8) -> Option<u8> {
-    let element = Element::of(class)?;
-    // 61 is the fairy and wears none; 62, 63 and 64 are the three that do.
-    class.checked_sub(element.first_class() + 1)
-}
-
 /// What a hatchling holds in slot six, and what the first evolution puts
 /// there instead.
 pub const CHILD_HELD_ITEM: u16 = 150;
@@ -930,21 +873,13 @@ pub fn evolve(pran: &mut Pran) -> Result<Evolution, NotYet> {
     pran.class += 1;
     pran.equipment[0] = stone;
 
-    // Only the first one raises the transform skill, and only the first one
-    // hands over a hair at all -- before it there is none.
+    // Only the first one. The second sets no held item and raises nothing.
     let first = at == 0;
     if first {
-        pran.equipment[HAIR_SLOT] = CHILD_HELD_ITEM;
+        pran.equipment[6] = CHILD_HELD_ITEM;
         if let Some(level) = pran.skill_levels.get_mut(TRANSFORM_SKILL) {
             *level = level.saturating_add(1);
         }
-    }
-
-    // And every evolution cuts it for the new form. The original does this
-    // once and never again, which leaves a grown companion in the child's
-    // hair and its panel drawing the child's face; see [`hair_for_form`].
-    if let Some(form) = hair_form_of(pran.class) {
-        pran.equipment[HAIR_SLOT] = hair_for_form(pran.equipment[HAIR_SLOT], form);
     }
 
     Ok(Evolution { class: pran.class, stone, clears_the_glow: first })
@@ -1219,42 +1154,6 @@ mod tests {
                 "the window is still holding the stone of a shape it no longer is",
             );
         }
-    }
-
-    /// The nine hairs are three styles across three forms, and evolving keeps
-    /// the style and moves the form. Getting this wrong leaves a grown
-    /// companion wearing the child's hair, and the panel draws its face from
-    /// the hair rather than from the stone.
-    #[test]
-    fn evolving_cuts_the_hair_for_the_new_form() {
-        let mut pran = Pran { level: 4, ..Pran::hatch(Element::Fire, &stone_of(1), 0) };
-
-        evolve(&mut pran).expect("the first wall");
-        assert_eq!(pran.equipment[HAIR_SLOT], 150, "the child's hair is the first one it gets");
-
-        pran.level = 19;
-        evolve(&mut pran).expect("the second wall");
-        assert_eq!(pran.equipment[HAIR_SLOT], 154, "the adolescent kept the child's hair");
-
-        pran.level = 49;
-        evolve(&mut pran).expect("the last wall");
-        assert_eq!(pran.equipment[HAIR_SLOT], 158, "the adult kept a younger hair");
-    }
-
-    /// The style is what is kept; only the form moves.
-    #[test]
-    fn a_hair_keeps_its_style_across_the_forms() {
-        for (style, child) in [(0u16, 150u16), (1, 151), (2, 152)] {
-            assert_eq!(hair_for_form(child, 0), child);
-            assert_eq!(hair_for_form(child, 1), 154 + style);
-            assert_eq!(hair_for_form(child, 2), 158 + style);
-        }
-
-        // The hatchling's pink one is not one of the nine, and something that
-        // is not a hair at all is nobody's business to rewrite.
-        assert_eq!(hair_for_form(HATCHLING_HELD_ITEM, 2), HATCHLING_HELD_ITEM);
-        assert_eq!(hair_for_form(0, 2), 0);
-        assert_eq!(hair_for_form(153, 2), 153, "the gap in the grid is left alone");
     }
 
     /// `GetSkillPranLevel` returns its width from a `case` with two arms over

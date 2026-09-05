@@ -178,8 +178,15 @@ pub const EQUIPMENT_SLOTS: usize = 8;
 /// What a newly hatched pran is given to hold, in slot six
 /// (`FinishQuest`, with no explanation of what it is).
 pub const HATCHLING_HELD_ITEM: u16 = 7780;
-/// And in the fortieth slot of its own bag.
+/// And in the fortieth slot of its own bag: item 5301, the "Bolsa Pran",
+/// which is what unlocks the page that bag is on.
 pub const HATCHLING_BAG_ITEM: u16 = 5301;
+/// Which slot it goes in (`Pran1.Inventory[40]` in `FinishQuest`).
+pub const BAG_SLOT: usize = 40;
+
+/// How many slots a companion's own bag has: forty, and two more that are the
+/// bags themselves (`Inventory: Array [0..41] of TITEM`).
+pub const INVENTORY_SLOTS: usize = 42;
 
 /// How many skills a pran carries. The original's own comment says the array
 /// is ten and may one day be twelve.
@@ -278,6 +285,10 @@ pub struct Pran {
     pub width: u8,
     pub chest: u8,
     pub leg: u8,
+    /// Its own bag, by item index. The window carries all forty-two and the
+    /// client reads them: `rep movsd 0xD2` out of body 384, eight hundred and
+    /// forty bytes, in the handler at `0x004B5350` of the client.
+    pub inventory: [u16; INVENTORY_SLOTS],
     /// The eight equipment slots the spawn carries, by item index.
     ///
     /// The first is what the client draws it as. In the player spawn that
@@ -318,6 +329,7 @@ impl Default for Pran {
             width: 0,
             chest: 0,
             leg: 0,
+            inventory: [0; INVENTORY_SLOTS],
             equipment: [0; EQUIPMENT_SLOTS],
             skill_levels: [0; SKILLS],
             skills: [0; SKILLS],
@@ -392,6 +404,11 @@ impl Pran {
             width: 7,
             chest: 100,
             leg: 100,
+            inventory: {
+                let mut bag = [0u16; INVENTORY_SLOTS];
+                bag[BAG_SLOT] = HATCHLING_BAG_ITEM;
+                bag
+            },
             equipment,
             skill_levels: {
                 let mut levels = [0u8; SKILLS];
@@ -587,6 +604,17 @@ pub fn world_body(pran: &Pran) -> Vec<u8> {
             continue;
         }
         let start = at::EQUIPMENT + slot * at::ITEM;
+        write_item(&mut out[start..start + at::ITEM], *index);
+    }
+
+    // `Move(Pran.Inventory, Packet.Inventory, 42 * SizeOf(TItem))`. The client
+    // really does read these: `rep movsd 0xD2` from body 384, which is eight
+    // hundred and forty bytes, in its own handler for this packet.
+    for (slot, index) in pran.inventory.iter().enumerate() {
+        if *index == 0 {
+            continue;
+        }
+        let start = at::INVENTORY + slot * at::ITEM;
         write_item(&mut out[start..start + at::ITEM], *index);
     }
 
@@ -1216,8 +1244,18 @@ mod tests {
         // An empty slot is still zero, or the client draws item nought in it.
         let empty = at::EQUIPMENT + at::ITEM;
         assert!(body[empty..empty + at::ITEM].iter().all(|b| *b == 0));
-        // The bag is a container this server does not keep yet.
-        assert!(body[at::INVENTORY..at::BAR].iter().all(|b| *b == 0));
+        // And its own bag, with the Pran Bag in the fortieth slot -- the one
+        // item `FinishQuest` puts there, and eight hundred and forty bytes
+        // the client really reads.
+        let bag = at::INVENTORY + BAG_SLOT * at::ITEM;
+        assert_eq!(
+            u16::from_le_bytes(body[bag..bag + 2].try_into().unwrap()),
+            HATCHLING_BAG_ITEM,
+        );
+        assert!(
+            body[at::INVENTORY..bag].iter().all(|b| *b == 0),
+            "something turned up in a bag slot nothing was put in",
+        );
         // The first three carry a level, so the field is not blank: it is
         // 1, 4, 16 -- `2^1 - 1` times one, four and sixteen.
         assert_eq!(&body[at::SKILL_LEVELS..at::SKILL_LEVELS + 3], &[1, 4, 16]);

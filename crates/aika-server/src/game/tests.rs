@@ -2559,6 +2559,127 @@ async fn a_pran_is_drawn_under_an_id_of_its_own() {
     let title = String::from_utf8_lossy(&title[..title.iter().position(|b| *b == 0).unwrap()]);
     assert!(title.starts_with("Pran do "), "the title reads {title:?}");
 }
+/// One step, to wherever.
+fn walk_to(x: f32, y: f32) -> Message {
+    let mut body = vec![0u8; Movement::BODY_SIZE];
+    body[0..4].copy_from_slice(&x.to_le_bytes());
+    body[4..8].copy_from_slice(&y.to_le_bytes());
+    body[Movement::SPEED] = 50;
+    Message { sender: TEST_CLIENT_ID, opcode: OP_MOVE, time: 0, body }
+}
+
+/// A companion with a body of its own, out and standing beside its owner.
+async fn with_a_companion_out(state: &State) -> Session {
+    let mut session = in_world(state).await;
+    carrying_stone(&mut session, 4242);
+    handle_message(state, &mut session, &wear_stone()).await;
+    // Past the first wall, so it has a body rather than being an effect on
+    // the player.
+    session.account.as_mut().unwrap().prans[0].class = 63;
+    handle_message(state, &mut session, &take_stone_off()).await;
+    handle_message(state, &mut session, &wear_stone()).await;
+    assert!(session.pran_body.is_some(), "no body was drawn to follow with");
+    session
+}
+
+/// The move packet the server sent on the companion's behalf, if it sent one.
+fn companion_step(frames: &[Vec<u8>]) -> Option<Message> {
+    frames
+        .iter()
+        .map(|f| decode(f))
+        .find(|m| m.opcode == OP_MOVE && crate::pran::IDS.contains(&(m.sender as u32)))
+}
+
+/// A companion follows by being sent an ordinary move packet under its own
+/// id. Without it the body is drawn once where the player was standing and
+/// stays there for the rest of the session.
+#[tokio::test]
+async fn a_companion_follows_the_player() {
+    let state = buff_state();
+    let mut session = with_a_companion_out(&state).await;
+    let (x, y) = {
+        let c = session.character.as_ref().unwrap();
+        (c.x as f32, c.y as f32)
+    };
+
+    let frames = frames_of(handle_message(&state, &mut session, &walk_to(x + 40.0, y)).await);
+
+    let step = companion_step(&frames).expect("the companion was left behind");
+    let to = (
+        f32::from_le_bytes(step.body[0..4].try_into().unwrap()),
+        f32::from_le_bytes(step.body[4..8].try_into().unwrap()),
+    );
+    assert!(
+        within(to, (x + 40.0, y), 2.0),
+        "it was sent to {to:?}, which is not beside the player",
+    );
+    assert_eq!(step.body[Movement::MOVE_TYPE], MOVE_NORMAL, "a teleport, not a walk");
+    assert_eq!(session.pran_at, Some(to), "the server lost track of where it put the body");
+}
+
+/// The owner has to be told too. `SendToVisible(..., True)` includes them, and
+/// they are the one person who would otherwise never see their own companion
+/// move.
+#[tokio::test]
+async fn the_owner_sees_their_own_companion_move() {
+    let state = buff_state();
+    let mut session = with_a_companion_out(&state).await;
+    let (x, y) = {
+        let c = session.character.as_ref().unwrap();
+        (c.x as f32, c.y as f32)
+    };
+
+    let frames = frames_of(handle_message(&state, &mut session, &walk_to(x + 40.0, y)).await);
+    assert!(companion_step(&frames).is_some(), "the move went to everyone but its owner");
+}
+
+/// A step the world does not notice moves nothing. The original only acts
+/// once the player is three from where it last looked, and a packet per step
+/// would be one per walking animation frame.
+#[tokio::test]
+async fn a_small_step_does_not_move_the_companion() {
+    let state = buff_state();
+    let mut session = with_a_companion_out(&state).await;
+    let (x, y) = {
+        let c = session.character.as_ref().unwrap();
+        (c.x as f32, c.y as f32)
+    };
+
+    // A step that changes nothing else answers nothing at all, which is
+    // already the absence being tested for.
+    let frames = match handle_message(&state, &mut session, &walk_to(x + 1.0, y)).await {
+        Action::Reply(frames) => frames,
+        _ => Vec::new(),
+    };
+    assert!(companion_step(&frames).is_none(), "one step was worth a packet");
+}
+
+/// It walks a little slower than its owner while it is keeping up, and
+/// hurries when it has been left behind.
+#[tokio::test]
+async fn a_companion_left_behind_hurries() {
+    let state = buff_state();
+    let mut session = with_a_companion_out(&state).await;
+    let (x, y) = {
+        let c = session.character.as_ref().unwrap();
+        (c.x as f32, c.y as f32)
+    };
+
+    let close = frames_of(handle_message(&state, &mut session, &walk_to(x + 10.0, y)).await);
+    let keeping_up = companion_step(&close).expect("no step").body[Movement::SPEED];
+
+    // Leave the body where it is and run.
+    session.pran_at = Some((x, y));
+    let far = frames_of(handle_message(&state, &mut session, &walk_to(x + 400.0, y)).await);
+    let hurrying = companion_step(&far).expect("no step").body[Movement::SPEED];
+
+    assert_eq!(
+        hurrying as i32 - keeping_up as i32,
+        20,
+        "keeping up is the owner's pace less ten and hurrying is it plus ten"
+    );
+}
+
 /// The effect values in a burst of frames.
 ///
 /// An effect is not its own packet: it shares `0x117` with the client index,

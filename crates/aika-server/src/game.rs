@@ -587,6 +587,14 @@ pub(crate) struct Session {
     /// (`TPlayer.SkillUpgraded`). Per connection in the original too, so
     /// logging out clears it.
     skill_upgraded: Option<usize>,
+    /// Where the player was standing when the world last took notice of it
+    /// moving. The original keeps two positions and this is the coarse one
+    /// (`Player^.Character.LastPos`): the fine one follows every step, this
+    /// one only catches up once the player is [`STEP_NOTICED`] away, and what
+    /// hangs off it is the companion following and the NPC window closing.
+    walked_from: (f32, f32),
+    /// Where the companion's body is standing, while it has one.
+    pran_at: Option<(f32, f32)>,
 }
 
 impl Session {
@@ -1222,6 +1230,9 @@ fn handle_client_ready(state: &State, session: &mut Session) -> Action {
     }
 
     session.spawned = true;
+    // Where the coarse position starts. Left at the origin it would read as
+    // three thousand units of walking on the player's very first step.
+    session.walked_from = (character.x as f32, character.y as f32);
     state.world.enter(session.client_id, character.clone());
 
     let skills = known_skills(state, &character);
@@ -1516,6 +1527,18 @@ fn handle_move(state: &State, session: &mut Session, message: &Message) -> Actio
     }
     state.world.move_to(session.client_id, x, y);
 
+    // The original keeps a second, coarser position and only acts on it once
+    // the player is three away from it. Everything that would be silly to do
+    // per step hangs off that: the shop closing behind somebody who walks off,
+    // and the companion following.
+    let mut trailing = Vec::new();
+    if !within((movement.x, movement.y), session.walked_from, STEP_NOTICED) {
+        session.walked_from = (movement.x, movement.y);
+        session.opened_npc = None;
+        session.opened_option = 0;
+        trailing = follow_with_pran(state, session);
+    }
+
     // Standing up. A player who walks is no longer sitting or dancing, so the
     // next person to come into view must not be told that they are — the
     // original clears it at the end of `MovementCommand`.
@@ -1536,7 +1559,92 @@ fn handle_move(state: &State, session: &mut Session, message: &Message) -> Actio
     );
     state.world.send_to_visible(session.client_id, relay);
 
-    refresh_visibility(state, session)
+    match refresh_visibility(state, session) {
+        Action::Reply(mut frames) => {
+            frames.extend(trailing);
+            Action::Reply(frames)
+        }
+        other if trailing.is_empty() => other,
+        _ => Action::Reply(trailing),
+    }
+}
+
+/// How far a player walks before the world takes any notice
+/// (`not LastPos.InRange(Character.LastPos, 3)`).
+const STEP_NOTICED: f32 = 3.0;
+/// How far the chosen spot has to be from where the companion stands before it
+/// is worth moving it at all.
+const PRAN_STEP: f32 = 2.0;
+/// Past this the companion is left behind and hurries
+/// (`not InRange(LastPos, 25)`).
+const PRAN_TRAILING: f32 = 25.0;
+/// How much slower it walks when it is keeping up, and faster when it is not.
+const PRAN_PACE: u32 = 10;
+/// The spots the original draws from when the companion follows. It keeps
+/// nine and picks from the first seven here (`Neighbors[Random(7)]`), where
+/// the spawn picks from eight.
+const PRAN_FOLLOW_SPOTS: usize = 7;
+
+/// The companion walking after its owner (`MovementCommand`,
+/// `PacketHandlers.pas:922`).
+///
+/// It is not an AI and it does not path: the server picks one of the spots
+/// beside the player, decides it is far enough from where the body stands to
+/// be worth moving, and sends an ordinary `0x301` with the companion's own id
+/// in the header. The client walks it there. That is the whole of following.
+///
+/// The packet goes to the owner as well as to everyone nearby
+/// (`SendToVisible(..., True)`) — without the owner it is the one person who
+/// cannot see their own companion move.
+fn follow_with_pran(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+    let Some(pran_id) = session.pran_body else {
+        return Vec::new();
+    };
+    let Some(standing) = session.pran_at else {
+        return Vec::new();
+    };
+    let Some(owner) = session.character.as_ref() else {
+        return Vec::new();
+    };
+
+    let at = (owner.x as f32, owner.y as f32);
+    let spot = neighbour_spot(at, rand::random::<usize>() % PRAN_FOLLOW_SPOTS);
+    // Already close enough to that spot to not be worth a packet.
+    if within(spot, standing, PRAN_STEP) {
+        return Vec::new();
+    }
+
+    // A companion that is keeping up walks slightly slower than its owner, and
+    // one that has been left behind hurries. Both are read off the owner,
+    // which is what keeps a mounted player's companion with them.
+    //
+    // The original asks whether the *spot* is far from the player, which it
+    // can only be because its list of spots is refreshed on the visibility
+    // tick and goes stale while somebody runs — so the question it is really
+    // asking is whether the companion has been left behind. These spots are
+    // worked out from where the player is standing now, so a stale one is
+    // impossible and the test has to be asked of the companion directly, or
+    // it can never be true and nothing ever hurries.
+    let owner_speed = stats::of(owner, &state.items, &session.effects(state)).speed_move;
+    let speed = if within(standing, at, PRAN_TRAILING) {
+        owner_speed.saturating_sub(PRAN_PACE)
+    } else {
+        owner_speed.saturating_add(PRAN_PACE)
+    };
+
+    session.pran_at = Some(spot);
+    let frame = frame::encode(
+        &Message {
+            sender: pran_id as u16,
+            opcode: OP_MOVE,
+            time: PACKET_TIME,
+            body: Movement { x: spot.0, y: spot.1, move_type: MOVE_NORMAL, speed: speed as u8 }
+                .to_body(),
+        },
+        rand::random(),
+    );
+    state.world.send_to_visible(session.client_id, frame.clone());
+    vec![frame]
 }
 
 /// Spawns and removes players as they walk into and out of range.
@@ -1775,10 +1883,23 @@ impl Movement {
         })
     }
 
-    /// Mesma checagem do original (`TPosition.IsValid`): recusa infinito e
-    /// NaN. Note that `(0, 0)` passes, as it did there.
+    /// The original's own check (`TPosition.IsValid`): infinity and NaN are
+    /// refused. Note that `(0, 0)` passes, as it did there.
     pub fn is_valid(&self) -> bool {
         self.x.is_finite() && self.y.is_finite()
+    }
+
+    /// The same twenty bytes going the other way, for a move the server makes
+    /// on somebody's behalf. The six between the position and the type are the
+    /// record's own `Null`, and the four after it its `Unk`; the original
+    /// zeroes the whole packet and fills three fields, so they stay zero.
+    pub fn to_body(self) -> Vec<u8> {
+        let mut body = vec![0u8; Self::BODY_SIZE];
+        body[0..4].copy_from_slice(&self.x.to_le_bytes());
+        body[4..8].copy_from_slice(&self.y.to_le_bytes());
+        body[Self::MOVE_TYPE] = self.move_type;
+        body[Self::SPEED] = self.speed;
+        body
     }
 }
 
@@ -4238,6 +4359,7 @@ fn evolve_the_pran(state: &State, session: &mut Session) -> Option<Vec<Vec<u8>>>
             let speed = stats::of(owner, &state.items, &Effects::none()).speed_move;
             frames.push(encode_pran_spawn(pran, owner, pran_id, at, speed));
             session.pran_body = Some(pran_id);
+            session.pran_at = Some(at);
         }
     }
 
@@ -4404,6 +4526,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     frames.push(described);
     frames.push(aged);
     session.pran_body = Some(pran_id);
+    session.pran_at = Some(at);
     frames
 }
 

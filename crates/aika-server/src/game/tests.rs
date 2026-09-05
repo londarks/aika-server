@@ -2654,6 +2654,65 @@ async fn a_small_step_does_not_move_the_companion() {
     assert!(companion_step(&frames).is_none(), "one step was worth a packet");
 }
 
+/// Behind means behind, whichever way the player turns. The original picks
+/// one of two diagonal corners at random and knows nothing about which way
+/// anybody is facing, so half its choices are the corner the player is
+/// walking into.
+#[test]
+fn a_companion_is_placed_behind_whoever_it_follows() {
+    let at = (100.0, 100.0);
+
+    for side in [1.0, -1.0] {
+        let east = trailing_spot(at, (1.0, 0.0), side);
+        assert!(east.0 < at.0, "walking east it was put at {east:?}, which is ahead");
+
+        let west = trailing_spot(at, (-1.0, 0.0), side);
+        assert!(west.0 > at.0, "walking west it was put at {west:?}, which is ahead");
+
+        let north = trailing_spot(at, (0.0, 1.0), side);
+        assert!(north.1 < at.1, "walking north it was put at {north:?}, which is ahead");
+
+        // And never further off than the original's own spots reach.
+        for spot in [east, west, north] {
+            assert!(within(spot, at, 1.3), "{spot:?} is further out than the original ever puts it");
+        }
+    }
+
+    // The two sides really are opposite sides, or holding one of them means
+    // nothing.
+    let left = trailing_spot(at, (1.0, 0.0), 1.0);
+    let right = trailing_spot(at, (1.0, 0.0), -1.0);
+    assert_ne!(left, right);
+
+    // Standing still has no direction to trail from and must still answer.
+    let still = trailing_spot(at, (0.0, 0.0), 1.0);
+    assert!(within(still, at, 1.3), "a companion of somebody standing still went to {still:?}");
+}
+
+/// Walking out and back is what showed the problem: the companion overtook
+/// the player on the way back.
+#[tokio::test]
+async fn turning_round_does_not_send_the_companion_out_in_front() {
+    let state = buff_state();
+    let mut session = with_a_companion_out(&state).await;
+    let (x, y) = {
+        let c = session.character.as_ref().unwrap();
+        (c.x as f32, c.y as f32)
+    };
+
+    // Out...
+    let out = frames_of(handle_message(&state, &mut session, &walk_to(x + 40.0, y)).await);
+    let spot = companion_step(&out).expect("no step going out");
+    let spot_x = f32::from_le_bytes(spot.body[0..4].try_into().unwrap());
+    assert!(spot_x < x + 40.0, "going out it was sent ahead, to {spot_x}");
+
+    // ...and back.
+    let back = frames_of(handle_message(&state, &mut session, &walk_to(x, y)).await);
+    let spot = companion_step(&back).expect("no step coming back");
+    let spot_x = f32::from_le_bytes(spot.body[0..4].try_into().unwrap());
+    assert!(spot_x > x, "coming back it was sent ahead, to {spot_x}");
+}
+
 /// It walks a little slower than its owner while it is keeping up, and
 /// hurries when it has been left behind.
 #[tokio::test]

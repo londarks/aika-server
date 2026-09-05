@@ -595,6 +595,10 @@ pub(crate) struct Session {
     walked_from: (f32, f32),
     /// Where the companion's body is standing, while it has one.
     pran_at: Option<(f32, f32)>,
+    /// Which side of its owner it walks on, drawn once when it comes out and
+    /// held after that. Redrawing it every step is what made it weave across
+    /// the player rather than follow them.
+    pran_side: f32,
 }
 
 impl Session {
@@ -1533,10 +1537,13 @@ fn handle_move(state: &State, session: &mut Session, message: &Message) -> Actio
     // and the companion following.
     let mut trailing = Vec::new();
     if !within((movement.x, movement.y), session.walked_from, STEP_NOTICED) {
+        // Where the player came from, which is the only thing that says which
+        // way they are walking.
+        let from = session.walked_from;
         session.walked_from = (movement.x, movement.y);
         session.opened_npc = None;
         session.opened_option = 0;
-        trailing = follow_with_pran(state, session);
+        trailing = follow_with_pran(state, session, from);
     }
 
     // Standing up. A player who walks is no longer sitting or dancing, so the
@@ -1580,10 +1587,45 @@ const PRAN_STEP: f32 = 2.0;
 const PRAN_TRAILING: f32 = 25.0;
 /// How much slower it walks when it is keeping up, and faster when it is not.
 const PRAN_PACE: u32 = 10;
-/// The spots the original draws from when the companion follows. It keeps
-/// nine and picks from the first seven here (`Neighbors[Random(7)]`), where
-/// the spawn picks from eight.
-const PRAN_FOLLOW_SPOTS: usize = 7;
+/// How far behind its owner a companion walks, and how far off to its side.
+///
+/// Kept inside the spread the original's own spots cover: those sit on the
+/// diagonal from half a unit out to nine tenths, so between 0.71 and 1.27 away.
+/// These two make 1.12, which is the middle of that.
+const PRAN_BEHIND: f32 = 1.0;
+const PRAN_BESIDE: f32 = 0.5;
+
+/// Where a companion should be standing, given which way its owner is walking.
+///
+/// # Why this is not the original's
+///
+/// `SetCurrentNeighbors` keeps nine spots and `MovementCommand` picks one at
+/// random. All nine are on the same diagonal — `(x - d, y - d)` on even
+/// indices and `(x + d, y + d)` on odd — so the choice is really between two
+/// corners, and **nothing in it knows which way the player is facing**. Half
+/// the time the companion is sent to the corner the player is walking
+/// towards, which is how it ends up in front; and because the side is redrawn
+/// every time, it crosses back and forth across its owner as they walk.
+///
+/// This asks the direction of travel instead. The companion trails behind the
+/// player and holds the side it was given when it came out, which is what a
+/// thing following somebody looks like. The distances are the original's.
+fn trailing_spot(at: (f32, f32), heading: (f32, f32), side: f32) -> (f32, f32) {
+    let length = (heading.0 * heading.0 + heading.1 * heading.1).sqrt();
+    if !length.is_normal() {
+        // Nowhere to trail from. Standing beside them is the honest answer,
+        // and it is where the original would have put it anyway.
+        return (at.0 + PRAN_BESIDE * side, at.1 + PRAN_BEHIND);
+    }
+    let forward = (heading.0 / length, heading.1 / length);
+    // Turned a quarter, so the companion sits off to one side of the line
+    // rather than directly in the way of whoever it is following.
+    let across = (-forward.1, forward.0);
+    (
+        at.0 - forward.0 * PRAN_BEHIND + across.0 * PRAN_BESIDE * side,
+        at.1 - forward.1 * PRAN_BEHIND + across.1 * PRAN_BESIDE * side,
+    )
+}
 
 /// The companion walking after its owner (`MovementCommand`,
 /// `PacketHandlers.pas:922`).
@@ -1596,7 +1638,7 @@ const PRAN_FOLLOW_SPOTS: usize = 7;
 /// The packet goes to the owner as well as to everyone nearby
 /// (`SendToVisible(..., True)`) — without the owner it is the one person who
 /// cannot see their own companion move.
-fn follow_with_pran(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+fn follow_with_pran(state: &State, session: &mut Session, from: (f32, f32)) -> Vec<Vec<u8>> {
     let Some(pran_id) = session.pran_body else {
         return Vec::new();
     };
@@ -1608,7 +1650,7 @@ fn follow_with_pran(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     };
 
     let at = (owner.x as f32, owner.y as f32);
-    let spot = neighbour_spot(at, rand::random::<usize>() % PRAN_FOLLOW_SPOTS);
+    let spot = trailing_spot(at, (at.0 - from.0, at.1 - from.1), session.pran_side);
     // Already close enough to that spot to not be worth a packet.
     if within(spot, standing, PRAN_STEP) {
         return Vec::new();
@@ -4360,6 +4402,7 @@ fn evolve_the_pran(state: &State, session: &mut Session) -> Option<Vec<Vec<u8>>>
             frames.push(encode_pran_spawn(pran, owner, pran_id, at, speed));
             session.pran_body = Some(pran_id);
             session.pran_at = Some(at);
+            session.pran_side = pran_side();
         }
     }
 
@@ -4527,6 +4570,7 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     frames.push(aged);
     session.pran_body = Some(pran_id);
     session.pran_at = Some(at);
+    session.pran_side = pran_side();
     frames
 }
 
@@ -4635,6 +4679,16 @@ fn encode_pran_spawn(
 fn pran_client_id(client_id: u16) -> Option<u32> {
     let id = pran::IDS.start() + client_id as u32 - 1;
     pran::IDS.contains(&id).then_some(id)
+}
+
+/// Which side of its owner a companion walks on. Drawn once, when it comes
+/// out, so that it keeps to that side rather than weaving.
+fn pran_side() -> f32 {
+    if rand::random::<bool>() {
+        1.0
+    } else {
+        -1.0
+    }
 }
 
 /// Where a companion is put down.

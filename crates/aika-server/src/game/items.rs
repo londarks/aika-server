@@ -488,7 +488,11 @@ pub(crate) fn session_heal(current: &mut u32, by: u32, ceiling: u32) {
 /// of nothing clears the slot; kinds it keeps on the pran rather than the
 /// character (1 and 3) leave the character's bar untouched. It then echoes the
 /// packet straight back, which is how the client confirms the change.
-pub(crate) fn handle_change_item_bar(session: &mut Session, message: &Message) -> Action {
+pub(crate) fn handle_change_item_bar(
+    state: &State,
+    session: &mut Session,
+    message: &Message,
+) -> Action {
     if message.body.len() < 12 {
         warn!(size = message.body.len(), "0x31E packet too short");
         return Action::Ignore;
@@ -511,9 +515,11 @@ pub(crate) fn handle_change_item_bar(session: &mut Session, message: &Message) -
         0 => character.item_bar[dest] = 0,
         2 => character.item_bar[dest] = ability::on_bar(src as usize),
         6 => character.item_bar[dest] = src,
-        // Kinds 1 and 3 belong to the pran's bar, which we do not keep yet.
+        // Three is the *companion's* bar, which is a different bar with three
+        // slots of its own, and it is the only way a pran skill is ever cast.
+        PRAN_BAR => return put_on_the_pran_bar(state, session, dest, src),
         other => {
-            debug!(kind = other, "item-bar change for a kind we do not store");
+            debug!(kind = other, "item-bar change for a kind the original refuses");
             return Action::Ignore;
         }
     }
@@ -530,6 +536,75 @@ pub(crate) fn handle_change_item_bar(session: &mut Session, message: &Message) -
         rand::random(),
     );
     Action::Reply(vec![echo])
+}
+
+/// The kind that names the companion's bar rather than the player's
+/// (`ChangeItemBar`, `$3`).
+const PRAN_BAR: u32 = 3;
+
+/// `0x31E` with kind three: a skill dragged onto the companion's own bar.
+///
+/// A different bar from the player's, three slots wide, kept on the pran and
+/// not on the character -- and the only way a pran skill is ever cast, which
+/// is why a companion whose bar was never stored could not use one of the ten
+/// skills it had been growing all along.
+///
+/// What travels is not the skill id but the id counted from its element's
+/// base, so the fourth skill is 31 whether the companion is fire, water or
+/// air. The original validates it against `SkillData[SrcIndex + 5760]` --
+/// the fire base, whatever the element -- and gets away with it because the
+/// three elements mirror each other slot for slot.
+///
+/// # Only five of the ten may go there
+///
+/// `if (SkillData[SrcIndex + 5760].Duration = 0) and (SrcIndex <> 0) then Exit`.
+/// Five of a pran's skills carry a duration and five do not, and the five that
+/// do not are the passives, which work by being known rather than by being
+/// used. Nought is let through because that is the clear.
+fn put_on_the_pran_bar(
+    state: &State,
+    session: &mut Session,
+    dest: usize,
+    src: u32,
+) -> Action {
+    if dest >= pran::BAR_SLOTS {
+        warn!(dest, "0x31E for a companion bar slot that does not exist");
+        return Action::Ignore;
+    }
+    let Some(at) = session.pran_out else {
+        debug!("0x31E for a companion bar with no companion out");
+        return Action::Ignore;
+    };
+
+    // A passive has no duration and cannot be put on a bar. Clearing the slot
+    // is the one thing that skips the test.
+    if src != 0 {
+        let lasts = state
+            .skills
+            .get((src + pran::Element::Fire.skill_base()) as usize)
+            .is_some_and(|skill| skill.duration_secs() != 0);
+        if !lasts {
+            debug!(src, "a companion skill with no duration cannot go on a bar");
+            return Action::Ignore;
+        }
+    }
+
+    let Some(account) = session.account.as_mut() else {
+        return Action::Ignore;
+    };
+    let Some(pran) = account.prans.get_mut(at) else {
+        return Action::Ignore;
+    };
+    let Ok(value) = u8::try_from(src) else {
+        warn!(src, "0x31E companion bar entry out of range");
+        return Action::Ignore;
+    };
+    pran.bar[dest] = value;
+    // The companions are written wherever the chest is, and that is this flag.
+    session.dirty = true;
+    info!(slot = dest, skill = src, "companion bar set");
+
+    Action::Reply(vec![encode_item_bar_slot(dest, PRAN_BAR, src)])
 }
 
 /// `RefreshItemBarSlot` (`Mob/Player.pas:4387`): the server changed a hotbar

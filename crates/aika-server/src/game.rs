@@ -599,6 +599,11 @@ pub(crate) struct Session {
     /// held after that. Redrawing it every step is what made it weave across
     /// the player rather than follow them.
     pran_side: f32,
+    /// `TPlayer.FaericForm`: the companion has been turned into a fairy by its
+    /// own Forma Faerica skill. `PranIsFairy` is true for the first class of
+    /// each element **or** for this, so while it is on a grown companion is
+    /// drawn the way a hatchling is -- a glow on the player and no body.
+    faeric_form: bool,
 }
 
 impl Session {
@@ -1028,7 +1033,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         ability::OP_USE_SKILL => handle_use_skill(state, session, message),
         OP_DELETE_ITEM => handle_delete_item(session, message),
         OP_CHAT => handle_chat(state, session, message),
-        OP_CHANGE_ITEM_BAR => handle_change_item_bar(session, message),
+        OP_CHANGE_ITEM_BAR => handle_change_item_bar(state, session, message),
         OP_GROUP_ITEM => handle_group_item(state, session, message),
         OP_UNGROUP_ITEM => handle_ungroup_item(state, session, message),
         OP_LEARN_SKILL => handle_learn_skill(state, session, message),
@@ -3419,7 +3424,79 @@ fn encode_skills_level(character: &Character, client_id: u16) -> Vec<u8> {
 /// then works out what it did (`PacketHandlers.pas:7550`). Same order here:
 /// the relay is what makes a spell look like it happened.
 fn handle_use_skill(state: &State, session: &mut Session, message: &Message) -> Action {
-    cast_skill(state, session, message, ability::Named::ByTheClient)
+    // A companion's own skills are none of the caster's class and would fail
+    // the ownership test that stops a client naming a spell it never learned,
+    // exactly as a mount's do. They are answered here first.
+    match cast_pran_skill(state, session, message) {
+        Some(action) => action,
+        None => cast_skill(state, session, message, ability::Named::ByTheClient),
+    }
+}
+
+/// One of the companion's ten, or `None` when the id is not one of them.
+///
+/// The ten sit at 5761, 5861 and 5961 by element, ten ranks apart, just past
+/// the sixth class's block -- so `belongs_to` refuses every one of them and
+/// they have to come in by the door the mount's skills use.
+///
+/// Forma Faerica is the one that does something other than damage, and it is
+/// the whole of `SelfBuffSkill`'s `196, 220, 244` arm
+/// (`Mob/BaseMob.pas:7626`): it turns the companion into a fairy and back.
+fn cast_pran_skill(
+    state: &State,
+    session: &mut Session,
+    message: &Message,
+) -> Option<Action> {
+    let request = ability::UseSkill::parse(&message.body)?;
+    let at = session.pran_out?;
+    let pran = session.account.as_ref()?.prans.get(at)?;
+    let element = pran.element()?;
+    let slot = pran::skill_slot(element, request.skill)?;
+
+    if pran.skill_levels.get(slot).copied().unwrap_or(0) == 0 {
+        debug!(skill = request.skill, slot, "a companion skill it has not learned");
+        return Some(Action::Reply(vec![encode_client_message(
+            session.client_id,
+            "Sua pran ainda nao aprendeu essa habilidade.",
+        )]));
+    }
+
+    if slot == pran::TRANSFORM_SKILL {
+        return Some(Action::Reply(take_faeric_form(state, session)));
+    }
+
+    // Everything else is an ordinary cast that the server, rather than the
+    // client, is vouching for.
+    Some(cast_skill(state, session, message, ability::Named::ByTheServer))
+}
+
+/// Forma Faerica: the companion becomes a fairy, or stops being one.
+///
+/// `SelfBuffSkill` does the same three things either way -- take away what is
+/// drawn, flip the flag, and draw it again -- and the flag is what decides
+/// which of the two the drawing turns out to be. Going *in*, the body is
+/// removed and the glow appears; coming *out*, the glow is cleared first
+/// (`SendEffect(0)`) and the body comes back.
+fn take_faeric_form(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    let becoming = !session.faeric_form;
+
+    if becoming {
+        // The body goes, and `dismiss_pran` would forget which companion is
+        // worn, which this must not do -- it is still worn, it is just a
+        // fairy now.
+        if let Some(pran_id) = session.pran_body.take() {
+            frames.push(encode_remove_mob(pran_id as u16, 0));
+        }
+    } else {
+        frames.push(encode_effect(session.client_id, EFFECT_NONE));
+    }
+
+    session.faeric_form = becoming;
+    session.pran_at = None;
+    frames.extend(pran_frames(state, session));
+    info!(faeric = becoming, "companion changed form");
+    frames
 }
 
 /// The casting itself, told who chose the skill.
@@ -4542,7 +4619,9 @@ fn pran_frames(state: &State, session: &mut Session) -> Vec<Vec<u8>> {
     // the player, one per element, and that is the whole of how it shows.
     // Every form after it is a companion of its own, standing beside the
     // player under an id from the pran range.
-    if !pran.has_body() {
+    // `not PranIsFairy`, which is the class *and* the player's own faeric
+    // form: the skill turns a grown companion back into a glow.
+    if !pran.has_body() || session.faeric_form {
         session.pran_body = None;
         if let Some(element) = pran.element() {
             frames.push(encode_effect(client_id, element.fairy_effect()));

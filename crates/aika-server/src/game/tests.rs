@@ -1658,6 +1658,20 @@ fn buff_state() -> State {
         // And one that is aimed at something else, and lasts: the shape of
         // the skill that froze a session.
         define(ROOTING_ATTACK, ROOTING_FAMILY, 60, AIMED_AT_SOMETHING);
+        // The companion's ten, of which the five with a duration are the ones
+        // that may go on its bar. Fire's, since the fixture hatches fire.
+        for slot in 0..crate::pran::SKILLS {
+            let id = crate::pran::Element::Fire.first_skill() as usize
+                + slot * crate::pran::RANKS_PER_SKILL as usize;
+            // Slots 2, 3, 5, 7 and 9 carry a duration in the real table, and
+            // the transform skill's is the one that never runs out.
+            let seconds = match slot {
+                crate::pran::TRANSFORM_SKILL => u32::MAX,
+                2 | 5 | 7 | 9 => 30,
+                _ => 0,
+            };
+            define(id, 900 + slot as u32, seconds, TARGET_TYPE_SELF);
+        }
         SkillTable::decode(&raw).expect("the fixture table is malformed")
     };
     state
@@ -2737,6 +2751,106 @@ async fn a_companion_left_behind_hurries() {
         20,
         "keeping up is the owner's pace less ten and hurrying is it plus ten"
     );
+}
+
+fn pran_bar_drag(slot: u32, skill_offset: u32) -> Message {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&slot.to_le_bytes());
+    body.extend_from_slice(&3u32.to_le_bytes()); // the companion's bar
+    body.extend_from_slice(&skill_offset.to_le_bytes());
+    Message { sender: TEST_CLIENT_ID, opcode: OP_CHANGE_ITEM_BAR, time: 0, body }
+}
+
+/// The companion's bar is a bar of its own, and it is the only way one of its
+/// ten skills is ever cast. It was thrown away as "a kind we do not store",
+/// which left every pran skill unreachable however far it had grown.
+#[tokio::test]
+async fn a_companion_skill_can_be_put_on_its_own_bar() {
+    let state = buff_state();
+    let mut session = with_a_companion_out(&state).await;
+
+    // The fourth skill, which is Forma Faerica and carries a duration.
+    let transform = 1 + crate::pran::TRANSFORM_SKILL as u32 * crate::pran::RANKS_PER_SKILL;
+    let frames = frames_of(handle_message(&state, &mut session, &pran_bar_drag(1, transform)).await);
+
+    let at = session.pran_out.unwrap();
+    assert_eq!(
+        session.account.as_ref().unwrap().prans[at].bar[1],
+        transform as u8,
+        "the companion's bar did not keep it",
+    );
+    let echo = decode(&frames[0]);
+    assert_eq!(echo.opcode, OP_CHANGE_ITEM_BAR);
+    assert_eq!(u32::from_le_bytes(echo.body[4..8].try_into().unwrap()), 3, "the wrong bar");
+}
+
+/// Five of the ten carry no duration, and those are the passives: they work
+/// by being known and the original refuses to put one on a bar.
+#[tokio::test]
+async fn a_passive_companion_skill_stays_off_the_bar() {
+    let state = buff_state();
+    let mut session = with_a_companion_out(&state).await;
+
+    // The first skill, Bravura, whose duration is nought.
+    let passive = 1u32;
+    handle_message(&state, &mut session, &pran_bar_drag(0, passive)).await;
+
+    let at = session.pran_out.unwrap();
+    assert_eq!(session.account.as_ref().unwrap().prans[at].bar[0], 0, "a passive reached the bar");
+}
+
+/// Forma Faerica turns a grown companion back into a fairy: the body goes and
+/// the glow of its element appears on the player. Casting it again undoes it.
+#[tokio::test]
+async fn the_transform_skill_turns_a_companion_into_a_fairy_and_back() {
+    let state = buff_state();
+    let mut session = with_a_companion_out(&state).await;
+    let drawn_as = session.pran_body.expect("it never had a body");
+    // The first evolution is what grants it: a hatchling knows the first
+    // three and this is the fourth.
+    let at = session.pran_out.unwrap();
+    session.account.as_mut().unwrap().prans[at].skill_levels[crate::pran::TRANSFORM_SKILL] = 1;
+
+    let transform = crate::pran::Element::Fire.first_skill()
+        + crate::pran::TRANSFORM_SKILL as u32 * crate::pran::RANKS_PER_SKILL;
+    let frames =
+        frames_of(handle_message(&state, &mut session, &cast_message(transform, 0)).await);
+
+    assert!(session.faeric_form, "it did not become a fairy");
+    assert_eq!(session.pran_body, None, "the body is still on the field");
+    let removed = frames.iter().map(|f| decode(f)).find(|m| m.opcode == OP_REMOVE_MOB);
+    assert_eq!(
+        removed.map(|m| u32::from_le_bytes(m.body[0..4].try_into().unwrap())),
+        Some(drawn_as),
+        "the body it was drawn as was never taken off",
+    );
+    assert!(
+        effects_in(&frames).contains(&crate::pran::Element::Fire.fairy_effect()),
+        "no glow went on the player",
+    );
+
+    // And back again.
+    let frames =
+        frames_of(handle_message(&state, &mut session, &cast_message(transform, 0)).await);
+    assert!(!session.faeric_form, "it stayed a fairy");
+    assert!(session.pran_body.is_some(), "the body never came back");
+    assert!(effects_in(&frames).contains(&0), "the glow was not cleared first");
+}
+
+/// A skill the companion has never learned is refused, and says so.
+#[tokio::test]
+async fn a_companion_skill_it_never_learned_is_refused() {
+    let state = buff_state();
+    let mut session = with_a_companion_out(&state).await;
+    // The tenth, which a hatchling has not learned: only the first three
+    // carry a level.
+    let unlearned = crate::pran::Element::Fire.first_skill() + 9 * crate::pran::RANKS_PER_SKILL;
+
+    let frames =
+        frames_of(handle_message(&state, &mut session, &cast_message(unlearned, 0)).await);
+
+    assert_eq!(decode(&frames[0]).opcode, OP_CLIENT_MESSAGE, "it did not refuse");
+    assert!(!session.faeric_form);
 }
 
 /// The effect values in a burst of frames.

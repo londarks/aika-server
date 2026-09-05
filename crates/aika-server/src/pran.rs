@@ -143,6 +143,32 @@ impl Element {
             Element::Air => 5961,
         }
     }
+
+    /// What the skill bar counts from, which is one below the first skill
+    /// (`baseSkillPran` in `AddPranLevel`: 5760, 5860, 5960).
+    pub fn skill_base(self) -> u32 {
+        self.first_skill() - 1
+    }
+}
+
+/// How many skills a companion carries on its bar (`ItemBar: Array [0..2]`).
+pub const BAR_SLOTS: usize = 3;
+
+/// What the bar holds for a skill: the id counted from its element's base, so
+/// the same slot is the same number whichever element the pran is -- the
+/// fourth skill is 31 for fire, water and air alike.
+///
+/// The original validates it against `SkillData[SrcIndex + 5760]`, the fire
+/// base, whatever element the companion is. It gets away with it because the
+/// three elements mirror each other slot for slot, and it is why the number
+/// on the wire is an offset rather than an id.
+pub fn bar_value(element: Element, id: u32) -> Option<u8> {
+    id.checked_sub(element.skill_base()).and_then(|v| u8::try_from(v).ok())
+}
+
+/// And back: the skill a bar entry names.
+pub fn bar_skill(element: Element, value: u8) -> u32 {
+    element.skill_base() + value as u32
 }
 
 /// How many of the pran's equipment slots the spawn packet carries. Its
@@ -779,13 +805,24 @@ const EVOLUTION_STONES: [(u8, u16); 3] = [(4, 104), (19, 105), (49, 111)];
 /// there instead.
 pub const CHILD_HELD_ITEM: u16 = 150;
 
+/// How many ranks each of the ten skills has, which is what puts them ten
+/// apart: 5761 to 5770 is the first, 5771 the second.
+pub const RANKS_PER_SKILL: u32 = 10;
+
+/// Which of the ten a skill id belongs to, for a companion of this element.
+pub fn skill_slot(element: Element, id: u32) -> Option<usize> {
+    let offset = id.checked_sub(element.first_skill())?;
+    let slot = (offset / RANKS_PER_SKILL) as usize;
+    (slot < SKILLS).then_some(slot)
+}
+
 /// Which of the ten skills the first evolution raises.
 ///
 /// `Inc(Pran1.Skills[3].Level)`, with a comment beside it calling it
 /// "transformar" and noting that this one must not grow from kills like the
 /// others -- which is why the band that raises skills on a level skips
 /// exactly this index.
-const TRANSFORM_SKILL: usize = 3;
+pub const TRANSFORM_SKILL: usize = 3;
 
 /// Why a companion cannot evolve yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -33,7 +33,7 @@ the file in that source which owns it, and the commit that adds it says which.
 | Diagnostics | a per-connection packet trace that dumps itself when a client stops talking |
 | Game data | `ItemList.bin`, `SkillData.bin`, `ExpList.bin`, `.npc`, mob CSVs, drops, `SL.bin` |
 
-526 tests, including end-to-end runs over real sockets: HTTP token, TCP login
+530 tests, including end-to-end runs over real sockets: HTTP token, TCP login
 and game server through to the character list, and a second server started on
 the same database file to prove what was saved.
 

@@ -214,6 +214,30 @@ pub fn bar_of(table: &SkillTable, class_number: u32, level: u32) -> Vec<usize> {
         .collect()
 }
 
+/// How a skill is written into a hotbar slot
+/// (`TSkillFunctions.GetSkillIndexOnBar`).
+///
+/// The bar holds one dword per slot and it holds two kinds of thing, so the
+/// kind has to be readable off the value: a skill is its id shifted up four
+/// bits with a `2` underneath, and a usable item is stored as its plain id.
+pub fn on_bar(id: usize) -> u32 {
+    id as u32 * RANKS_PER_SLOT as u32 + 2
+}
+
+/// Which hotbar slot holds a given skill, or `None`.
+///
+/// The original reads the id back out of the slot instead, dividing by sixteen
+/// and rounding (`GetFromBarSkillIndex`), which answers for a slot holding an
+/// *item* too — any item id within sixteen of `id * 16 + 2` reads back as that
+/// skill, and `UpdateAllOnBar` would then overwrite the item. Comparing the
+/// stored word against the one [`on_bar`] would have written is the same test
+/// for every slot that really holds a skill, and narrower for the ones that do
+/// not.
+pub fn slot_on_bar(bar: &[u32], id: usize) -> Option<usize> {
+    let looking_for = on_bar(id);
+    bar.iter().position(|slot| *slot == looking_for)
+}
+
 /// When each skill may be used again.
 ///
 /// Keyed by the spell rather than the rank: learning a better rank must not

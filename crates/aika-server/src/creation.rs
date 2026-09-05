@@ -148,7 +148,7 @@ fn ammunition_for(class_number: u16) -> Option<u16> {
 /// The marker the original writes for a learned basic skill
 /// (`SetPlayerSkills`). The client reads this out of the record to decide the
 /// skill may be cast; anything else and it treats the skill as unlearned.
-const BASIC_LEARNED: u16 = 2;
+pub(crate) const BASIC_LEARNED: u16 = 2;
 
 /// Builds the record's skill list the way `TPlayer.SetPlayerSkills` does,
 /// rather than copying the template's stored bytes.
@@ -158,7 +158,7 @@ const BASIC_LEARNED: u16 = 2;
 /// the sixty-slot array the client reads: a learned basic is `2`, a learned
 /// advanced skill carries its level in slots six and up, and everything else
 /// stays zero.
-fn skill_list_from(template: &Template) -> [u16; 60] {
+pub(crate) fn skill_list_from(template: &Template) -> [u16; 60] {
     let mut list = [0u16; 60];
     let learned = template.skills();
 

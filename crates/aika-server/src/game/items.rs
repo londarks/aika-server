@@ -509,7 +509,7 @@ pub(crate) fn handle_change_item_bar(session: &mut Session, message: &Message) -
         // Cleared, a skill, or a usable item — the three the original keeps on
         // the character's own bar (`ChangeItemBar`).
         0 => character.item_bar[dest] = 0,
-        2 => character.item_bar[dest] = src * 16 + 2,
+        2 => character.item_bar[dest] = ability::on_bar(src as usize),
         6 => character.item_bar[dest] = src,
         // Kinds 1 and 3 belong to the pran's bar, which we do not keep yet.
         other => {
@@ -530,6 +530,32 @@ pub(crate) fn handle_change_item_bar(session: &mut Session, message: &Message) -
         rand::random(),
     );
     Action::Reply(vec![echo])
+}
+
+/// `RefreshItemBarSlot` (`Mob/Player.pas:4387`): the server changed a hotbar
+/// slot on its own.
+///
+/// The same `0x31E` the client sends, sent the other way, and the one field
+/// that differs is the header: the original puts the fixed `0x7535` there
+/// rather than the client id, the way it does for every packet that is the
+/// server talking about the character rather than the character acting.
+///
+/// The id goes in raw. It is the *packet* that carries the kind separately;
+/// the `id * 16 + 2` packing is only how the value is kept in the record.
+pub(crate) fn encode_item_bar_slot(slot: usize, kind: u32, id: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&(slot as u32).to_le_bytes());
+    body.extend_from_slice(&kind.to_le_bytes());
+    body.extend_from_slice(&id.to_le_bytes());
+    frame::encode(
+        &Message {
+            sender: dialog::FIXED_INDEX,
+            opcode: OP_CHANGE_ITEM_BAR,
+            time: PACKET_TIME,
+            body,
+        },
+        rand::random(),
+    )
 }
 
 /// `TStoragePacket` (`0x137`): the chest, gold and every slot of it.

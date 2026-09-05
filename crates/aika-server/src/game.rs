@@ -75,6 +75,9 @@ pub const OP_CHAT: u16 = 0xF86;
 /// something onto, off, or across the action bar. The original both reads and
 /// echoes it at `$31E` (`ServerSocket.pas:3626`, `RefreshItemBarSlot`).
 pub const OP_CHANGE_ITEM_BAR: u16 = 0x31E;
+/// The kind field of that packet, for the one kind the server sends by itself:
+/// a skill (`RefreshItemBarSlot(BarIndex, 2, NewSkillIndex)`).
+pub const ITEM_BAR_SKILL: u32 = 2;
 /// `TAgroupItemPacket` (`Data/Packets.pas:887`): stack one pile onto another
 /// (`AgroupItem`, `$332`).
 pub const OP_GROUP_ITEM: u16 = 0x332;
@@ -113,6 +116,10 @@ pub const OP_REMOVE_BUFF: u16 = 0x329;
 /// `TGetStatusPointPacket` (`Data/Packets.pas:2150`): the player spent free
 /// points on an attribute (`GetStatusPoint`, `$213`).
 pub const OP_STATUS_POINT: u16 = 0x213;
+/// The player asked to unlearn everything and start the sheet again
+/// (`ResetSkills`, `$32A`, `PlayerThread.pas:1015`). The packet carries
+/// nothing: the request is the whole of it.
+pub const OP_RESET_SKILLS: u16 = 0x32A;
 /// Walking, the only move type the original relays to other players
 /// (`Data/GlobalDefs.pas:216`). The real client also sends other values.
 const MOVE_NORMAL: u8 = 0;
@@ -576,6 +583,10 @@ pub(crate) struct Session {
     /// window that counts down, so it has to be sent again before the
     /// window empties or the icon leaves the bar on its own.
     buffs_sent_at: Option<std::time::Instant>,
+    /// The last rank bought, which may not be bought again
+    /// (`TPlayer.SkillUpgraded`). Per connection in the original too, so
+    /// logging out clears it.
+    skill_upgraded: Option<usize>,
 }
 
 impl Session {
@@ -1016,6 +1027,7 @@ async fn handle_message(state: &State, session: &mut Session, message: &Message)
         pran::OP_RENAME => handle_rename_pran(state, session, message).await,
         OP_MOUNT_SKILL => handle_mount_skill(state, session, message),
         OP_STATUS_POINT => handle_status_point(state, session, message),
+        OP_RESET_SKILLS => handle_reset_skills(state, session),
         OP_REMOVE_BUFF => handle_remove_buff(state, session, message),
         opcode => {
             // The original merely prints the code here; we do the same, adding the
@@ -2215,6 +2227,17 @@ const WORN_ON_THE_BODY: std::ops::RangeInclusive<u16> = 2..=9;
 /// — a basic stays marked as it was, an advanced skill climbs a rank — and
 /// spends the points and the gold. The client is then sent the fresh skill
 /// list, the fresh levels, and the new purse.
+///
+/// # The rank has to reach the bar or it is worth nothing
+///
+/// A rank is not a modifier on a skill: it is a *different id*, one past the
+/// last (`Index + Level - 1`, which is how `SetPlayerSkills` reads the record
+/// back). The client casts whatever id its bar holds, so a rank bought and
+/// never written onto the bar is a rank the player paid for and will never
+/// cast — every spell keeps hitting for the first rank's damage for the rest
+/// of the character's life. The original closes this with the last line of
+/// `LearnSkill`, `UpdateAllOnBar(SkillIndex - 1, SkillIndex)`
+/// (`PacketHandlers.pas:7738`).
 fn handle_learn_skill(state: &State, session: &mut Session, message: &Message) -> Action {
     if message.body.len() < 8 {
         warn!(size = message.body.len(), "0x31C packet too short");
@@ -2227,6 +2250,15 @@ fn handle_learn_skill(state: &State, session: &mut Session, message: &Message) -
 
     let client_id = session.client_id;
     let chest = chest_gold(session);
+
+    // `if (Player.SkillUpgraded = Packet.SkillIndex) then Exit`. The trainer
+    // window sends the same id again when it has not redrawn yet, and without
+    // this a double click buys the rank twice.
+    if session.skill_upgraded == Some(skill_id) {
+        debug!(skill = skill_id, "0x31C for the rank just bought");
+        return Action::Ignore;
+    }
+
     let Some(character) = session.character.as_mut() else {
         return Action::Ignore;
     };
@@ -2260,20 +2292,157 @@ fn handle_learn_skill(state: &State, session: &mut Session, message: &Message) -
     if slot >= BASIC_SKILL_COUNT {
         character.skill_list[slot] = character.skill_list[slot].saturating_add(1);
     }
-    character.skill_points -= cost;
+    spend_skill_point(character, cost);
     character.gold -= learn_cost;
-    session.dirty = true;
-    info!(skill = skill_id, slot, cost, "skill learned");
 
+    // The bar follows the rank. The slot holds the id of the rank cast until
+    // now, which is one below the one just bought, and the client goes on
+    // casting whatever is written there.
+    let bar_slot = ability::slot_on_bar(&character.item_bar, skill_id.saturating_sub(1));
+    if let Some(at) = bar_slot {
+        character.item_bar[at] = ability::on_bar(skill_id);
+    }
+
+    session.dirty = true;
+    session.skill_upgraded = Some(skill_id);
+    info!(skill = skill_id, slot, cost, bar = ?bar_slot, "skill learned");
+
+    let character = session.character.as_ref().expect("checked above");
     let known = known_skills(state, character);
-    Action::Reply(vec![
+    let mut frames = vec![
         // The skill list said to come from the trainer, so its window redraws
         // the newly learned skill; `SendPlayerSkills(NPCIndex)` in the original.
         encode_skill_list_from(client_id, npc, &known),
         encode_skills_level(character, client_id),
         encode_refresh_point(character),
         encode_refresh_money(character.gold, chest),
-    ])
+    ];
+    if let Some(at) = bar_slot {
+        frames.push(encode_item_bar_slot(at, ITEM_BAR_SKILL, skill_id as u32));
+    }
+    Action::Reply(frames)
+}
+
+/// What a skill costs in points, spent the way the original spends it.
+///
+/// The last point is a special case in `LearnSkill` and not a kind one: rather
+/// than subtracting the cost it sets the skill points to nought **and the
+/// unspent status points with them** (`PacketHandlers.pas:7723`). It reads
+/// like a slip — `Status` is the pool `0x213` spends and nothing else in the
+/// function touches it — but it is what the server our client talked to did,
+/// so it is what happens here. It is also the whole reason a character should
+/// spend status points as they come rather than banking them.
+fn spend_skill_point(character: &mut Character, cost: u16) {
+    if character.skill_points == 1 {
+        character.skill_points = 0;
+        character.attributes[FREE_POINTS] = 0;
+    } else {
+        character.skill_points -= cost;
+    }
+}
+
+/// What starting over costs: half a thousand gold a level
+/// (`Taxa := (Level * 1000) div 2`).
+fn reset_fee(level: u16) -> u64 {
+    level as u64 * 1000 / 2
+}
+
+/// The sheet a character goes back to.
+///
+/// `ResetSkills` does it in two steps that read oddly together: it copies the
+/// whole of the class template's skills back over the character's, and then
+/// clears every advanced level it just copied and hands back the first one.
+/// So the six basic skills come from the template and the forty advanced ones
+/// do not — whatever the template had learned past the first is gone.
+fn starting_skills(template: Option<&aika_data::template::Template>) -> [u16; 60] {
+    let mut list = match template {
+        Some(template) => creation::skill_list_from(template),
+        // Without a template there is nothing to copy, and the six basics are
+        // what a character cannot be without: unmarked, the client refuses to
+        // cast at all. Same fallback as the one on the way into the world.
+        None => {
+            let mut list = [0u16; 60];
+            list[..BASIC_SKILL_COUNT].fill(BASIC_SKILL_LEARNED);
+            list
+        }
+    };
+    list[BASIC_SKILL_COUNT..].fill(0);
+    list[BASIC_SKILL_COUNT] = 1;
+    list
+}
+
+/// `0x32A`: forget every skill and take the points back (`ResetSkills`,
+/// `PacketHandlers.pas:7744`).
+///
+/// The fee is the only thing that can refuse it. After that the bar is wiped
+/// slot by slot — a bar left pointing at ranks the character no longer has
+/// would cast them, since the id in the slot is the whole of what the client
+/// sends — the sheet goes back to the class template with the first advanced
+/// skill at rank one, and the points come back as the level's whole
+/// entitlement rather than as a count of what was spent.
+///
+/// The reply is the original's list of sends, repeats included: it says the
+/// skills, the score, the points and the vitals twice each, in that order.
+/// They are left in because the order packets go out in has already cost this
+/// project a week once, and the cost of sending one twice is a few bytes.
+///
+/// Passives are the one line not carried over. `SearchSkillsPassive(1)` takes
+/// off what the learned passives were adding, and there are none here to take
+/// off yet.
+fn handle_reset_skills(state: &State, session: &mut Session) -> Action {
+    let client_id = session.client_id;
+    let chest = chest_gold(session);
+    let Some(character) = session.character.as_mut() else {
+        return Action::Ignore;
+    };
+
+    let fee = reset_fee(character.level);
+    if character.gold < fee {
+        return Action::Reply(vec![encode_client_message(
+            client_id,
+            "Você não possui gold sulficiente para reniciar as suas habilidades!",
+        )]);
+    }
+
+    // The bar first, and every slot of it whether or not it held anything:
+    // the original sends forty of these and the client redraws each.
+    character.item_bar = [0; 40];
+    let mut frames: Vec<Vec<u8>> = (0..character.item_bar.len())
+        .map(|slot| encode_item_bar_slot(slot, 0, 0))
+        .collect();
+
+    let class = character.class_number();
+    character.skill_list = starting_skills(state.template(class));
+    character.gold -= fee;
+    character.skill_points = crate::store::skill_points_for(character.level);
+    session.dirty = true;
+    info!(fee, points = character.skill_points, "skills reset");
+
+    let effects = session.effects(state);
+    let character = session.character.as_ref().expect("checked above");
+    let known = known_skills(state, character);
+    let (max_hp, max_mp) = vitals(character);
+    session.cur_hp = session.cur_hp.min(max_hp);
+    session.cur_mp = session.cur_mp.min(max_mp);
+
+    frames.extend([
+        encode_hp_mp(character, client_id, session.cur_hp, session.cur_mp),
+        encode_skill_list(client_id, &known),
+        encode_refresh_point(character),
+        encode_refresh_status(character, &state.items, &effects),
+        encode_level(character, client_id),
+        encode_hp_mp(character, client_id, session.cur_hp, session.cur_mp),
+        encode_skill_list(client_id, &known),
+        encode_refresh_money(character.gold, chest),
+        encode_skills_level(character, client_id),
+        encode_refresh_status(character, &state.items, &effects),
+        encode_refresh_point(character),
+    ]);
+
+    // `Sair(Player)`: whatever window this came from is closed.
+    session.opened_npc = None;
+    session.opened_option = 0;
+    Action::Reply(frames)
 }
 
 /// `TMoveItemPacket` (`0x70F`), 8 bytes of body.
@@ -3554,8 +3723,30 @@ fn reward_for(state: &State, session: &mut Session, target: &crate::mob::Mob) ->
     // Anything the companion earned goes out with the rest.
 
     if gained > 0 && character.level < cap {
+        let was = character.level;
         character.level = character.level.saturating_add(gained).min(cap);
-        info!(character = %character.name, level = character.level, cap, "levelled up");
+
+        // A level is worth points, and the original hands them out one level
+        // at a time: `AddExp` loops on `AddLevel` rather than adding several
+        // at once, so two levels from one kill pay twice. Counting them here
+        // rather than off the new level keeps that true.
+        let (mut skill, mut status) = (0u16, 0u16);
+        for level in was + 1..=character.level {
+            let (s, t) = crate::store::points_for_reaching(level);
+            skill += s;
+            status += t;
+        }
+        character.skill_points = character.skill_points.saturating_add(skill);
+        character.attributes[FREE_POINTS] =
+            character.attributes[FREE_POINTS].saturating_add(status);
+        info!(
+            character = %character.name,
+            level = character.level,
+            cap,
+            skill,
+            status,
+            "levelled up"
+        );
 
         // Health and mana come back full: a level is the one moment the game
         // hands them over, and arriving at a new level nearly dead is a
@@ -3569,6 +3760,11 @@ fn reward_for(state: &State, session: &mut Session, target: &crate::mob::Mob) ->
             session.cur_hp,
             session.cur_mp,
         ));
+
+        // And what the level was worth. `AddLevel` sends this straight after
+        // the vitals; without it the points are in the record and the two
+        // windows that spend them keep drawing the old count until a relog.
+        frames.push(encode_refresh_point(session.character.as_ref().expect("checked above")));
 
         // The burst everyone on screen sees. The original plays it on the
         // player for everyone who can see them, so it goes out to the world

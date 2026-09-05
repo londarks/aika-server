@@ -135,18 +135,42 @@ pub struct Character {
     pub tier: u16,
 }
 
-/// How many skill points a character of a given level has earned in total
-/// (`TPlayer.CalcSkillPoints`): one per level, and below the cap of fifty that
-/// is the whole story.
-pub fn skill_points_for(level: u16) -> u16 {
-    let mut points = 0u16;
-    for l in 1..=level {
-        points = points.saturating_add(1);
-        if l > 50 && l % 10 == 1 {
-            points = points.saturating_add(7);
-        }
+/// Skill and status points a level is worth, from `TPlayer.AddLevel`
+/// (`Mob/Player.pas:6580`).
+///
+/// One skill point a level, always. Status points do not start until past
+/// fifty at all — a character below the promotion wall has none to spend and
+/// the window it spends them in stays empty, which is the original's own
+/// shape. Every tenth level after that, counted from fifty-one, is worth a
+/// handful of both.
+///
+/// The two bonuses sit *inside* the test on fifty, so level 41 gets nothing
+/// extra even though it ends in a one.
+pub fn points_for_reaching(level: u16) -> (u16, u16) {
+    const SKILL_PER_LEVEL: u16 = 1;
+    const STATUS_PER_LEVEL: u16 = 2;
+    const SKILL_EVERY_TENTH: u16 = 7;
+    const STATUS_EVERY_TENTH: u16 = 10;
+
+    if level <= 50 {
+        return (SKILL_PER_LEVEL, 0);
     }
-    points
+    if level % 10 == 1 {
+        (SKILL_PER_LEVEL + SKILL_EVERY_TENTH, STATUS_PER_LEVEL + STATUS_EVERY_TENTH)
+    } else {
+        (SKILL_PER_LEVEL, STATUS_PER_LEVEL)
+    }
+}
+
+/// How many skill points a character of a given level has earned in total
+/// (`TPlayer.CalcSkillPoints`).
+///
+/// The original writes this sum out a second time rather than calling what
+/// hands the points out, and the two agree only because the same two rules are
+/// typed twice. Here they are the one function, so a skill reset can never
+/// give back a different number from the one levelling gave.
+pub fn skill_points_for(level: u16) -> u16 {
+    (1..=level).fold(0u16, |points, l| points.saturating_add(points_for_reaching(l).0))
 }
 
 /// Where a brand new character appears.
@@ -784,5 +808,34 @@ mod class_tests {
     fn an_impossible_class_index_is_clamped() {
         assert_eq!(with_index(0).class_number(), 1);
         assert_eq!(with_index(999).class_number(), 6);
+    }
+
+    /// Below the promotion wall a level is worth one skill point and no
+    /// status point at all — the two bonuses in `AddLevel` sit inside the
+    /// test on fifty, so the window that spends status points stays empty
+    /// until a character is promoted.
+    #[test]
+    fn a_level_below_fifty_one_is_worth_one_skill_point_and_nothing_else() {
+        assert_eq!(points_for_reaching(2), (1, 0));
+        assert_eq!(points_for_reaching(41), (1, 0), "a one at the end does not count below fifty");
+        assert_eq!(points_for_reaching(50), (1, 0));
+    }
+
+    /// Past it, every level pays status points and every tenth pays a
+    /// handful of both.
+    #[test]
+    fn every_tenth_level_past_fifty_pays_a_handful() {
+        assert_eq!(points_for_reaching(51), (8, 12));
+        assert_eq!(points_for_reaching(52), (1, 2));
+        assert_eq!(points_for_reaching(91), (8, 12));
+    }
+
+    /// The total a reset hands back. Fifty levels are fifty points; the five
+    /// tenth levels between fifty-one and ninety-nine are seven more each.
+    #[test]
+    fn the_total_is_the_sum_of_the_levels() {
+        assert_eq!(skill_points_for(50), 50);
+        assert_eq!(skill_points_for(51), 58);
+        assert_eq!(skill_points_for(99), 99 + 5 * 7);
     }
 }

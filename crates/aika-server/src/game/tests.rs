@@ -4119,6 +4119,9 @@ fn cast_state() -> State {
     };
 
     define(SPELL as usize, 1, 1, 11, 30, 500, 300, 3000);       // ours
+    // The rank above it, which is the id one past. Not a slot's first rank,
+    // so it never joins the forty the trainer window lists.
+    define(SPELL as usize + 1, 1, 1, 11, 30, 700, 300, 3000);
     define(OTHER_SPELL as usize, 1, 1, 51, 5, 40, 200, 1000);   // another class
 
     state.skills = SkillTable::decode(&raw).unwrap();
@@ -4166,6 +4169,198 @@ async fn learning_a_skill_ranks_it_up_and_spends_points() {
     // The fixture leaves the cost at zero, so points are untouched here;
     // what matters is the rank went up and nothing was overspent.
     assert!(c.skill_points <= 5, "points went up rather than down");
+}
+
+/// The whole point of buying a rank: the bar has to start casting it.
+///
+/// A rank is a different id, and the id in the bar slot is all the client
+/// sends. Leave the slot alone and the player pays for ranks and goes on
+/// casting the first one for the rest of the character's life.
+#[tokio::test]
+async fn a_rank_bought_moves_the_bar_onto_it() {
+    let state = cast_state();
+    let mut session = in_world(&state).await;
+    const BAR_SLOT: usize = 3;
+    {
+        let c = session.character.as_mut().unwrap();
+        c.skill_points = 5;
+        c.gold = 1000;
+        c.item_bar[BAR_SLOT] = ability::on_bar(SPELL as usize);
+    }
+
+    let frames =
+        frames_of(handle_message(&state, &mut session, &learn_message(SPELL + 1)).await);
+
+    let c = session.character.as_ref().unwrap();
+    assert_eq!(
+        c.item_bar[BAR_SLOT],
+        ability::on_bar(SPELL as usize + 1),
+        "the bar still casts the rank that was replaced"
+    );
+
+    // And the client is told, or it draws the old one until the next login.
+    let told = frames
+        .iter()
+        .map(|f| decode(f))
+        .find(|m| m.opcode == OP_CHANGE_ITEM_BAR)
+        .expect("the bar change was never sent");
+    assert_eq!(u32::from_le_bytes(told.body[0..4].try_into().unwrap()), BAR_SLOT as u32);
+    assert_eq!(u32::from_le_bytes(told.body[4..8].try_into().unwrap()), ITEM_BAR_SKILL);
+    assert_eq!(u32::from_le_bytes(told.body[8..12].try_into().unwrap()), SPELL + 1);
+}
+
+/// A skill nowhere near the bar leaves every slot of it alone.
+#[tokio::test]
+async fn a_rank_bought_for_a_skill_off_the_bar_moves_nothing() {
+    let state = cast_state();
+    let mut session = in_world(&state).await;
+    {
+        let c = session.character.as_mut().unwrap();
+        c.skill_points = 5;
+        c.gold = 1000;
+    }
+    let before = session.character.as_ref().unwrap().item_bar;
+
+    handle_message(&state, &mut session, &learn_message(SPELL + 1)).await;
+
+    assert_eq!(session.character.as_ref().unwrap().item_bar, before, "the bar moved on its own");
+}
+
+/// `if (Player.SkillUpgraded = Packet.SkillIndex) then Exit`. The trainer
+/// window sends the same id again before it has redrawn, and a double click
+/// must not buy the rank twice.
+#[tokio::test]
+async fn the_same_rank_cannot_be_bought_twice_running() {
+    let state = cast_state();
+    let mut session = in_world(&state).await;
+    {
+        let c = session.character.as_mut().unwrap();
+        c.skill_points = 5;
+        c.gold = 1000;
+    }
+
+    handle_message(&state, &mut session, &learn_message(SPELL)).await;
+    let after_one = session.character.as_ref().unwrap().skill_list[6];
+    handle_message(&state, &mut session, &learn_message(SPELL)).await;
+
+    assert_eq!(
+        session.character.as_ref().unwrap().skill_list[6],
+        after_one,
+        "the second click bought the same rank again"
+    );
+}
+
+/// The original's own arithmetic, and it is not a kind one: spending the
+/// *last* skill point zeroes the unspent status points along with it
+/// (`PacketHandlers.pas:7723`).
+#[tokio::test]
+async fn the_last_skill_point_takes_the_status_points_with_it() {
+    let state = cast_state();
+    let mut session = in_world(&state).await;
+    {
+        let c = session.character.as_mut().unwrap();
+        c.skill_points = 1;
+        c.gold = 1000;
+        c.attributes[FREE_POINTS] = 7;
+    }
+
+    handle_message(&state, &mut session, &learn_message(SPELL)).await;
+
+    let c = session.character.as_ref().unwrap();
+    assert_eq!(c.skill_points, 0);
+    assert_eq!(c.attributes[FREE_POINTS], 0, "the original wipes these and we did not");
+}
+
+fn reset_message() -> Message {
+    Message { sender: TEST_CLIENT_ID, opcode: OP_RESET_SKILLS, time: 0, body: Vec::new() }
+}
+
+/// A reset hands back the level's whole entitlement, not a count of what was
+/// spent — `CalcSkillPoints(Level)`, which is the same sum levelling pays out.
+#[tokio::test]
+async fn a_reset_gives_back_what_the_levels_were_worth() {
+    let state = cast_state();
+    let mut session = in_world(&state).await;
+    {
+        let c = session.character.as_mut().unwrap();
+        c.level = 60;
+        c.gold = 1_000_000;
+        c.skill_points = 0;
+        c.skill_list[6] = 9;
+        c.skill_list[12] = 4;
+    }
+
+    handle_message(&state, &mut session, &reset_message()).await;
+
+    let c = session.character.as_ref().unwrap();
+    assert_eq!(c.skill_points, crate::store::skill_points_for(60));
+    assert_eq!(c.skill_list[6], 1, "the first advanced skill did not come back at rank one");
+    assert!(c.skill_list[7..].iter().all(|&s| s == 0), "an advanced rank survived the reset");
+    assert!(
+        c.skill_list[..6].iter().all(|&s| s != 0),
+        "the basics went unmarked, which stops the client casting at all"
+    );
+}
+
+/// The bar is wiped slot by slot, and the client is told about every one:
+/// a slot left pointing at a rank the character no longer has would cast it.
+#[tokio::test]
+async fn a_reset_wipes_the_bar_and_says_so() {
+    let state = cast_state();
+    let mut session = in_world(&state).await;
+    {
+        let c = session.character.as_mut().unwrap();
+        c.gold = 1_000_000;
+        c.item_bar[0] = ability::on_bar(SPELL as usize);
+        c.item_bar[7] = ability::on_bar(SPELL as usize + 1);
+    }
+
+    let frames = frames_of(handle_message(&state, &mut session, &reset_message()).await);
+
+    assert_eq!(session.character.as_ref().unwrap().item_bar, [0u32; 40], "the bar kept a skill");
+    let cleared = frames
+        .iter()
+        .map(|f| decode(f))
+        .filter(|m| m.opcode == OP_CHANGE_ITEM_BAR)
+        .count();
+    assert_eq!(cleared, 40, "the client was not told about every slot");
+}
+
+/// Half a thousand gold a level, and it is the one thing that can refuse.
+#[tokio::test]
+async fn a_reset_costs_half_a_thousand_a_level() {
+    let state = cast_state();
+    let mut session = in_world(&state).await;
+    {
+        let c = session.character.as_mut().unwrap();
+        c.level = 40;
+        c.gold = 20_000;
+    }
+
+    handle_message(&state, &mut session, &reset_message()).await;
+
+    assert_eq!(session.character.as_ref().unwrap().gold, 0, "the fee was not 40 * 1000 / 2");
+}
+
+#[tokio::test]
+async fn a_reset_nobody_can_pay_for_changes_nothing() {
+    let state = cast_state();
+    let mut session = in_world(&state).await;
+    {
+        let c = session.character.as_mut().unwrap();
+        c.level = 40;
+        c.gold = 19_999;
+        c.skill_list[6] = 9;
+        c.item_bar[0] = ability::on_bar(SPELL as usize);
+    }
+
+    let frames = frames_of(handle_message(&state, &mut session, &reset_message()).await);
+
+    assert_eq!(decode(&frames[0]).opcode, OP_CLIENT_MESSAGE, "it did not say why");
+    let c = session.character.as_ref().unwrap();
+    assert_eq!(c.gold, 19_999, "gold left a refused reset");
+    assert_eq!(c.skill_list[6], 9, "the sheet was reset without being paid for");
+    assert_ne!(c.item_bar[0], 0, "the bar was wiped without being paid for");
 }
 
 /// A skill from another class is refused, points untouched.
@@ -4403,6 +4598,43 @@ async fn enough_experience_is_a_level() {
     let character = session.character.as_ref().unwrap();
     assert_eq!(character.exp, 25);
     assert_eq!(character.level, 2, "the kill did not buy a level");
+}
+
+/// A level pays a skill point. Nothing granted them before, so a character
+/// could level to the cap and never learn a second rank of anything.
+#[tokio::test]
+async fn a_level_pays_the_skill_point_it_is_worth() {
+    let state = progress_state();
+    let mut session = in_world(&state).await;
+    {
+        let c = session.character.as_mut().unwrap();
+        c.level = 1;
+        c.exp = 0;
+        c.skill_points = 0;
+    }
+
+    // The killing blow carries the reply, so the swings are made here rather
+    // than through `kill_the_rat`, which throws the frames away.
+    let mut frames = Vec::new();
+    let mut swings = 0;
+    while state.world.mob(RAT).is_some_and(|m| m.is_alive()) && swings < 500 {
+        frames = frames_of(handle_message(&state, &mut session, &attack_message(RAT)).await);
+        swings += 1;
+    }
+    assert!(swings < 500, "the monster would not die");
+
+    let c = session.character.as_ref().unwrap();
+    assert_eq!(c.level, 2, "the fixture stopped buying a level");
+    assert_eq!(c.skill_points, 1, "the level paid nothing");
+
+    // And the window that draws them is told, or it keeps the old count
+    // until the next login.
+    let point = frames
+        .iter()
+        .map(|f| decode(f))
+        .find(|m| m.opcode == OP_REFRESH_POINT)
+        .expect("the points were never sent");
+    assert_eq!(u16::from_le_bytes(point.body[14..16].try_into().unwrap()), 1);
 }
 
 /// One kill can be worth more than one level, and health comes back with

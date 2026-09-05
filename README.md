@@ -21,10 +21,11 @@ the file in that source which owns it, and the commit that adds it says which.
 | Movement and chat | walking, turning, say and whisper, emotes, sitting and dancing |
 | Combat | swings, spells, damage with both animations, dying and getting up |
 | Monsters | the two clocks of `Mob/MOB.pas`: patrol, aggro, chase, leash, respawn, drops |
-| Skills | the class grid, learning at a trainer, casting, cooldowns per family |
+| Skills | the class grid, learning and ranking up at a trainer, casting, cooldowns per family, the reset |
+| Character sheet | the points a level pays, spending them, and what buffs and gear are worth (`GetMobAbility`) |
 | Items | shops (gold, honor, medals, item currency), equipment, stacking, splitting, durability |
 | Storage | the account chest: 86 slots, four pages, gold in and out |
-| Buffs | potions and saddles start them; they expire on their own |
+| Buffs | potions and saddles start them, they change the numbers they promise, and they expire on their own |
 | Mounts | worn, drawn on the rider, and their own two skills |
 | Companions | the Pran: hatched from a quest stone, named, summoned, drawn, fed on kills, evolved |
 | Promotion | the class tier and its level walls at 50 and 89 |
@@ -32,7 +33,7 @@ the file in that source which owns it, and the commit that adds it says which.
 | Diagnostics | a per-connection packet trace that dumps itself when a client stops talking |
 | Game data | `ItemList.bin`, `SkillData.bin`, `ExpList.bin`, `.npc`, mob CSVs, drops, `SL.bin` |
 
-514 tests, including end-to-end runs over real sockets: HTTP token, TCP login
+526 tests, including end-to-end runs over real sockets: HTTP token, TCP login
 and game server through to the character list, and a second server started on
 the same database file to prove what was saved.
 
@@ -55,32 +56,28 @@ What is left, in the order it is worth doing. The ordering is not by size: it
 is by how much of the game each one unlocks for somebody playing alone, since
 that is how this is tested.
 
-**1. Effects.** The one piece everything else is waiting on. A skill and an
-item each carry an `EF`/`EFV` pair of arrays, and `GetCurrentScore` reads them
-through `GetMobAbility` to arrive at the numbers a character really has. Until
-it lands, a buff starts and shows and does nothing: a potion promising ten per
-cent more of everything changes no number, a mount adds no speed, and rings and
-necklaces are worth zero because that is where their whole value lives.
+**1. Passive skills.** The other half of every class's tree, and it does
+nothing at all today. A passive is learned, costs its points, shows as learned
+— and adds no number, because what turns it into one is `SearchSkillsPassive`
+(`Mob/Player.pas:7158`), a case per skill that raises effects by the rank. It
+is a long table rather than a hard one, and it is the last thing standing
+between a learned sheet and a character that is worth what its sheet says.
 
-**2. The rest of the character sheet.** Spending status points (`0x213`), the
-skill reset, and making a learned rank change what a spell does — learning
-raises the rank in the record today, but the damage is still the first rank's.
-
-**3. Keeping and mending things.** Repair, enchant, craft. The item types are
+**2. Keeping and mending things.** Repair, enchant, craft. The item types are
 already identified in `UseItem`; the work is the tables behind them.
 
-**4. The small ones.** Quests, dungeons.
+**3. The small ones.** Quests, dungeons.
 
-**5. The companion's window.** Everything else about a Pran works; the panel
+**4. The companion's window.** Everything else about a Pran works; the panel
 still draws the first form. Not a server problem to keep guessing at -- see
 the list of what has been ruled out in `pran.rs`, and then either capture a
 `0x907` from the original to diff, or hook the client.
 
-**6. Channels.** Changing channel needs the world split per channel first —
+**5. Channels.** Changing channel needs the world split per channel first —
 today all four share one — and then the token handshake of `LoginIntoChannel`.
 Large, and worth little until there is somebody else online.
 
-**7. Everything that needs other people.** Guilds, parties and raids, friends
+**6. Everything that needs other people.** Guilds, parties and raids, friends
 and duels, trading, nations and relics, mail, the auction house, titles and
 events. About half the remaining opcodes, and none of it testable alone.
 
@@ -235,6 +232,10 @@ They look like bugs and are not:
 - **`Equip[0]` and `Equip[1]` are not equipment**: they are the class index and
   the hair index. The rest of the array is appearance.
 - **The `Index` header field of `0x925` is a fixed `0x7535`**, not the client id.
+- **A rank is the next id along, and the bar is where it lives.** The record
+  keeps a level; the id cast is `Index + Level - 1`, and the client sends
+  whatever its bar slot holds and nothing else. Buying a rank without
+  rewriting the slot leaves the player casting the first one for ever.
 - Offset comments inside the Delphi records are stale and disagree with each
   other by 16 and 32 bytes. Trust the declared types.
 

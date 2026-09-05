@@ -1,7 +1,7 @@
 # Aika-RS — Prompt de Revival (handoff entre sessões)
 
 > Cole isto no começo de uma sessão nova pra me trazer de volta ao contexto.
-> Escrito em 2026-08-31, atualizado em 2026-09-01. Idioma de trabalho:
+> Escrito em 2026-08-31, atualizado em 2026-09-05. Idioma de trabalho:
 > **português** (o Gabriel/londarks fala PT-BR).
 
 ---
@@ -59,7 +59,7 @@ Start-Process -FilePath ".\target\debug\aika-server.exe" -WorkingDirectory "<aik
   -RedirectStandardOutput "var\server.log" -RedirectStandardError "var\server.err.log" -WindowStyle Hidden
 ```
 
-- Testes: `cargo test` (rodar de `aika-rs/`). Hoje: ~265 no aika-server, ~74 no aika-data, ~9 no aika-net, ~8+10 integração. **Manter tudo verde.**
+- Testes: `cargo test` (rodar de `aika-rs/`). Hoje: 425 no aika-server, 74 no aika-data, 9 no aika-net, 8+10 integração — **526**. **Manter tudo verde.**
 - Portas: web/launcher `127.0.0.1:8090`, login `127.0.0.1:8831`, game `127.0.0.1:8822` (nos IPs `.1`–`.4`, um por canal).
 - Cliente aponta pra cá via `Setting.txt` (`1 http://127.0.0.1:8090`) e `SL.bin`.
 - Para mexer no banco com o servidor parado: `python` tem módulo `sqlite3` (o `python` do bash funciona pra scripts; o do PowerShell às vezes cai no alias da Store).
@@ -135,14 +135,24 @@ Login/token (web ASP), lista/criação/deleção de personagem, entrar no mundo 
 - **Durabilidade**: 21 itens estavam gravados 0/0 onde a tabela diz 120/160. O original preenche as duas metades da tabela em todo item que entrega. Reparo no boot, ancorado no **teto** (desgaste só baixa a primeira metade).
 - **Baú pela conversa com NPC** (opções 7 e 13). Nenhuma das duas estava ligada; a 13 é a **Central da Pran** — mesmo baú, `STORAGE_TYPE_PRANS`.
 
+### Entrou em 2026-09-05
+- **A bancada foi commitada** (`tools/gm/`, `tools/visualizador/`, cinco scripts novos em `tools/ui/`). Fora do commit: o `config.toml` real de cada ferramenta, o `gen/` do Tauri e o jogo de ícones de fábrica (2,5 MB que o `tauri icon` refaz), e `__pycache__`. Só o `icon.ico` que o bundle nomeia ficou.
+- **Rank agora vale alguma coisa.** O rank **não é um modificador, é o id seguinte**: o registro guarda o nível e o id lançado é `Index + Level - 1`. A tabela real confirma — ids 97..112 são uma skill de Guerreiro em 16 ranks (dano 33→592, nível mínimo 1,4,8,…,60) e 113 já é a próxima. **O cliente lança o id que está na casa da barra e mais nada**, então comprar rank sem reescrever a casa é pagar e continuar lançando o primeiro pra sempre. É a última linha do `LearnSkill`: `UpdateAllOnBar(SkillIndex - 1, SkillIndex)`.
+- **`SkillUpgraded`**: o id recém-comprado não pode ser comprado de novo. A janela do treinador reenvia o mesmo id antes de redesenhar, e sem isso o duplo clique compra duas vezes. **Nunca é limpo na sessão, nem pelo reset** — é do original; depois de um reset, o id comprado antes fica travado até relogar.
+- **Gastar o *último* ponto de skill zera os pontos de status junto** (`PacketHandlers.pas:7723`). Parece deslize do original — nada mais na função toca nesse pool — mas foi copiado como está.
+- **Reset de skills (`0x32A`)**: taxa `level*1000 div 2`, limpa as 40 casas da barra uma a uma (casa apontando pra rank que não existe mais lançaria ela), volta a ficha ao template da classe com a **primeira skill avançada em rank 1**, e devolve `CalcSkillPoints(level)` inteiro.
+- **Level agora paga pontos.** Não pagava nada: dava pra chegar no teto com os pontos da criação e mais nenhum. 1 ponto de skill por nível; **status só passa de 50** (os dois bônus do `AddLevel` estão *dentro* do teste do 50, então nível 41 não ganha nada); a cada décimo nível a partir do 51, +7 skill e +10 status. `AddExp` chama `AddLevel` **num while, um nível por vez**, então dois níveis de uma morte pagam duas vezes.
+- **Ponta solta conhecida:** ninguém trava o rank em 16. `IncremmentSkillLevel` não trava, e id 113 (rank 1 da skill seguinte) cai no `record_slot` da anterior. O `SetPlayerSkills` tem uma linha que compensa isso (`if Others[I-1].Level = 16 then Inc(Level)`), o que sugere que o original conhecia. A janela do treinador não oferece, então não dá pra chegar lá pelo jogo.
+
 ## 12. Falta (roadmap) — ordem sugerida pra jogo solo
-1. **Efeitos de buff/equipamento (`EF`/`EFV` da skill e do item, lidos por `GetMobAbility` dentro do `GetCurrentScore`).** É a maior pendência: hoje o buff começa, aparece e libera a montaria, mas **não muda número nenhum** — a poção não dá os +10% e a montaria não corre mais. Os acessórios (anel, brinco, colar) também guardam o valor aí, por isso valem zero na janela C.
-2. **Skills**: distribuir ponto de status (`0x213`, `GetStatusPoint` já lido), reset de skills, e **efeito do rank aprendido** (aprender sobe o rank no registro mas o combate ainda usa dano do rank-1).
-3. **Inventário**: reparar (tipos 708/709, já lidos em `UseItem`), encantar, craftar.
-4. Pequenos: Quest (1), Dungeon (2).
-5. **Painel da Pran** — ver secção 17. Não é mais trabalho de servidor às cegas.
-6. **Troca de canal** — grande e de pouco valor solo: exige antes separar `World` por canal (hoje os 4 canais dividem um só) e depois o handshake de token do `LoginIntoChannel`.
-7. Só quando tiver gente: Guild(13), Party/raid(12), Amigos/duelo(8), Troca(7), Nação/relíquia(7), Correio(6), Leilão(5), Títulos/eventos/mapa(8).
+1. **Skills passivas (`SearchSkillsPassive`, `Mob/Player.pas:7158`).** É a metade da árvore de toda classe e hoje não faz **nada**: a passiva é aprendida, custa os pontos, aparece aprendida, e não muda número nenhum. O que a transforma em número é um `case` por skill que sobe efeitos pelo rank (`EF_DAMAGE1`, `EF_HP`, `EF_COOLTIME`, `EF_REDUCE_AOE`…). Tabela longa, não difícil. Cuidado: o `Mode` é invertido — **0 ativa, 1 desativa** — e o reset chama com 1.
+2. **Inventário**: reparar (tipos 708/709, já lidos em `UseItem`), encantar, craftar.
+3. Pequenos: Quest (1), Dungeon (2).
+4. **Painel da Pran** — ver secção 17. Não é mais trabalho de servidor às cegas.
+5. **Troca de canal** — grande e de pouco valor solo: exige antes separar `World` por canal (hoje os 4 canais dividem um só) e depois o handshake de token do `LoginIntoChannel`.
+6. Só quando tiver gente: Guild(13), Party/raid(12), Amigos/duelo(8), Troca(7), Nação/relíquia(7), Correio(6), Leilão(5), Títulos/eventos/mapa(8).
+
+**Saiu do roadmap por estar pronto:** os efeitos de buff/equipamento (`effects.rs`, 2026-09-01 — o README ficou dizendo que faltava por mais três dias), distribuir ponto de status (`0x213`), o reset de skills e o efeito do rank aprendido.
 
 **Já resolvido, não procurar:** PIN (`NumericToken` morre num `Exit;`, a parte viva já é o nosso `0xF02`) e `0x308 KarakAereo` (idem).
 

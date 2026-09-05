@@ -2072,14 +2072,14 @@ async fn the_pran_station_opens_the_chest_on_its_pran_side() {
     }
 }
 
-/// The pran station says which pran it is showing.
+/// Neither side of the chest opens the companion's own window.
 ///
-/// `0x907` is the only packet that carries a name, and the original sends it
-/// when a pran is summoned and never otherwise. So the station draws a pran
-/// the client may know nothing about -- and one it believes is unnamed is one
-/// it asks the player to name, before any refusal exists to correct it.
+/// `0x907` is not a description, it is that window, and a companion sitting in
+/// a chest is standing nowhere. The station used to send one to break a naming
+/// loop and the loop is closed in `handle_rename_pran` instead, where the
+/// client has already said it is out of date.
 #[tokio::test]
-async fn the_pran_station_says_which_pran_is_in_it() {
+async fn the_pran_station_does_not_open_the_companions_window() {
     let state = buff_state();
     let mut session = in_world(&state).await;
     carrying_stone(&mut session, 4242);
@@ -2101,14 +2101,10 @@ async fn the_pran_station_says_which_pran_is_in_it() {
             .await,
     );
 
-    let told = frames
-        .iter()
-        .map(|frame| decode(frame))
-        .find(|m| m.opcode == crate::pran::OP_WORLD)
-        .expect("the station drew a pran it never described");
-    let name = &told.body[crate::pran::at::NAME..crate::pran::at::CLASS];
-    let name = &name[..name.iter().position(|b| *b == 0).unwrap()];
-    assert_eq!(name, b"Alice");
+    assert!(
+        !opcodes(&frames).contains(&crate::pran::OP_WORLD),
+        "opening the chest opened the window of a companion that is in it",
+    );
 }
 
 /// The plain chest says nothing about prans, because it is not about them.

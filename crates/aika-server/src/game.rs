@@ -2210,34 +2210,19 @@ fn handle_open_npc(state: &State, session: &mut Session, message: &Message) -> A
                 if for_prans { STORAGE_TYPE_PRANS } else { STORAGE_TYPE_PLAYER },
             ));
 
-            // What the window is about, for the window that is about it.
+            // No `0x907` here, and it is worth saying why not, because there
+            // was one and it looked reasonable.
             //
-            // Ours, and the second half of the same hole: `0x907` is the only
-            // packet that carries a pran's name, and the original sends it
-            // when one is summoned and at no other time. The station draws a
-            // pran the client may know nothing about, and a pran it thinks is
-            // unnamed is one it asks the player to name -- before there is any
-            // refusal to correct it with.
-            //
-            // The stone in the first pran slot names which one. Sent only for
-            // the pran side of the window, so the plain chest is untouched.
-            if for_prans {
-                let named_by_the_first_slot = account
-                    .storage
-                    .get(inventory::STORAGE, inventory::STORAGE_PRAN_SLOTS[0])
-                    .and_then(|stone| account.prans.iter().find(|p| p.belongs_to(stone)));
-                if let Some(pran) = named_by_the_first_slot {
-                    frames.push(frame::encode(
-                        &Message {
-                            sender: dialog::FIXED_INDEX,
-                            opcode: pran::OP_WORLD,
-                            time: 0,
-                            body: pran::world_body(pran),
-                        },
-                        rand::random(),
-                    ));
-                }
-            }
+            // It was put here to break a naming loop: that packet is the only
+            // one carrying a pran's name, the original sends it when one is
+            // summoned and never otherwise, and a client that thinks a pran
+            // is unnamed asks the player to name it -- while an unnamed pran
+            // is one it will not let out of the chest. But `0x907` is not a
+            // description, it is *the companion's window*, so opening the
+            // chest opened the window for a companion standing nowhere. The
+            // refusal in `handle_rename_pran` closes the same loop and closes
+            // it where the client has already proved it is out of date, which
+            // is the place that costs nothing.
             Action::Reply(frames)
         }
         dialog::option::CLOSE => {
